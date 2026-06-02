@@ -5,7 +5,7 @@
 tuetoken is a BPE tokenizer with a fast, safe Rust core. It is a drop-in replacement
 for 🤗 `transformers.AutoTokenizer`: it loads any model's own `tokenizer.json` and
 reproduces tokenization exactly (special tokens, chat templates, padding/truncation),
-up to 20x faster. It also loads OpenAI/tiktoken encodings natively, and
+up to 30x faster. It also loads OpenAI/tiktoken encodings natively, and
 its O(n) merger stays fast even on adversarial inputs (hashes, base64, minified code)
 where other tokenizers degrade to O(n²).
 
