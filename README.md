@@ -1,6 +1,6 @@
 # tuetoken
 
-**The fastest tokenizer for modern LLMs, up to 20x faster.**
+**The fastest tokenizer for modern LLMs, up to 30x faster.**
 
 tuetoken is a BPE tokenizer with a fast, safe Rust core. It is a drop-in replacement
 for 🤗 `transformers.AutoTokenizer`: it loads any model's own `tokenizer.json` and
