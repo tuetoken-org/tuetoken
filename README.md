@@ -33,7 +33,7 @@ extension. `from_pretrained` needs `huggingface_hub`; chat templates need `jinja
 Build from source (development, or a platform with no prebuilt wheel):
 
 ```bash
-git clone https://github.com/pyybor/tuetoken && cd tuetoken
+git clone https://github.com/tuetoken-org/tuetoken && cd tuetoken
 pip install maturin
 maturin develop --release
 ```
