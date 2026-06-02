@@ -25,11 +25,6 @@ Phi, GPT-OSS, GLM, Kimi, and more.
 ```bash
 pip install tuetoken
 ```
-
-There are **no required runtime dependencies**: the core is the compiled Rust
-extension. `from_pretrained` needs `huggingface_hub`; chat templates need `jinja2`;
-`return_tensors=` needs `numpy`/`torch` (all optional: `pip install tuetoken[auto]`).
-
 Build from source (development, or a platform with no prebuilt wheel):
 
 ```bash
