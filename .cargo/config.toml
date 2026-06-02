@@ -1,0 +1,8 @@
+# Builds are PORTABLE by default (generic target) so released wheels run on any
+# x86-64 CPU — mirroring the C package, whose cibuildwheel build also drops
+# -march=native. Measured cost of portability for this tokenizer: ~0% (C) to
+# ~5-10% (Rust); the hot path doesn't auto-vectorize, so native buys little.
+#
+# For a max-speed LOCAL build (e.g. a fair benchmark vs the C version, which
+# uses -march=native for local installs), opt in:
+#     RUSTFLAGS="-C target-cpu=native" maturin develop --release

@@ -1,0 +1,38 @@
+[package]
+name = "tuetoken"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tuetoken"
+# rlib so `cargo test` can build a test harness; cdylib for the Python wheel.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# extension-module is enabled only for the wheel (via the `extension-module`
+# feature, set in pyproject [tool.maturin]); leaving it off lets `cargo test`
+# link libpython normally instead of failing on missing symbols.
+pyo3 = { version = "0.28" }
+serde_json = "1"
+rayon = "1"
+rustc-hash = "2"
+# Universal pre-tokenizer fallback for ByteLevel Split patterns the hand-written
+# machines don't recognize (supports the lookarounds the std `regex` crate can't).
+# Same engine family HF tokenizers / tiktoken use. Only on the slow path.
+fancy-regex = "0.14"
+# Unicode normalization (NFC/NFD/NFKC/NFKD) for SentencePiece/byte_fallback models.
+unicode-normalization = "0.1"
+# Leftmost-longest multi-pattern matcher for special-token splitting in the
+# AutoTokenizer path (so a whole chat string is tokenized in one Rust pass).
+aho-corasick = "1"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# NB: do NOT set panic = "abort" — PyO3 catches Rust panics at the pymethods
+# boundary and turns them into Python exceptions; "abort" would crash the host
+# interpreter instead. Default unwind keeps a panic recoverable from Python.
