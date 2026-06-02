@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Self-contained correctness gate: the streaming-vs-scan-vs-canonical merge
+      # invariants on random tables, rank-inversion, etc. No Python or model data.
+      - name: Rust tests
+        run: cargo test --release
+
+      - name: Build and install extension
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --out dist --interpreter python
+          python -m pip install --force-reinstall dist/*.whl
+
+      # Smoke test the installed wheel: imports cleanly, tokenizes, round-trips.
+      # from_tiktoken downloads a small rank file from OpenAI's CDN (no tiktoken dep).
+      - name: Python smoke test
+        run: |
+          python - <<'PY'
+          from tuetoken import Tokenizer, AutoTokenizer
+          enc = Tokenizer.from_tiktoken("gpt2")
+          ids = enc.encode_ordinary("Hello world 1234")
+          assert enc.decode(ids) == "Hello world 1234", "round-trip failed"
+          assert enc.count_tokens("Hello world 1234") == len(ids)
+          print("smoke OK:", ids)
+          PY

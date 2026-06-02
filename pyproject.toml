@@ -1,0 +1,47 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tuetoken"
+version = "0.1.1"
+description = "The fastest tokenizer for modern LLMs, up to 20x faster. Drop-in for transformers.AutoTokenizer, byte-exact, never quadratic."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Vadim Borisov", email = "pyybor@gmail.com" }]
+keywords = ["tokenizer", "bpe", "nlp", "tiktoken", "rust", "pyo3", "llm"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
+
+[project.urls]
+Homepage = "https://github.com/pyybor/tuetoken"
+Repository = "https://github.com/pyybor/tuetoken"
+Issues = "https://github.com/pyybor/tuetoken/issues"
+
+[project.optional-dependencies]
+hub = ["huggingface_hub"]   # for Tokenizer/AutoTokenizer.from_pretrained(repo_id)
+auto = ["huggingface_hub", "jinja2", "numpy"]  # full AutoTokenizer (chat templates, return_tensors)
+test = ["tiktoken", "tokenizers", "numpy", "huggingface_hub", "transformers", "jinja2"]
+
+[tool.maturin]
+# Mixed layout: the compiled core is `tuetoken._core`; the Python package
+# in `python/` re-exports it and adds from_pretrained/from_tiktoken + stubs.
+python-source = "python"
+module-name = "tuetoken._core"
+features = ["extension-module"]
+strip = true
