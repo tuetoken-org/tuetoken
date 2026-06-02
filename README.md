@@ -38,6 +38,10 @@ pip install maturin
 maturin develop --release
 ```
 
+## Performances
+
+![Performances](https://raw.githubusercontent.com/tuetoken-org/tuetoken/main/bench_tokenizers.png)
+
 ## Drop-in `AutoTokenizer`
 
 The full 🤗 API, byte-exact with `transformers.AutoTokenizer`:
