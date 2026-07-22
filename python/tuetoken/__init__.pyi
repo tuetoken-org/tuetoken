@@ -38,6 +38,13 @@ class Tokenizer:
     def count_tokens_batch(self, texts: Sequence[str], num_threads: int = ...) -> list[int]:
         """Token counts for many texts in parallel."""
 
+    def encode_ordinary_to_buffer(self, texts: Sequence[str], num_threads: int = ...) -> dict[str, Any]:
+        """Bulk-corpus fast path: encode many texts in parallel and return all ids
+        as one flat ``uint32`` numpy array plus an ``int64`` offsets array (length
+        rows+1). Document ``i``'s tokens are ``data[offsets[i]:offsets[i+1]]``.
+        Avoids the per-token Python boxing of ``encode_ordinary_batch`` — use it to
+        tokenize a whole corpus offline. Returns ``{"data", "offsets"}``. Needs numpy."""
+
     def encode_batch(
         self,
         texts: Sequence[str],

@@ -377,6 +377,17 @@ def test_new_features():
     tot += 1; ok += fix_ok
     tot += 1; ok += R.encode_batch([])["input_ids"].shape == (0, 0)
 
+    # encode_ordinary_to_buffer: flat uint32 ids + int64 offsets, slices == list
+    buf = R.encode_ordinary_to_buffer(texts)
+    data, offs = buf["data"], buf["offsets"]
+    buf_ok = (data.dtype == np.uint32 and offs.dtype == np.int64
+              and len(offs) == len(texts) + 1 and int(offs[0]) == 0
+              and int(offs[-1]) == len(data) == sum(len(s) for s in seqs))
+    for i, s in enumerate(seqs):
+        buf_ok &= data[offs[i]:offs[i + 1]].tolist() == s
+    tot += 1; ok += buf_ok
+    tot += 1; ok += R.encode_ordinary_to_buffer([])["offsets"].tolist() == [0]
+
     # from_tiktoken accepts an OpenAI MODEL name (not just an encoding name)
     tot += 1
     ok += tuetoken.Tokenizer.from_tiktoken("gpt-4o").encode_ordinary("hi") == \

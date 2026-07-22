@@ -17,7 +17,7 @@ mod unicode_tables;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyString};
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
@@ -1558,6 +1558,81 @@ impl Tokenizer {
         let out = PyDict::new(py);
         out.set_item("input_ids", ids_arr)?;
         out.set_item("attention_mask", mask_arr)?;
+        Ok(out)
+    }
+
+    /// Bulk-corpus fast path: encode `texts` in parallel and return ALL token ids
+    /// as ONE flat `uint32` numpy array plus an `int64` offsets array (length
+    /// rows+1), so document `i`'s tokens are `data[offsets[i]:offsets[i+1]]`.
+    ///
+    /// Unlike `encode_ordinary_batch` (which builds a Python `list[int]` per doc,
+    /// boxing every token into a PyInt) this never crosses the Python-object
+    /// boundary per token — the ids go straight into a contiguous buffer, handed
+    /// to numpy in a single copy. This is the right path for tokenizing a whole
+    /// corpus offline (data prep), where per-token boxing otherwise dominates.
+    /// Ragged (no padding), so no wasted work on uneven document lengths.
+    #[pyo3(signature = (texts, num_threads = 0))]
+    fn encode_ordinary_to_buffer<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+        num_threads: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        // Encode in parallel (GIL released) into per-document token vecs, then build
+        // the offsets (prefix sum of lengths). Only the encode is expensive; the
+        // fill below is memcpy.
+        let seqs: Vec<Vec<u32>> = py.detach(|| {
+            self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_one(t, Merge::Auto))
+        });
+        let mut offsets = Vec::with_capacity(seqs.len() + 1);
+        offsets.push(0i64);
+        let mut total = 0usize;
+        for s in &seqs {
+            total += s.len();
+            offsets.push(total as i64);
+        }
+
+        // Fill the flat u32 buffer DIRECTLY into a numpy-owned bytearray, in parallel
+        // by offset. np.frombuffer then views that memory with no copy (numpy keeps
+        // the bytearray alive via array.base). This avoids the intermediate Vec and
+        // the extra numpy .copy() the list/padded paths pay — the two-pass parallel
+        // fill mirrors gigatoken's contiguous-buffer approach.
+        let data_ba = PyByteArray::new_with(py, total * 4, |buf: &mut [u8]| {
+            // SAFETY: buf is total*4 bytes, 4-byte aligned (fresh alloc), and u32 is
+            // POD; we write every element exactly once via disjoint sub-slices.
+            let out: &mut [u32] =
+                unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u32, total) };
+            // Split into per-doc disjoint mutable slices, then copy each in parallel.
+            let mut slices: Vec<&mut [u32]> = Vec::with_capacity(seqs.len());
+            let mut rest = out;
+            for s in &seqs {
+                let (head, tail) = rest.split_at_mut(s.len());
+                slices.push(head);
+                rest = tail;
+            }
+            slices
+                .into_par_iter()
+                .zip(seqs.par_iter())
+                .for_each(|(dst, src)| dst.copy_from_slice(src));
+            Ok(())
+        })?;
+
+        let np = py.import("numpy").map_err(|_| {
+            PyValueError::new_err("encode_ordinary_to_buffer requires numpy (pip install numpy)")
+        })?;
+        // data: zero-copy writable view over the bytearray (shares its memory).
+        let data_arr = np.call_method1("frombuffer", (data_ba, "uint32"))?;
+        // offsets are tiny (rows+1); one copy is negligible.
+        let off_u8 = unsafe {
+            std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 8)
+        };
+        let off_arr = np
+            .call_method1("frombuffer", (PyBytes::new(py, off_u8), "int64"))?
+            .call_method0("copy")?;
+
+        let out = PyDict::new(py);
+        out.set_item("data", data_arr)?;
+        out.set_item("offsets", off_arr)?;
         Ok(out)
     }
 
