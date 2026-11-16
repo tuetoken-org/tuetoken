@@ -9,7 +9,9 @@
 //! only pre-tokenizer still declined is the Punctuation pre-tokenizer.
 
 mod bpe;
+mod chunk_table;
 mod cjk;
+mod norm;
 mod pretok;
 mod unicode;
 mod unicode_tables;
@@ -17,6 +19,7 @@ mod unicode_tables;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -25,6 +28,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pretok::Pretok;
+
+/// Fork safety: rayon pools (global or cached) are threads of the process that
+/// created them; after `fork()` the child inherits the pool's state but not its
+/// threads, so submitting work there deadlocks. We remember the pid of the
+/// first process to go parallel and run everything serially in any other
+/// process (e.g. a multiprocessing child that forked after the parent encoded).
+fn parallel_ok() -> bool {
+    static PID: OnceLock<u32> = OnceLock::new();
+    *PID.get_or_init(std::process::id) == std::process::id()
+}
 
 /// Cached rayon thread pools keyed by thread count. Building a pool spawns OS
 /// threads, so creating one per `encode_ordinary_batch` call made 2-thread runs
@@ -449,6 +462,9 @@ fn extract_split_fallback(pre: &Value) -> Option<Vec<String>> {
 /// cache-hot scan-and-merge (faster for typical short post-pretok chunks).
 const STREAM_THRESHOLD: usize = 256;
 
+/// Documents at least this long are encoded as parallel segments.
+const SPLIT_MIN: usize = 1 << 18;
+
 /// Which BPE merge implementation to run. `Auto` picks per chunk (streaming for
 /// long byte-level chunks, scan otherwise); `Stream`/`Scan` force one — used by
 /// the `_encode_ordinary_stream`/`_encode_ordinary_scan` parity-test entry points
@@ -505,6 +521,14 @@ struct Tokenizer {
     special_lstrip: Vec<bool>, // absorb whitespace to the left of the match
     special_rstrip: Vec<bool>, // absorb whitespace to the right
     prepend_scheme: u8,        // 0 none, 1 always, 2 first (metaspace prepend)
+    // Load-time verified whole-chunk table (≤15-byte pre-token -> its single
+    // token). See chunk_table.rs. Only consulted under Merge::Auto.
+    chunk_table: chunk_table::ChunkTable,
+    uid: u64,
+    // Pre-built Python ints for every token id (lazily, under the GIL), so a
+    // result list is filled with INCREF'd pointers instead of allocating a fresh
+    // PyLong per token — the dominant cost of returning list[int].
+    int_table: OnceLock<Vec<Py<PyAny>>>,
 }
 
 #[derive(Default)]
@@ -520,7 +544,68 @@ struct Scratch {
     nrank: Vec<u32>,
     state: Vec<u32>,
     todo: Vec<(u32, u32)>,
+    // per-thread memo of multi-token chunks (see chunk_table::DynCache)
+    dyn_cache: chunk_table::DynCache,
 }
+
+thread_local! {
+    /// One reusable Scratch per OS thread: no per-call allocation of the merge
+    /// buffers, and the DynCache stays warm across calls on the same thread.
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// Output of `Tokenizer::encode_flat`: task buffers in document order, plus
+/// tokens per document.
+struct Flat {
+    bufs: Vec<Vec<u32>>,
+    doc_counts: Vec<usize>,
+}
+
+impl Flat {
+    fn total(&self) -> usize {
+        self.bufs.iter().map(|b| b.len()).sum()
+    }
+
+    /// Copy all task buffers, in order, into `dst` (len == total) in parallel.
+    fn scatter(&self, dst: &mut [u32]) {
+        let mut slices: Vec<(&mut [u32], &Vec<u32>)> = Vec::with_capacity(self.bufs.len());
+        let mut rest = dst;
+        for b in &self.bufs {
+            let (head, tail) = rest.split_at_mut(b.len());
+            slices.push((head, b));
+            rest = tail;
+        }
+        if self.bufs.len() <= 1 || self.total() < (1 << 16) || !parallel_ok() {
+            for (d, s) in slices {
+                d.copy_from_slice(s);
+            }
+        } else {
+            slices.into_par_iter().for_each(|(d, s)| d.copy_from_slice(s));
+        }
+    }
+
+    fn scatter_into_vec(&self, out: &mut Vec<u32>) {
+        if self.bufs.len() == 1 {
+            out.extend_from_slice(&self.bufs[0]);
+            return;
+        }
+        let total = self.total();
+        out.clear();
+        out.reserve_exact(total);
+        // SAFETY: capacity >= total; `scatter` writes every one of the `total`
+        // elements exactly once before we set the length (u32 has no invalid
+        // bit patterns, so exposing the writes is sound).
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(out.as_mut_ptr(), total);
+            self.scatter(dst);
+            out.set_len(total);
+        }
+    }
+}
+
+/// Unique id per Tokenizer instance (never reused), so a thread-local cache can
+/// tell whose results it holds even if a dropped tokenizer's address is reused.
+static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Tokenizer {
     /// Map `f` over `items` in parallel, sizing rayon tasks by WORK (each task
@@ -536,7 +621,7 @@ impl Tokenizer {
     ) -> Vec<R> {
         const MIN_TASK_BYTES: usize = 4096;
         let nt = if num_threads == 0 { 0 } else { num_threads.min(1024) };
-        if nt == 1 || items.len() <= 1 {
+        if nt == 1 || items.len() <= 1 || !parallel_ok() {
             return items.iter().map(f).collect();
         }
         let total: usize = items.iter().map(&weight).sum();
@@ -557,6 +642,145 @@ impl Tokenizer {
                 None => run(),
             }
         }
+    }
+
+    /// Inputs shorter than this are encoded without releasing the GIL: for a
+    /// short string the detach/re-attach round trip costs more than the encode.
+    const DETACH_MIN: usize = 2048;
+
+    fn ints<'py>(&self, py: Python<'py>) -> &Vec<Py<PyAny>> {
+        self.int_table.get_or_init(|| {
+            (0..self.vocab_size as u64)
+                .map(|i| i.into_pyobject(py).unwrap().into_any().unbind())
+                .collect()
+        })
+    }
+
+    /// `ids` -> Python list[int], reusing the pre-built int objects.
+    fn to_pylist<'py>(&self, py: Python<'py>, ids: &[u32]) -> Bound<'py, PyList> {
+        let table = self.ints(py);
+        // SAFETY: PyList_New(n) returns a new list with n NULL slots, each of which
+        // we fill exactly once with an owned reference (PyList_SET_ITEM steals it).
+        unsafe {
+            let list = pyo3::ffi::PyList_New(ids.len() as pyo3::ffi::Py_ssize_t);
+            if list.is_null() {
+                // allocation failure: fall back to the generic conversion path
+                return PyList::new(py, ids).expect("list alloc");
+            }
+            for (i, &t) in ids.iter().enumerate() {
+                let obj = match table.get(t as usize) {
+                    Some(o) => {
+                        let p = o.as_ptr();
+                        pyo3::ffi::Py_INCREF(p);
+                        p
+                    }
+                    None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
+                };
+                pyo3::ffi::PyList_SET_ITEM(list, i as pyo3::ffi::Py_ssize_t, obj);
+            }
+            Bound::from_owned_ptr(py, list).cast_into_unchecked()
+        }
+    }
+
+    /// Python list-of-lists straight from a `Flat` (walks the task buffers with
+    /// a cursor; a split document may span several buffers).
+    fn flat_to_pylists<'py>(&self, py: Python<'py>, flat: &Flat) -> Bound<'py, PyList> {
+        let table = self.ints(py);
+        let (mut bi, mut off) = (0usize, 0usize);
+        // SAFETY: as in to_pylist — each slot of each new list is filled exactly
+        // once with an owned reference.
+        unsafe {
+            let outer = pyo3::ffi::PyList_New(flat.doc_counts.len() as pyo3::ffi::Py_ssize_t);
+            assert!(!outer.is_null(), "list alloc");
+            for (d, &c) in flat.doc_counts.iter().enumerate() {
+                let inner = pyo3::ffi::PyList_New(c as pyo3::ffi::Py_ssize_t);
+                assert!(!inner.is_null(), "list alloc");
+                let mut k = 0usize;
+                while k < c {
+                    while off == flat.bufs[bi].len() {
+                        bi += 1;
+                        off = 0;
+                    }
+                    let t = flat.bufs[bi][off];
+                    off += 1;
+                    let obj = match table.get(t as usize) {
+                        Some(o) => {
+                            let p = o.as_ptr();
+                            pyo3::ffi::Py_INCREF(p);
+                            p
+                        }
+                        None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
+                    };
+                    pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj);
+                    k += 1;
+                }
+                pyo3::ffi::PyList_SET_ITEM(outer, d as pyo3::ffi::Py_ssize_t, inner);
+            }
+            Bound::from_owned_ptr(py, outer).cast_into_unchecked()
+        }
+    }
+
+    fn to_pylists<'py>(&self, py: Python<'py>, seqs: &[Vec<u32>]) -> Bound<'py, PyList> {
+        unsafe {
+            let outer = pyo3::ffi::PyList_New(seqs.len() as pyo3::ffi::Py_ssize_t);
+            if outer.is_null() {
+                return PyList::new(py, seqs.iter().map(|v| self.to_pylist(py, v))).expect("list alloc");
+            }
+            for (i, v) in seqs.iter().enumerate() {
+                let inner = self.to_pylist(py, v).into_ptr();
+                pyo3::ffi::PyList_SET_ITEM(outer, i as pyo3::ffi::Py_ssize_t, inner);
+            }
+            Bound::from_owned_ptr(py, outer).cast_into_unchecked()
+        }
+    }
+
+    /// Run `f` with the GIL released only when the input is big enough to pay off.
+    #[inline]
+    fn maybe_detach<T: Send>(&self, py: Python<'_>, len: usize, f: impl FnOnce() -> T + Send) -> T {
+        if len < Self::DETACH_MIN {
+            f()
+        } else {
+            py.detach(f)
+        }
+    }
+
+
+    /// Build the whole-chunk table: for every vocab token whose bytes are a
+    /// plausible pre-token (1..=15 bytes), run this tokenizer's own per-chunk
+    /// encoder on those bytes and keep the ones that come out as ONE token. The
+    /// table therefore only ever records `f(bytes)` for the runtime's `f` — it
+    /// cannot disagree with the merge path. Parallel; a few ms for 200k vocab.
+    fn build_chunk_table(&mut self) {
+        let ids: Vec<u32> = (0..self.byte_span.len() as u32)
+            .filter(|&id| {
+                let l = self.byte_span[id as usize].1 as usize;
+                l >= 1 && l <= chunk_table::MAX_KEY
+            })
+            .collect();
+        let this = &*self;
+        let one = |s: &mut Scratch, id: u32| -> Option<(&[u8], u32)> {
+            let (off, len) = this.byte_span[id as usize];
+            let b = &this.byte_arena[off as usize..(off + len) as usize];
+            s.out.clear();
+            this.emit(b, s, Merge::Auto);
+            if s.out.len() != 1 {
+                return None;
+            }
+            Some((b, s.out[0]))
+        };
+        let pairs: Vec<(&[u8], u32)> = if parallel_ok() {
+            ids.par_iter()
+                .with_min_len(512)
+                .map_init(Scratch::default, |s, &id| one(s, id))
+                .flatten()
+                .collect()
+        } else {
+            let mut s = Scratch::default();
+            ids.iter().filter_map(|&id| one(&mut s, id)).collect()
+        };
+        let table = chunk_table::ChunkTable::build(&pairs);
+        drop(pairs);
+        self.chunk_table = table;
     }
 
     /// Gather the raw bytes for `ids` from the contiguous token-byte arena.
@@ -638,6 +862,29 @@ impl Tokenizer {
     /// Emit one pre-token chunk: byte_fallback (char lookup) or byte-level.
     #[inline]
     fn emit(&self, chunk: &[u8], s: &mut Scratch, mode: Merge) {
+        let n = chunk.len();
+        if mode == Merge::Auto && n.wrapping_sub(1) < chunk_table::MAX_KEY {
+            let (lo, hi) = chunk_table::pack(chunk);
+            if let Some(t) = self.chunk_table.get(lo, hi) {
+                s.out.push(t);
+                return;
+            }
+            if s.dyn_cache.owned_by(self.uid) {
+                if let Some(ts) = s.dyn_cache.get(lo, hi) {
+                    s.out.extend_from_slice(ts); // disjoint field borrows
+                    return;
+                }
+                let start = s.out.len();
+                if self.byte_fallback {
+                    self.process_chunk_bf(chunk, s, mode);
+                } else {
+                    self.process_chunk(chunk, s, mode);
+                }
+                let (out, dc) = (&s.out, &mut s.dyn_cache);
+                dc.put(lo, hi, &out[start..]);
+                return;
+            }
+        }
         if self.byte_fallback {
             self.process_chunk_bf(chunk, s, mode);
         } else {
@@ -703,23 +950,7 @@ impl Tokenizer {
     /// declares an NFC normalizer — stays zero-copy on the hot path.
     #[inline]
     fn normalize<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
-        use std::borrow::Cow;
-        use unicode_normalization::{
-            is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
-            UnicodeNormalization,
-        };
-        let yes = IsNormalized::Yes;
-        match self.norm_form {
-            1 if is_nfc_quick(text.chars()) == yes => Cow::Borrowed(text),
-            1 => Cow::Owned(text.nfc().collect()),
-            2 if is_nfd_quick(text.chars()) == yes => Cow::Borrowed(text),
-            2 => Cow::Owned(text.nfd().collect()),
-            3 if is_nfkc_quick(text.chars()) == yes => Cow::Borrowed(text),
-            3 => Cow::Owned(text.nfkc().collect()),
-            4 if is_nfkd_quick(text.chars()) == yes => Cow::Borrowed(text),
-            4 => Cow::Owned(text.nfkd().collect()),
-            _ => Cow::Borrowed(text),
-        }
+        norm::normalize(self.norm_form, text)
     }
 
     /// SentencePiece metaspace: ' ' -> U+2581, with the model's prepend variant.
@@ -786,6 +1017,10 @@ impl Tokenizer {
     /// Fast path: hand-written state machine produces chunk boundaries.
     #[inline]
     fn encode_bytes(&self, bytes: &[u8], s: &mut Scratch, mode: Merge) {
+        if mode == Merge::Auto {
+            self.encode_range(bytes, 0, bytes.len(), s);
+            return;
+        }
         let n = bytes.len();
         let mut pos = 0usize;
         while pos < n {
@@ -793,6 +1028,204 @@ impl Tokenizer {
             self.emit(&bytes[pos..end], s, mode);
             pos = end;
         }
+    }
+
+    /// Hot loop over `bytes[start..stop]` (Merge::Auto). `stop` must be a chunk
+    /// boundary of the full-buffer scan; scanning always sees the WHOLE buffer, so
+    /// look-ahead rules (`\s+(?!\S)`) behave exactly as in an unsplit encode.
+    #[inline]
+    fn encode_range(&self, bytes: &[u8], start: usize, stop: usize, s: &mut Scratch) {
+        let n = bytes.len();
+        let mut pos = start;
+        while pos < stop {
+            let end = pretok::next_chunk_end(self.kind, bytes, pos);
+            let len = end - pos;
+            if len.wrapping_sub(1) < chunk_table::MAX_KEY && pos + 16 <= n {
+                // SAFETY: pos + 16 <= n, so 16 bytes are readable at pos.
+                let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(pos), len) };
+                if let Some(t) = self.chunk_table.get(lo, hi) {
+                    s.out.push(t);
+                    pos = end;
+                    continue;
+                }
+                // Static miss: reuse the key for the per-thread cache, then merge.
+                if s.dyn_cache.owned_by(self.uid) {
+                    if let Some(ts) = s.dyn_cache.get(lo, hi) {
+                        s.out.extend_from_slice(ts); // disjoint field borrows
+                        pos = end;
+                        continue;
+                    }
+                    let st = s.out.len();
+                    self.process_chunk(&bytes[pos..end], s, Merge::Auto);
+                    let (out, dc) = (&s.out, &mut s.dyn_cache);
+                    dc.put(lo, hi, &out[st..]);
+                    pos = end;
+                    continue;
+                }
+            }
+            self.emit(&bytes[pos..end], s, Merge::Auto);
+            pos = end;
+        }
+        debug_assert_eq!(pos, stop, "segment end was not a chunk boundary");
+    }
+
+    /// Can one long document be split across threads? Only the hand-written
+    /// state-machine path, where the split rule below is proven (see split_points).
+    fn splittable(&self) -> bool {
+        self.meta_mode == 0 && !self.byte_fallback && !self.cjk && self.fallback_re.is_empty()
+    }
+
+    /// Positions `p` that are GUARANTEED chunk boundaries for every grammar
+    /// (Word / Generic / CamelCase): `b[p-1] == '\n'` and `b[p]` is an ASCII
+    /// letter. Proof sketch: the only chunks that can contain a '\n' are
+    /// whitespace chunks (`\s*[\r\n]+` ends at the last newline of the run;
+    /// `\s+(?!\S)` leaves the last ws char — here the '\n' — to a 1-char `\s+`
+    /// chunk) and symbol runs with a `[\r\n]*`/`[\r\n/]*` tail, which stop at a
+    /// letter. No letter-run prefix (`[^\r\n\p{L}\p{N}]?`, ` ?`) can be '\n'.
+    /// So the chunk containing `p-1` ends exactly at `p`, and since every chunk
+    /// scan only looks forward, the scan from `p` is independent of what came
+    /// before. Returns [0, p1, p2, …, n], segments ~`seg` bytes.
+    fn split_points(b: &[u8], seg: usize) -> Vec<usize> {
+        let n = b.len();
+        let mut pts = vec![0usize];
+        let mut target = seg;
+        while target < n {
+            let lim = (target + seg).min(n);
+            let mut found = None;
+            let mut i = target.max(1);
+            while i < lim {
+                if b[i - 1] == b'\n' && b[i].is_ascii_alphabetic() {
+                    found = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            match found {
+                Some(p) => {
+                    pts.push(p);
+                    target = p + seg;
+                }
+                None => target = lim + 1,
+            }
+        }
+        pts.push(n);
+        pts
+    }
+
+    /// Encode one long document in parallel segments (state-machine path only).
+    fn encode_split(&self, text: &str) -> Vec<u32> {
+        let flat = self.encode_flat(&[text], 0);
+        let mut out = Vec::new();
+        flat.scatter_into_vec(&mut out);
+        out
+    }
+
+    /// Run `f` on this thread's warm Scratch (claimed for this tokenizer), or on a
+    /// fresh one if the thread-local is already borrowed (re-entrant rayon steal).
+    #[inline]
+    fn with_scratch<R>(&self, f: impl FnOnce(&mut Scratch) -> R) -> R {
+        SCRATCH.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut g) => {
+                g.dyn_cache.claim(self.uid);
+                f(&mut g)
+            }
+            Err(_) => f(&mut Scratch::default()),
+        })
+    }
+
+    /// The batch engine behind every multi-document / large-document path.
+    ///
+    /// Work items are whole documents, or — for long documents on the
+    /// state-machine path — segments cut at PROVEN chunk boundaries (see
+    /// `split_points`). Consecutive items are grouped into tasks of at least
+    /// TASK_BYTES of input, and each task encodes into ONE contiguous buffer
+    /// (no per-document Vec, no per-document free). Tasks run on rayon (GIL
+    /// released by the caller); the caller then scatters the task buffers into
+    /// its destination in parallel. Output is identical to per-document
+    /// `encode_one`, in document order.
+    fn encode_flat<T: AsRef<str> + Sync>(&self, texts: &[T], num_threads: usize) -> Flat {
+        const SEG: usize = 1 << 16;
+        const TASK_BYTES: usize = 1 << 16;
+        let splittable = self.splittable();
+        let norm: Vec<std::borrow::Cow<'_, str>> = if self.norm_form == 0 {
+            texts.iter().map(|t| std::borrow::Cow::Borrowed(t.as_ref())).collect()
+        } else {
+            // quick-check is ~free on ASCII; only rare runs allocate
+            if num_threads == 1 || !parallel_ok() {
+                texts.iter().map(|t| self.normalize(t.as_ref())).collect()
+            } else {
+                texts.par_iter().with_min_len(64).map(|t| self.normalize(t.as_ref())).collect()
+            }
+        };
+        // items: (doc, start, end, is_segment)
+        let mut items: Vec<(u32, usize, usize, bool)> = Vec::with_capacity(texts.len());
+        for (i, d) in norm.iter().enumerate() {
+            let b = d.as_bytes();
+            if splittable && b.len() >= SPLIT_MIN {
+                let pts = Self::split_points(b, SEG);
+                for w in pts.windows(2) {
+                    items.push((i as u32, w[0], w[1], true));
+                }
+            } else {
+                items.push((i as u32, 0, b.len(), false));
+            }
+        }
+        let mut tasks: Vec<(usize, usize, usize)> = Vec::new(); // (first item, end item, bytes)
+        let (mut st, mut acc) = (0usize, 0usize);
+        for (k, it) in items.iter().enumerate() {
+            acc += it.2 - it.1;
+            if acc >= TASK_BYTES {
+                tasks.push((st, k + 1, acc));
+                st = k + 1;
+                acc = 0;
+            }
+        }
+        if st < items.len() {
+            tasks.push((st, items.len(), acc));
+        }
+        let run_task = |&(x, y, nbytes): &(usize, usize, usize)| -> (Vec<u32>, Vec<u32>) {
+            self.with_scratch(|s| {
+                let mut counts = Vec::with_capacity(y - x);
+                let saved = std::mem::replace(&mut s.out, Vec::with_capacity(nbytes / 3 + 16));
+                for &(doc, a, b, seg) in &items[x..y] {
+                    let before = s.out.len();
+                    let d: &str = &norm[doc as usize];
+                    if seg {
+                        self.encode_range(d.as_bytes(), a, b, s);
+                    } else {
+                        self.encode_into_norm(d, Merge::Auto, true, s);
+                    }
+                    counts.push((s.out.len() - before) as u32);
+                }
+                let out = std::mem::replace(&mut s.out, saved);
+                (out, counts)
+            })
+        };
+        let nt = if num_threads == 0 { 0 } else { num_threads.min(1024) };
+        let parts: Vec<(Vec<u32>, Vec<u32>)> = if nt == 1 || tasks.len() <= 1 || !parallel_ok() {
+            tasks.iter().map(run_task).collect()
+        } else {
+            let run = || tasks.par_iter().map(run_task).collect();
+            if nt == 0 {
+                run()
+            } else {
+                match fixed_pool(nt) {
+                    Some(pool) => pool.install(run),
+                    None => run(),
+                }
+            }
+        };
+        let mut doc_counts = vec![0usize; texts.len()];
+        let mut bufs = Vec::with_capacity(parts.len());
+        let mut k = 0usize;
+        for (buf, counts) in parts {
+            for c in counts {
+                doc_counts[items[k].0 as usize] += c as usize;
+                k += 1;
+            }
+            bufs.push(buf);
+        }
+        Flat { bufs, doc_counts }
     }
 
     /// Fallback path: pre-tokenize via the model's actual Split regex(es)
@@ -896,32 +1329,56 @@ impl Tokenizer {
     /// (false, for non-first fragments under `prepend_scheme="first"`). Only the
     /// metaspace path uses it; all other paths ignore it.
     fn encode_one_p(&self, text: &str, mode: Merge, prepend: bool) -> Vec<u32> {
-        let mut s = Scratch::default();
+        // Long single documents: split at proven chunk boundaries and encode the
+        // segments in parallel (nests fine inside a rayon batch — work stealing).
+        if mode == Merge::Auto && text.len() >= SPLIT_MIN && self.splittable() {
+            return self.encode_split(text);
+        }
+        SCRATCH.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut s) => {
+                s.dyn_cache.claim(self.uid);
+                s.out = Vec::with_capacity(text.len() / 3 + 8);
+                self.encode_into(text, mode, prepend, &mut s);
+                std::mem::take(&mut s.out)
+            }
+            // re-entrant use on this thread (not expected): fall back to fresh scratch
+            Err(_) => {
+                let mut s = Scratch::default();
+                self.encode_into(text, mode, prepend, &mut s);
+                s.out
+            }
+        })
+    }
+
+    fn encode_into(&self, text: &str, mode: Merge, prepend: bool, s: &mut Scratch) {
         // The normalizer runs first in the HF pipeline (normalizer -> pre_tokenizer
         // -> model), for ByteLevel models too — not just SentencePiece. Skipping it
         // silently mistokenizes decomposed/combining Unicode (NFD text, jamo, Å, …)
         // on every model that declares one (a large share of popular models).
         let norm = self.normalize(text);
-        let text = norm.as_ref();
+        self.encode_into_norm(norm.as_ref(), mode, prepend, s);
+    }
+
+    /// `encode_into` for text that is ALREADY normalized. Appends to `s.out`.
+    fn encode_into_norm(&self, text: &str, mode: Merge, prepend: bool, s: &mut Scratch) {
         if self.meta_mode != 0 {
             // SentencePiece: metaspace -> split on U+2581 -> emit.
             let meta = self.apply_metaspace(text, prepend);
-            self.encode_meta(&meta, &mut s, mode);
+            self.encode_meta(&meta, s, mode);
         } else if self.byte_fallback {
             // byte_fallback without metaspace (Split pretok, or whole-text).
             if self.fallback_re.is_empty() {
-                self.emit(text.as_bytes(), &mut s, mode);
+                self.emit(text.as_bytes(), s, mode);
             } else {
-                self.encode_text_regex(text, &mut s, mode);
+                self.encode_text_regex(text, s, mode);
             }
         } else if self.cjk {
-            self.encode_cjk(text, &mut s, mode);
+            self.encode_cjk(text, s, mode);
         } else if !self.fallback_re.is_empty() {
-            self.encode_text_regex(text, &mut s, mode);
+            self.encode_text_regex(text, s, mode);
         } else {
-            self.encode_bytes(text.as_bytes(), &mut s, mode);
+            self.encode_bytes(text.as_bytes(), s, mode);
         }
-        s.out
     }
 
     /// BPE one inter-special fragment and append to `out`. `at_start` => the
@@ -1215,7 +1672,7 @@ impl Tokenizer {
             byte_arena.extend_from_slice(b);
         }
 
-        Ok(Tokenizer {
+        let mut tk = Tokenizer {
             kind,
             singleton,
             map,
@@ -1240,7 +1697,12 @@ impl Tokenizer {
             special_lstrip: Vec::new(),
             special_rstrip: Vec::new(),
             prepend_scheme: 0,
-        })
+            chunk_table: chunk_table::ChunkTable::empty(),
+            uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            int_table: OnceLock::new(),
+        };
+        tk.build_chunk_table();
+        Ok(tk)
     }
 
     /// `repr(tok)` — show what it is.
@@ -1294,16 +1756,18 @@ impl Tokenizer {
         Self::new(&path)
     }
 
-    fn encode_ordinary(&self, py: Python<'_>, text: &str) -> Vec<u32> {
-        py.detach(|| self.encode_one(text, Merge::Auto))
+    fn encode_ordinary<'py>(&self, py: Python<'py>, text: &str) -> Bound<'py, PyList> {
+        let ids = self.maybe_detach(py, text.len(), || self.encode_one(text, Merge::Auto));
+        self.to_pylist(py, &ids)
     }
 
     /// Like `encode_ordinary` but WITHOUT the SentencePiece metaspace prepend —
     /// used by the AutoTokenizer wrapper for fragments after a special token under
     /// `prepend_scheme="first"`. Identical to `encode_ordinary` for non-metaspace
     /// models.
-    fn encode_ordinary_no_prefix(&self, py: Python<'_>, text: &str) -> Vec<u32> {
-        py.detach(|| self.encode_one_p(text, Merge::Auto, false))
+    fn encode_ordinary_no_prefix<'py>(&self, py: Python<'py>, text: &str) -> Bound<'py, PyList> {
+        let ids = self.maybe_detach(py, text.len(), || self.encode_one_p(text, Merge::Auto, false));
+        self.to_pylist(py, &ids)
     }
 
     /// Register the AutoTokenizer's special tokens so `encode_special` can split on
@@ -1333,16 +1797,18 @@ impl Tokenizer {
     /// the registered added tokens (leftmost-longest, honouring lstrip/rstrip), BPE
     /// each gap, splice the special ids — all in one Rust pass. Same ids as the
     /// Python fragment loop, but no per-fragment Python↔Rust crossing.
-    fn encode_special(&self, py: Python<'_>, text: &str) -> Vec<u32> {
-        py.detach(|| self.encode_special_one(text))
+    fn encode_special<'py>(&self, py: Python<'py>, text: &str) -> Bound<'py, PyList> {
+        let ids = self.maybe_detach(py, text.len(), || self.encode_special_one(text));
+        self.to_pylist(py, &ids)
     }
 
     /// Batch of `encode_special`, parallel over rayon (GIL released) — so the
     /// AutoTokenizer's `__call__` on a list is one Rust pass instead of a Python
     /// loop. `num_threads` 0 = all cores.
     #[pyo3(signature = (texts, num_threads = 0))]
-    fn encode_special_batch(&self, py: Python<'_>, texts: Vec<String>, num_threads: usize) -> Vec<Vec<u32>> {
-        py.detach(|| self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_special_one(t)))
+    fn encode_special_batch<'py>(&self, py: Python<'py>, texts: Vec<PyBackedStr>, num_threads: usize) -> Bound<'py, PyList> {
+        let seqs = py.detach(|| self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_special_one(t)));
+        self.to_pylists(py, &seqs)
     }
 
     /// Buffer fast-path for the output side: ordinary-encode to a raw
@@ -1451,56 +1917,21 @@ impl Tokenizer {
     }
 
     #[pyo3(signature = (texts, num_threads = 0))]
-    fn encode_ordinary_batch(
+    fn encode_ordinary_batch<'py>(
         &self,
-        py: Python<'_>,
-        texts: Vec<String>,
+        py: Python<'py>,
+        texts: Vec<PyBackedStr>,
         num_threads: usize,
-    ) -> Vec<Vec<u32>> {
-        // Clamp absurd thread counts so we never try to spawn millions of OS
-        // threads (0 = use the global pool / all cores).
-        let num_threads = if num_threads == 0 { 0 } else { num_threads.min(1024) };
-        py.detach(|| {
-            if num_threads == 1 {
-                return texts.iter().map(|t| self.encode_one(t, Merge::Auto)).collect();
-            }
-            // Size each rayon task by WORK, not item count: group docs so every
-            // task encodes at least ~MIN_TASK_BYTES. Encoding cost is ~linear in
-            // bytes, and rayon's per-task scheduling overhead is sub-microsecond,
-            // so a few KB of work per task makes that overhead negligible (<1%).
-            // This is workload-independent: tiny docs batch up (no over-split, so
-            // 2 threads beat serial), large docs run ~one-per-task, and the task
-            // count stays high enough for good work-stealing at ANY thread count
-            // — no thread-count-tuned constant.
-            const MIN_TASK_BYTES: usize = 4096;
-            let total: usize = texts.iter().map(|t| t.len()).sum();
-            let avg = (total / texts.len().max(1)).max(1);
-            let min_len = (MIN_TASK_BYTES / avg).max(1);
-            let run = || -> Vec<Vec<u32>> {
-                texts
-                    .par_iter()
-                    .with_min_len(min_len)
-                    .map(|t| self.encode_one(t, Merge::Auto))
-                    .collect()
-            };
-            if num_threads == 0 {
-                run()
-            } else {
-                // Reuse a cached pool; if the OS can't spawn threads, run serial.
-                match fixed_pool(num_threads) {
-                    Some(pool) => pool.install(run),
-                    None => run(),
-                }
-            }
-        })
+    ) -> Bound<'py, PyList> {
+        let flat = py.detach(|| self.encode_flat(&texts, num_threads));
+        self.flat_to_pylists(py, &flat)
     }
+
 
     /// Token counts for many texts, in parallel (no Python list of ids built).
     #[pyo3(signature = (texts, num_threads = 0))]
-    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<String>, num_threads: usize) -> Vec<usize> {
-        py.detach(|| {
-            self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_one(t, Merge::Auto).len())
-        })
+    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<PyBackedStr>, num_threads: usize) -> Vec<usize> {
+        py.detach(|| self.encode_flat(&texts, num_threads).doc_counts)
     }
 
     /// Training-loader helper: encode `texts` and return a fixed-width, padded
@@ -1516,7 +1947,7 @@ impl Tokenizer {
     fn encode_batch<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<String>,
+        texts: Vec<PyBackedStr>,
         max_length: Option<usize>,
         pad_id: u32,
         num_threads: usize,
@@ -1575,45 +2006,25 @@ impl Tokenizer {
     fn encode_ordinary_to_buffer<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<String>,
+        texts: Vec<PyBackedStr>,
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
-        // Encode in parallel (GIL released) into per-document token vecs, then build
-        // the offsets (prefix sum of lengths). Only the encode is expensive; the
-        // fill below is memcpy.
-        let seqs: Vec<Vec<u32>> = py.detach(|| {
-            self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_one(t, Merge::Auto))
-        });
-        let mut offsets = Vec::with_capacity(seqs.len() + 1);
+        // Encode in parallel (GIL released) into a few contiguous task buffers,
+        // then scatter them in parallel straight into a numpy-owned bytearray.
+        let flat = py.detach(|| self.encode_flat(&texts, num_threads));
+        let mut offsets = Vec::with_capacity(flat.doc_counts.len() + 1);
         offsets.push(0i64);
         let mut total = 0usize;
-        for s in &seqs {
-            total += s.len();
+        for &c in &flat.doc_counts {
+            total += c;
             offsets.push(total as i64);
         }
-
-        // Fill the flat u32 buffer DIRECTLY into a numpy-owned bytearray, in parallel
-        // by offset. np.frombuffer then views that memory with no copy (numpy keeps
-        // the bytearray alive via array.base). This avoids the intermediate Vec and
-        // the extra numpy .copy() the list/padded paths pay — the two-pass parallel
-        // fill mirrors gigatoken's contiguous-buffer approach.
         let data_ba = PyByteArray::new_with(py, total * 4, |buf: &mut [u8]| {
-            // SAFETY: buf is total*4 bytes, 4-byte aligned (fresh alloc), and u32 is
-            // POD; we write every element exactly once via disjoint sub-slices.
+            // SAFETY: buf is total*4 bytes from a fresh allocation (malloc
+            // alignment >= 4) and u32 is POD; `scatter` writes every element.
             let out: &mut [u32] =
                 unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u32, total) };
-            // Split into per-doc disjoint mutable slices, then copy each in parallel.
-            let mut slices: Vec<&mut [u32]> = Vec::with_capacity(seqs.len());
-            let mut rest = out;
-            for s in &seqs {
-                let (head, tail) = rest.split_at_mut(s.len());
-                slices.push(head);
-                rest = tail;
-            }
-            slices
-                .into_par_iter()
-                .zip(seqs.par_iter())
-                .for_each(|(dst, src)| dst.copy_from_slice(src));
+            py.detach(|| flat.scatter(out));
             Ok(())
         })?;
 
@@ -1649,7 +2060,7 @@ impl Tokenizer {
     fn encode_special_padded<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<String>,
+        texts: Vec<PyBackedStr>,
         prefix: Vec<i64>,
         suffix: Vec<i64>,
         max_length: Option<usize>,
