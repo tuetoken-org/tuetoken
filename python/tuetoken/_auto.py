@@ -386,8 +386,11 @@ class AutoTokenizer:
         if sentinel in out:
             i = out.index(sentinel)
             ps = (out[:i], out[i + 1:])
+            # exact iff the content appears exactly once (prefix + content + suffix)
+            self._ps_exact = out.count(sentinel) == 1
         else:
             ps = ([], [])
+            self._ps_exact = self._post is None
         self._ps_cache = ps
         return ps
 
@@ -418,6 +421,45 @@ class AutoTokenizer:
                 import torch
                 out = {k: torch.as_tensor(v) for k, v in out.items()}
             return out
+
+        # Rust fast path for lists (single sequences): encode + specials +
+        # truncation build the rows in one Rust pass; Python only adds masks and
+        # padding. Used only when the post-processor is exactly prefix+content+
+        # suffix (verified with a sentinel); anything else takes the path below.
+        if text_pair is None:
+            prefix, suffix = self._post_prefix_suffix() if add_special_tokens else ([], [])
+            if not add_special_tokens or self.__dict__.get("_ps_exact", False):
+                budget = (max(0, max_length - len(prefix) - len(suffix))
+                          if (truncation and max_length) else None)
+                seqs = self._core.encode_special_post(
+                    texts, list(prefix), list(suffix), budget, self.truncation_side == "left", 0)
+                masks = [[1] * len(q) for q in seqs] if (return_attention_mask or padding) else None
+                types = [[0] * len(q) for q in seqs] if return_token_type_ids else None
+                if padding:
+                    width = max_length if (padding == "max_length" and max_length) else max((len(q) for q in seqs), default=0)
+                    pid = self.pad_token_id or 0
+                    left = self.padding_side != "right"
+                    for k in range(len(seqs)):
+                        pad = width - len(seqs[k])
+                        if pad > 0:
+                            if left:
+                                seqs[k] = [pid] * pad + seqs[k]
+                                masks[k] = [0] * pad + masks[k]
+                                if types is not None:
+                                    types[k] = [0] * pad + types[k]
+                            else:
+                                seqs[k] = seqs[k] + [pid] * pad
+                                masks[k] = masks[k] + [0] * pad
+                                if types is not None:
+                                    types[k] = types[k] + [0] * pad
+                out = {"input_ids": seqs}
+                if return_attention_mask:
+                    out["attention_mask"] = masks
+                if return_token_type_ids:
+                    out["token_type_ids"] = types
+                if single and return_tensors is None:
+                    out = {k: v[0] for k, v in out.items()}
+                return out
 
         def _trunc(v, k):
             if k >= len(v):

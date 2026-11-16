@@ -10,7 +10,7 @@ use crate::unicode::{
 /// A ByteLevel pre-tokenizer grammar, detected from the model's config (never
 /// from its name). The three shapes differ only in how letter runs, contractions,
 /// and digit runs are split.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Pretok {
     // Plain word grammar: case-sensitive contractions, `\p{L}+` letter runs (no
     // case split), unlimited digits. `true` = a leading `Digits{individual_digits}`
