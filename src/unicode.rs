@@ -164,8 +164,8 @@ const fn build_ascii(fine: bool) -> [u8; 128] {
     }
     t
 }
-static ASCII_COARSE: [u8; 128] = build_ascii(false);
-static ASCII_FINE: [u8; 128] = build_ascii(true);
+pub static ASCII_COARSE: [u8; 128] = build_ascii(false);
+pub static ASCII_FINE: [u8; 128] = build_ascii(true);
 
 /// Coarse class: 'L' letter, 'N' number, 'S' whitespace, 'O' other.
 #[inline]

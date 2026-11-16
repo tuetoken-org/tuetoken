@@ -483,7 +483,7 @@ def test_auto():
             b = tt(inputs, padding=True, truncation=ml is not None, max_length=ml, return_tensors="np")
             e += int(np.array_equal(a["input_ids"], b["input_ids"])
                      and np.array_equal(a["attention_mask"], b["attention_mask"]))
-        _cids = lambda x: list(x["input_ids"]) if isinstance(x, dict) else list(x)  # noqa: E731
+        _cids = lambda x: list(x["input_ids"]) if hasattr(x, "keys") else list(x)  # noqa: E731  (BatchEncoding is a Mapping, not a dict, in transformers>=5)
         e += _cids(hf.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)) \
              == _cids(tt.apply_chat_template(chat, tokenize=True, add_generation_prompt=True))
         n = len(inputs) * 2 + 5  # encode(2x) + decode + call + 2x tensors + chat
