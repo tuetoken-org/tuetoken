@@ -8,6 +8,7 @@
 //! SentencePiece models (char-lookup encode + NFC normalize + metaspace). The
 //! only pre-tokenizer still declined is the Punctuation pre-tokenizer.
 
+mod blockscan;
 mod bpe;
 mod chunk_table;
 mod cjk;
@@ -20,7 +21,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
-use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
@@ -546,6 +547,8 @@ struct Scratch {
     todo: Vec<(u32, u32)>,
     // per-thread memo of multi-token chunks (see chunk_table::DynCache)
     dyn_cache: chunk_table::DynCache,
+    // per-thread exact memo of chunks longer than the table key (see LongCache)
+    long_cache: chunk_table::LongCache,
 }
 
 thread_local! {
@@ -600,6 +603,110 @@ impl Flat {
             self.scatter(dst);
             out.set_len(total);
         }
+    }
+}
+
+/// A token buffer handed to numpy WITHOUT a copy: it owns the `Vec<u32>` the
+/// encoder filled (in parallel) and exposes it through the buffer protocol, so
+/// `numpy.frombuffer(buf, "uint32")` views that memory directly and keeps the
+/// owner alive via `array.base`. (A `bytearray` would first be zero-filled on
+/// one thread with the GIL held — ~40 MB of memset for a 50 MB batch.)
+/// Held as a raw pointer so writes through the (writable) numpy array never
+/// alias a live Rust reference.
+#[pyclass(module = "tuetoken", frozen)]
+struct TokenBuffer {
+    ptr: *mut u8,
+    bytes: usize,
+    owned: Owned,
+}
+
+/// Raw parts of the Vec a TokenBuffer owns (element type decides the layout
+/// it is freed with).
+enum Owned {
+    U32(*mut u32, usize, usize),
+    I64(*mut i64, usize, usize),
+}
+
+// SAFETY: TokenBuffer exclusively owns its allocation (like a Vec); Rust never
+// reads or writes it after construction except to free it in Drop.
+unsafe impl Send for TokenBuffer {}
+unsafe impl Sync for TokenBuffer {}
+
+impl TokenBuffer {
+    fn new(v: Vec<u32>) -> Self {
+        let mut v = std::mem::ManuallyDrop::new(v);
+        let (p, l, c) = (v.as_mut_ptr(), v.len(), v.capacity());
+        TokenBuffer { ptr: p as *mut u8, bytes: l * 4, owned: Owned::U32(p, l, c) }
+    }
+
+    fn new_i64(v: Vec<i64>) -> Self {
+        let mut v = std::mem::ManuallyDrop::new(v);
+        let (p, l, c) = (v.as_mut_ptr(), v.len(), v.capacity());
+        TokenBuffer { ptr: p as *mut u8, bytes: l * 8, owned: Owned::I64(p, l, c) }
+    }
+}
+
+impl Drop for TokenBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the raw parts came from a Vec of that element type we own.
+        unsafe {
+            match self.owned {
+                Owned::U32(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
+                Owned::I64(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl TokenBuffer {
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        if view.is_null() {
+            return Err(pyo3::exceptions::PyBufferError::new_err("View is null"));
+        }
+        let (ptr, len) = {
+            let me = slf.get();
+            (me.ptr, me.bytes)
+        };
+        static FORMAT: &[u8] = b"B\0";
+        // SAFETY: `view` is a valid Py_buffer to fill; `ptr` stays valid while the
+        // view holds a reference to `slf` (stored in view.obj).
+        unsafe {
+            (*view).obj = slf.into_any().into_ptr();
+            (*view).buf = ptr as *mut std::os::raw::c_void;
+            (*view).len = len as isize;
+            (*view).readonly = 0;
+            (*view).itemsize = 1;
+            (*view).format = if flags & pyo3::ffi::PyBUF_FORMAT == pyo3::ffi::PyBUF_FORMAT {
+                FORMAT.as_ptr() as *mut std::os::raw::c_char
+            } else {
+                std::ptr::null_mut()
+            };
+            (*view).ndim = 1;
+            (*view).shape = if flags & pyo3::ffi::PyBUF_ND == pyo3::ffi::PyBUF_ND {
+                &mut (*view).len
+            } else {
+                std::ptr::null_mut()
+            };
+            (*view).strides = if flags & pyo3::ffi::PyBUF_STRIDES == pyo3::ffi::PyBUF_STRIDES {
+                &mut (*view).itemsize
+            } else {
+                std::ptr::null_mut()
+            };
+            (*view).suboffsets = std::ptr::null_mut();
+            (*view).internal = std::ptr::null_mut();
+        }
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
+
+    fn __len__(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -1036,37 +1143,58 @@ impl Tokenizer {
     #[inline]
     fn encode_range(&self, bytes: &[u8], start: usize, stop: usize, s: &mut Scratch) {
         let n = bytes.len();
-        let mut pos = start;
-        while pos < stop {
-            let end = pretok::next_chunk_end(self.kind, bytes, pos);
-            let len = end - pos;
-            if len.wrapping_sub(1) < chunk_table::MAX_KEY && pos + 16 <= n {
-                // SAFETY: pos + 16 <= n, so 16 bytes are readable at pos.
-                let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(pos), len) };
-                if let Some(t) = self.chunk_table.get(lo, hi) {
-                    s.out.push(t);
-                    pos = end;
-                    continue;
-                }
-                // Static miss: reuse the key for the per-thread cache, then merge.
-                if s.dyn_cache.owned_by(self.uid) {
-                    if let Some(ts) = s.dyn_cache.get(lo, hi) {
-                        s.out.extend_from_slice(ts); // disjoint field borrows
-                        pos = end;
-                        continue;
-                    }
-                    let st = s.out.len();
-                    self.process_chunk(&bytes[pos..end], s, Merge::Auto);
-                    let (out, dc) = (&s.out, &mut s.dyn_cache);
-                    dc.put(lo, hi, &out[st..]);
-                    pos = end;
-                    continue;
-                }
+        // 64-byte block scanner (identical boundaries, see blockscan.rs); each
+        // chunk is resolved immediately. (Batching a block's lookups and
+        // prefetching them one block ahead measured ~30% SLOWER on Apple M4:
+        // the out-of-order core already overlaps the probes, and the batch
+        // bookkeeping only adds work.)
+        blockscan::chunks_batched(self.kind, bytes, start, stop, |first, ends| {
+            let mut a = first;
+            for &e in ends {
+                self.emit_chunk(bytes, a, e, n, s);
+                a = e;
             }
-            self.emit(&bytes[pos..end], s, Merge::Auto);
-            pos = end;
+        });
+    }
+
+    /// Encode one pre-token chunk [pos, end) (Merge::Auto): load-time table,
+    /// then the per-thread cache, then the exact merge (memoized).
+    #[inline(always)]
+    fn emit_chunk(&self, bytes: &[u8], pos: usize, end: usize, n: usize, s: &mut Scratch) {
+        let len = end - pos;
+        if len.wrapping_sub(1) < chunk_table::MAX_KEY && pos + 16 <= n {
+            // SAFETY: pos + 16 <= n, so 16 bytes are readable at pos.
+            let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(pos), len) };
+            if let Some(t) = self.chunk_table.get(lo, hi) {
+                s.out.push(t);
+                return;
+            }
+            // Static miss: reuse the key for the per-thread cache, then merge.
+            if s.dyn_cache.owned_by(self.uid) {
+                if let Some(ts) = s.dyn_cache.get(lo, hi) {
+                    s.out.extend_from_slice(ts); // disjoint field borrows
+                    return;
+                }
+                let st = s.out.len();
+                self.process_chunk(&bytes[pos..end], s, Merge::Auto);
+                let (out, dc) = (&s.out, &mut s.dyn_cache);
+                dc.put(lo, hi, &out[st..]);
+                return;
+            }
+        } else if len > chunk_table::MAX_KEY && !self.byte_fallback {
+            // long chunk: exact per-thread memo
+            let key = &bytes[pos..end];
+            if let Some(ts) = s.long_cache.get(self.uid, key) {
+                s.out.extend_from_slice(ts); // disjoint field borrows
+                return;
+            }
+            let st = s.out.len();
+            self.process_chunk(key, s, Merge::Auto);
+            let (out, lc) = (&s.out, &mut s.long_cache);
+            lc.put(self.uid, key, &out[st..]);
+            return;
         }
-        debug_assert_eq!(pos, stop, "segment end was not a chunk boundary");
+        self.emit(&bytes[pos..end], s, Merge::Auto);
     }
 
     /// Can one long document be split across threads? Only the hand-written
@@ -1127,6 +1255,7 @@ impl Tokenizer {
         SCRATCH.with(|cell| match cell.try_borrow_mut() {
             Ok(mut g) => {
                 g.dyn_cache.claim(self.uid);
+                g.long_cache.claim(self.uid);
                 f(&mut g)
             }
             Err(_) => f(&mut Scratch::default()),
@@ -1337,6 +1466,7 @@ impl Tokenizer {
         SCRATCH.with(|cell| match cell.try_borrow_mut() {
             Ok(mut s) => {
                 s.dyn_cache.claim(self.uid);
+                s.long_cache.claim(self.uid);
                 s.out = Vec::with_capacity(text.len() / 3 + 8);
                 self.encode_into(text, mode, prepend, &mut s);
                 std::mem::take(&mut s.out)
@@ -1811,6 +1941,53 @@ impl Tokenizer {
         self.to_pylists(py, &seqs)
     }
 
+    /// AutoTokenizer `__call__` fast path (single sequences, no tensors): special
+    /// -aware encode of every text in parallel, then build each row's Python list
+    /// directly as `prefix + content + suffix` (content truncated to `budget`,
+    /// from the left if `trunc_left`) from the pre-built int table — no Python
+    /// per-row list surgery.
+    #[pyo3(signature = (texts, prefix, suffix, budget = None, trunc_left = false, num_threads = 0))]
+    fn encode_special_post<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<PyBackedStr>,
+        prefix: Vec<u32>,
+        suffix: Vec<u32>,
+        budget: Option<usize>,
+        trunc_left: bool,
+        num_threads: usize,
+    ) -> Bound<'py, PyList> {
+        let seqs = py.detach(|| self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_special_one(t)));
+        let table = self.ints(py);
+        let obj = |t: u32| unsafe {
+            match table.get(t as usize) {
+                Some(o) => {
+                    let p = o.as_ptr();
+                    pyo3::ffi::Py_INCREF(p);
+                    p
+                }
+                None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
+            }
+        };
+        // SAFETY: each new list's slots are filled exactly once with owned refs.
+        unsafe {
+            let outer = pyo3::ffi::PyList_New(seqs.len() as pyo3::ffi::Py_ssize_t);
+            assert!(!outer.is_null(), "list alloc");
+            for (r, c) in seqs.iter().enumerate() {
+                let keep = budget.map_or(c.len(), |b| c.len().min(b));
+                let content: &[u32] = if trunc_left { &c[c.len() - keep..] } else { &c[..keep] };
+                let n = prefix.len() + content.len() + suffix.len();
+                let inner = pyo3::ffi::PyList_New(n as pyo3::ffi::Py_ssize_t);
+                assert!(!inner.is_null(), "list alloc");
+                for (k, &t) in prefix.iter().chain(content).chain(suffix.iter()).enumerate() {
+                    pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj(t));
+                }
+                pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, inner);
+            }
+            Bound::from_owned_ptr(py, outer).cast_into_unchecked()
+        }
+    }
+
     /// Buffer fast-path for the output side: ordinary-encode to a raw
     /// native-endian uint32 byte buffer (one memcpy) instead of a Python list,
     /// skipping the per-token `int` boxing that costs ~20% of `encode_ordinary`
@@ -2019,14 +2196,16 @@ impl Tokenizer {
             total += c;
             offsets.push(total as i64);
         }
-        let data_ba = PyByteArray::new_with(py, total * 4, |buf: &mut [u8]| {
-            // SAFETY: buf is total*4 bytes from a fresh allocation (malloc
-            // alignment >= 4) and u32 is POD; `scatter` writes every element.
-            let out: &mut [u32] =
-                unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u32, total) };
-            py.detach(|| flat.scatter(out));
-            Ok(())
-        })?;
+        // Gather into one Vec<u32> in parallel (first-touch page faults happen on
+        // the worker threads too), then hand it to numpy without a copy.
+        let data = py.detach(|| {
+            let mut v = Vec::new();
+            flat.scatter_into_vec(&mut v);
+            drop(flat);
+            v
+        });
+        debug_assert_eq!(data.len(), total);
+        let data_ba = Bound::new(py, TokenBuffer::new(data))?;
 
         let np = py.import("numpy").map_err(|_| {
             PyValueError::new_err("encode_ordinary_to_buffer requires numpy (pip install numpy)")
@@ -2089,34 +2268,46 @@ impl Tokenizer {
             contents.iter().map(|c| n_special + content_len(c)).max().unwrap_or(0)
         };
 
+        // Fill both [rows, width] int64 matrices in parallel, one row per task,
+        // writing every element exactly once (no up-front zero fill).
         let (ids, mask) = py.detach(|| {
-            let mut ids = vec![pad_id; rows * width];
-            let mut mask = vec![0i64; rows * width];
-            for (r, c) in contents.iter().enumerate() {
-                // clamp content so prefix+content+suffix never overruns the row.
-                let cl = content_len(c).min(width.saturating_sub(n_special));
-                let cslice: &[u32] = if trunc_left && cl < c.len() {
-                    &c[c.len() - cl..]
-                } else {
-                    &c[..cl]
+            let total = rows * width;
+            let mut ids: Vec<i64> = Vec::with_capacity(total);
+            let mut mask: Vec<i64> = Vec::with_capacity(total);
+            if width > 0 {
+                let fill_row = |(r, (irow, mrow)): (usize, (&mut [std::mem::MaybeUninit<i64>], &mut [std::mem::MaybeUninit<i64>]))| {
+                    let c = &contents[r];
+                    // clamp content so prefix+content+suffix never overruns the row.
+                    let cl = content_len(c).min(width.saturating_sub(n_special));
+                    let cslice: &[u32] = if trunc_left && cl < c.len() { &c[c.len() - cl..] } else { &c[..cl] };
+                    let used = (n_special + cl).min(width);
+                    let off = if pad_left { width - used } else { 0 };
+                    let mut w = 0usize;
+                    for x in irow.iter_mut().take(off) { x.write(pad_id); }
+                    for x in mrow.iter_mut().take(off) { x.write(0); }
+                    w += off;
+                    for v in prefix.iter().copied().chain(cslice.iter().map(|&x| x as i64)).chain(suffix.iter().copied()) {
+                        if w >= width { break; }
+                        irow[w].write(v);
+                        mrow[w].write(1);
+                        w += 1;
+                    }
+                    for k in w..width {
+                        irow[k].write(pad_id);
+                        mrow[k].write(0);
+                    }
                 };
-                let total = n_special + cl;
-                let off = if pad_left { width - total } else { 0 };
-                let mut w = r * width + off;
-                for &p in &prefix {
-                    ids[w] = p;
-                    w += 1;
+                let iu = &mut ids.spare_capacity_mut()[..total];
+                let mu = &mut mask.spare_capacity_mut()[..total];
+                if parallel_ok() && rows > 1 {
+                    iu.par_chunks_mut(width).zip(mu.par_chunks_mut(width)).enumerate().for_each(fill_row);
+                } else {
+                    iu.chunks_mut(width).zip(mu.chunks_mut(width)).enumerate().for_each(fill_row);
                 }
-                for &x in cslice {
-                    ids[w] = x as i64;
-                    w += 1;
-                }
-                for &s in &suffix {
-                    ids[w] = s;
-                    w += 1;
-                }
-                for k in 0..total {
-                    mask[r * width + off + k] = 1;
+                // SAFETY: fill_row wrote all `width` elements of every row.
+                unsafe {
+                    ids.set_len(total);
+                    mask.set_len(total);
                 }
             }
             (ids, mask)
@@ -2125,15 +2316,15 @@ impl Tokenizer {
         let np = py.import("numpy").map_err(|_| {
             PyValueError::new_err("return_tensors requires numpy (pip install numpy)")
         })?;
-        let to_np = |buf: &[i64]| -> PyResult<Bound<'py, PyAny>> {
-            let u8s = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
-            np.call_method1("frombuffer", (PyBytes::new(py, u8s), "int64"))?
-                .call_method1("reshape", ((rows, width),))?
-                .call_method0("copy")
+        // zero-copy: numpy views the Rust-filled buffers (kept alive via .base)
+        let to_np = |buf: Vec<i64>| -> PyResult<Bound<'py, PyAny>> {
+            let b = Bound::new(py, TokenBuffer::new_i64(buf))?;
+            np.call_method1("frombuffer", (b, "int64"))?
+                .call_method1("reshape", ((rows, width),))
         };
         let out = PyDict::new(py);
-        out.set_item("input_ids", to_np(&ids)?)?;
-        out.set_item("attention_mask", to_np(&mask)?)?;
+        out.set_item("input_ids", to_np(ids)?)?;
+        out.set_item("attention_mask", to_np(mask)?)?;
         Ok(out)
     }
 
@@ -2233,6 +2424,127 @@ impl Tokenizer {
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Tokenizer>()?;
+    m.add_class::<TokenBuffer>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+    /// Interleaved A/B of the load-time table's load factor (<=50% vs <=75%):
+    /// two tokenizers built in one process, encodes alternated so background
+    /// load hits both equally.
+    #[test]
+    #[ignore]
+    fn ab_table_load() {
+        let toks = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let corpus = std::fs::read(std::env::var("TUETOKEN_CORPUS").expect("set TUETOKEN_CORPUS")).unwrap();
+        let text = String::from_utf8_lossy(&corpus[..corpus.len().min(30_000_000)]).into_owned();
+        let b = text.as_bytes();
+        for path in toks.split(',') {
+            chunk_table::DENSE.store(false, std::sync::atomic::Ordering::Relaxed);
+            let ta = Tokenizer::new(path).unwrap();
+            chunk_table::DENSE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let tb = Tokenizer::new(path).unwrap();
+            chunk_table::DENSE.store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut best = [f64::MAX; 2];
+            for round in 0..10 {
+                let t = if round % 2 == 0 { &ta } else { &tb };
+                let mut s = Scratch::default();
+                s.dyn_cache.claim(t.uid);
+            s.long_cache.claim(t.uid);
+                t.encode_range(b, 0, b.len(), &mut s); // warm this tokenizer's cache
+                s.out.clear();
+                let t0 = std::time::Instant::now();
+                t.encode_range(b, 0, b.len(), &mut s);
+                best[round % 2] = best[round % 2].min(t0.elapsed().as_secs_f64());
+            }
+            println!("{:45} load<=50% {:6.1} MB/s | load<=75% {:6.1} MB/s",
+                path.rsplit('/').nth(1).unwrap_or(path), b.len() as f64 / best[0] / 1e6, b.len() as f64 / best[1] / 1e6);
+        }
+    }
+
+    /// Core single-thread encode throughput, no Python in the loop:
+    /// `TUETOKEN_TOKENIZERS=a.json,b.json TUETOKEN_CORPUS=corpus.txt \
+    ///  cargo test --release core_perf -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn core_perf() {
+        let toks = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let corpus = std::fs::read(std::env::var("TUETOKEN_CORPUS").expect("set TUETOKEN_CORPUS")).unwrap();
+        let text = String::from_utf8_lossy(&corpus[..corpus.len().min(30_000_000)]).into_owned();
+        let b = text.as_bytes();
+        for path in toks.split(',') {
+            let t = Tokenizer::new(path).unwrap();
+            let mut s = Scratch::default();
+            s.dyn_cache.claim(t.uid);
+            s.long_cache.claim(t.uid);
+            let mut best = f64::MAX;
+            let mut ntok = 0;
+            for _ in 0..4 {
+                s.out.clear();
+                let t0 = std::time::Instant::now();
+                t.encode_range(b, 0, b.len(), &mut s);
+                best = best.min(t0.elapsed().as_secs_f64());
+                ntok = s.out.len();
+            }
+            println!("{:60} {:7.1} MB/s  ({ntok} tokens)", path.rsplit('/').nth(1).unwrap_or(path), b.len() as f64 / best / 1e6);
+            {
+                let n = b.len();
+                for v in 0..3 {
+                    let mut best = f64::MAX;
+                    let mut acc = 0u64;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        blockscan::chunks(t.kind, b, 0, n, |a, e| {
+                            let len = e - a;
+                            if v >= 1 && len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                                let (lo, hi) = unsafe { chunk_table::pack_wide(b.as_ptr().add(a), len) };
+                                if v == 1 {
+                                    acc = acc.wrapping_add(chunk_table::hash(lo, hi));
+                                } else if let Some(x) = t.chunk_table.get(lo, hi) {
+                                    acc = acc.wrapping_add(x as u64);
+                                }
+                            }
+                            acc = acc.wrapping_add(e as u64);
+                        });
+                        best = best.min(t0.elapsed().as_secs_f64());
+                    }
+                    println!("    ablation {} {:7.1} MB/s ({acc})", ["boundaries", "+pack+hash", "+probe"][v], n as f64 / best / 1e6);
+                }
+                // warm-pass outcome counts (s's dyn cache is warm from the runs above)
+                let (mut st, mut dy, mut mg, mut lg, mut tot) = (0usize, 0usize, 0usize, 0usize, 0usize);
+                let mut merge_ns = 0f64;
+                let mut long_ns = 0f64;
+                blockscan::chunks(t.kind, b, 0, n, |a, e| {
+                    tot += 1;
+                    let len = e - a;
+                    if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                        let (lo, hi) = unsafe { chunk_table::pack_wide(b.as_ptr().add(a), len) };
+                        if t.chunk_table.get(lo, hi).is_some() { st += 1; return; }
+                        if s.dyn_cache.get(lo, hi).is_some() { dy += 1; return; }
+                        mg += 1;
+                        let t0 = std::time::Instant::now();
+                        let k = s.out.len();
+                        t.process_chunk(&b[a..e], &mut s, Merge::Auto);
+                        merge_ns += t0.elapsed().as_nanos() as f64;
+                        s.out.truncate(k);
+                    } else {
+                        lg += 1;
+                        let t0 = std::time::Instant::now();
+                        let k = s.out.len();
+                        t.emit(&b[a..e], &mut s, Merge::Auto);
+                        long_ns += t0.elapsed().as_nanos() as f64;
+                        s.out.truncate(k);
+                    }
+                });
+                println!("    long chunks: avg {:.0} ns each => {:.2} ns per chunk overall; merges => {:.2} ns per chunk",
+                    long_ns / lg.max(1) as f64, long_ns / tot as f64, merge_ns / tot as f64);
+                println!("    warm: static {:.2}% dyn {:.2}% merge {:.3}% (avg {:.0} ns) long {:.3}%",
+                    st as f64 / tot as f64 * 100.0, dy as f64 / tot as f64 * 100.0,
+                    mg as f64 / tot as f64 * 100.0, merge_ns / mg.max(1) as f64, lg as f64 / tot as f64 * 100.0);
+            }
+        }
+    }
 }
