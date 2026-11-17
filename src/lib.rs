@@ -1866,6 +1866,13 @@ impl Tokenizer {
     fn encode_src(&self, texts: &[Src<'_>], num_threads: usize, want_output: bool) -> Result<(Vec<u32>, Vec<usize>), usize> {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
         let (norm, items, tasks) = self.plan(texts, num_threads);
+        // Size the learned table for this call up front: distinct chunks grow
+        // sublinearly with text size (Heaps' law); ~1 per KB is an upper-side
+        // estimate on web text (2 GB OpenWebText -> 2.0M). Small calls skip it.
+        let total_in: usize = tasks.iter().map(|t| t.2).sum();
+        if total_in >= 64 << 20 {
+            self.learned.reserve(self.learned.len() + total_in / 1024);
+        }
         let trusted: Vec<bool> = texts.iter().map(|t| matches!(t, Src::Str(_)) || self.norm_form != 0).collect();
         let bad_doc = AtomicUsize::new(usize::MAX);
         let ntask = tasks.len();
