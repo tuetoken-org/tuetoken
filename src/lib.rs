@@ -1280,21 +1280,30 @@ impl Tokenizer {
     #[cold]
     #[inline(never)]
     fn emit_chunk_cold(&self, bytes: &[u8], pos: usize, end: usize, n: usize, s: &mut Scratch) {
-        self.emit_chunk(bytes, pos, end, n, s);
+        // the pipeline already probed the unified table (which includes every
+        // vocabulary entry): skip the vocabulary-table probe
+        self.emit_chunk_impl::<false>(bytes, pos, end, n, s);
     }
 
     /// Encode one pre-token chunk [pos, end) (Merge::Auto): load-time table,
     /// then the per-thread cache, then the exact merge (memoized).
     #[inline(always)]
     fn emit_chunk(&self, bytes: &[u8], pos: usize, end: usize, n: usize, s: &mut Scratch) {
+        self.emit_chunk_impl::<true>(bytes, pos, end, n, s);
+    }
+
+    #[inline(always)]
+    fn emit_chunk_impl<const VOCAB: bool>(&self, bytes: &[u8], pos: usize, end: usize, n: usize, s: &mut Scratch) {
         let len = end - pos;
         if len.wrapping_sub(1) < chunk_table::MAX_KEY && pos + 16 <= n {
             // SAFETY: pos + 16 <= n, so 16 bytes are readable at pos.
             let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(pos), len) };
             let h = chunk_table::hash(lo, hi);
-            if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
-                s.out.push(t);
-                return;
+            if VOCAB {
+                if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
+                    s.out.push(t);
+                    return;
+                }
             }
             // Load-time table miss: what any thread already learned (shared) ...
             let mut spilled = false;
@@ -1307,19 +1316,25 @@ impl Tokenizer {
                 }
                 spilled = k == chunk_table::SPILLED;
             }
-            // ... then this thread's cache (results longer than 3 tokens), then merge.
+            // ... then, only for results known to be longer than 3 tokens (the
+            // table holds a marker), this thread's cache and the shared spill
+            // map; a chunk the table has never seen goes straight to the merge
+            // (probing the per-thread cache for it was a wasted cache miss on
+            // every first occurrence).
             if s.dyn_cache.owned_by(self.uid) {
-                if let Some(ts) = s.dyn_cache.get(lo, hi) {
-                    #[cfg(test)]
-                    perf::DYN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    s.out.extend_from_slice(ts); // disjoint field borrows
-                    return;
-                }
                 let st = s.out.len();
-                if spilled && self.spill.get_into(&bytes[pos..end], &mut s.out) {
-                    let (out, dc) = (&s.out, &mut s.dyn_cache);
-                    dc.put(lo, hi, &out[st..]);
-                    return;
+                if spilled {
+                    if let Some(ts) = s.dyn_cache.get(lo, hi) {
+                        #[cfg(test)]
+                        perf::DYN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        s.out.extend_from_slice(ts); // disjoint field borrows
+                        return;
+                    }
+                    if self.spill.get_into(&bytes[pos..end], &mut s.out) {
+                        let (out, dc) = (&s.out, &mut s.dyn_cache);
+                        dc.put(lo, hi, &out[st..]);
+                        return;
+                    }
                 }
                 #[cfg(test)]
                 perf::MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1330,9 +1345,10 @@ impl Tokenizer {
                     self.learned.put(lo, hi, h, res);
                 } else {
                     dc.put(lo, hi, res);
-                    if self.spill.put(&bytes[pos..end], res) {
-                        self.learned.put_spilled(lo, hi, h);
-                    }
+                    let _ = self.spill.put(&bytes[pos..end], res);
+                    // marker even if the spill map is full: it routes later
+                    // lookups to this thread's cache
+                    self.learned.put_spilled(lo, hi, h);
                 }
                 return;
             }
