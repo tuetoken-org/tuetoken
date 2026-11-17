@@ -463,6 +463,10 @@ fn extract_split_fallback(pre: &Value) -> Option<Vec<String>> {
 /// cache-hot scan-and-merge (faster for typical short post-pretok chunks).
 const STREAM_THRESHOLD: usize = 256;
 
+/// Default memory cap (MiB) of each tokenizer's shared learned-chunk table.
+/// It starts at 512 KiB and grows only as new distinct chunks are seen.
+const DEFAULT_CACHE_MIB: usize = 128;
+
 /// Documents at least this long are encoded as parallel segments.
 const SPLIT_MIN: usize = 1 << 18;
 
@@ -526,6 +530,9 @@ struct Tokenizer {
     // token). See chunk_table.rs. Only consulted under Merge::Auto.
     chunk_table: chunk_table::ChunkTable,
     uid: u64,
+    // Grow-only table of learned multi-token chunk encodings, shared by all
+    // threads (see chunk_table::SharedTable). Memory-capped.
+    learned: chunk_table::SharedTable,
     // Pre-built Python ints for every token id (lazily, under the GIL), so a
     // result list is filled with INCREF'd pointers instead of allocating a fresh
     // PyLong per token — the dominant cost of returning list[int].
@@ -1221,11 +1228,19 @@ impl Tokenizer {
         if len.wrapping_sub(1) < chunk_table::MAX_KEY && pos + 16 <= n {
             // SAFETY: pos + 16 <= n, so 16 bytes are readable at pos.
             let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(pos), len) };
-            if let Some(t) = self.chunk_table.get(lo, hi) {
+            let h = chunk_table::hash(lo, hi);
+            if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
                 s.out.push(t);
                 return;
             }
-            // Static miss: reuse the key for the per-thread cache, then merge.
+            // Load-time table miss: what any thread already learned (shared) ...
+            if let Some((ts, k)) = self.learned.get(lo, hi, h) {
+                #[cfg(test)]
+                perf::DYN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                s.out.extend_from_slice(&ts[..k]);
+                return;
+            }
+            // ... then this thread's cache (results longer than 3 tokens), then merge.
             if s.dyn_cache.owned_by(self.uid) {
                 if let Some(ts) = s.dyn_cache.get(lo, hi) {
                     #[cfg(test)]
@@ -1238,7 +1253,12 @@ impl Tokenizer {
                 let st = s.out.len();
                 self.process_chunk(&bytes[pos..end], s, Merge::Auto);
                 let (out, dc) = (&s.out, &mut s.dyn_cache);
-                dc.put(lo, hi, &out[st..]);
+                let res = &out[st..];
+                if res.len() <= 3 {
+                    self.learned.put(lo, hi, h, res);
+                } else {
+                    dc.put(lo, hi, res);
+                }
                 return;
             }
         } else if len > chunk_table::MAX_KEY && !self.byte_fallback {
@@ -1889,10 +1909,29 @@ impl Tokenizer {
             prepend_scheme: 0,
             chunk_table: chunk_table::ChunkTable::empty(),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            learned: chunk_table::SharedTable::new(DEFAULT_CACHE_MIB),
             int_table: OnceLock::new(),
         };
         tk.build_chunk_table();
         Ok(tk)
+    }
+
+    /// Memory cap (MiB) of this tokenizer's shared learned-chunk cache: chunks
+    /// the vocabulary table can't answer are merged once and remembered here,
+    /// for every thread. Grows on demand from 512 KiB. 0 disables learning.
+    #[getter]
+    fn cache_limit_mb(&self) -> usize {
+        self.learned.limit_mib()
+    }
+
+    fn set_cache_limit_mb(&self, mb: usize) {
+        self.learned.set_limit_mib(mb);
+    }
+
+    /// Number of chunk encodings learned so far (approximate under concurrency).
+    #[getter]
+    fn learned_entries(&self) -> usize {
+        self.learned.len()
     }
 
     /// `repr(tok)` — show what it is.
@@ -2509,6 +2548,27 @@ mod perf {
         t.encode_range(text.as_bytes(), 0, text.len(), &mut s);
         println!("owned_by={} merges={} dyn_hits={} tokens={}", s.dyn_cache.owned_by(t.uid),
             MERGES.load(Relaxed), DYN_HITS.load(Relaxed), s.out.len());
+    }
+
+    /// Phase timing for one big blob: encode_flat vs gathering into one Vec.
+    #[test]
+    #[ignore]
+    fn blob_phases() {
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read_to_string(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let flat = t.encode_flat(&[data.as_str()], 0);
+            let t1 = t0.elapsed();
+            let mut v = Vec::new();
+            flat.scatter_into_vec(&mut v);
+            let t2 = t0.elapsed();
+            drop(flat);
+            let t3 = t0.elapsed();
+            println!("encode {:?} ({} task bufs) | gather {:?} | free {:?} | total {:.2} GB/s",
+                t1, 0, t2 - t1, t3 - t2, data.len() as f64 / t3.as_secs_f64() / 1e9);
+        }
     }
 
     /// Multi-thread run over a document file (`<|endoftext|>`-separated), like a
