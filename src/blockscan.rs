@@ -460,6 +460,7 @@ fn span_bad(bad: &mut u64, bad_next: &mut u64, i: usize, end: usize) {
     }
 }
 
+#[inline(always)]
 fn generic_block(b: &[u8], base: usize, max_digits: u32, c: Carry) -> Block {
     let n = b.len();
     // Resolved multi-byte characters (Latin-1 letters, general punctuation)
@@ -505,6 +506,7 @@ fn generic_block(b: &[u8], base: usize, max_digits: u32, c: Carry) -> Block {
     (starts & x.valid, bad & x.valid, out)
 }
 
+#[inline(always)]
 fn camel_block(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Carry) -> Block {
     let n = b.len();
     let x = ctx(b, base);
@@ -645,19 +647,20 @@ fn word_fast(b: &[u8], base: usize, indiv: bool, c: &Carry, m: &Classes) -> Opti
     Some((starts, bad, out))
 }
 
+#[inline(always)]
 fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
-    let n = b.len();
     let m = classify(b, base);
-    // Fast path — the common block: full, pure ASCII, contractions ending
-    // inside the block, and a clean carry. (Routing blocks with resolvable
-    // non-ASCII here too measured slower: the extra path cost the hot one.)
-    if base + 64 < n && !c.na && (c.na4 | c.bad_in | c.suppress | c.forced) == 0 {
-        if m.na == 0 {
-            if let Some(r) = word_fast(b, base, indiv, &c, &m) {
-                return r;
-            }
+    if base + 64 < b.len() && !c.na && (c.na4 | c.bad_in | c.suppress | c.forced) == 0 && m.na == 0 {
+        if let Some(r) = word_fast(b, base, indiv, &c, &m) {
+            return r;
         }
     }
+    word_slow(b, base, indiv, c, m)
+}
+
+#[inline(never)]
+fn word_slow(b: &[u8], base: usize, indiv: bool, c: Carry, m: Classes) -> Block {
+    let n = b.len();
     let x = ctx_m::<true, false>(b, base, m);
     let (m, o) = (&x.m, x.o);
     let sp_before = p1(m.sp, c.sp);
@@ -768,12 +771,45 @@ fn carry_out(x: &Ctx, ostart: u64, abs_nl: u64, contr: bool, forced: u64, suppre
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn block(kind: Pretok, b: &[u8], base: usize, c: Carry) -> Block {
+    let mut c = c;
+    let (s, bad) = block_m(kind, b, base, &mut c);
+    (s, bad, c)
+}
+
+/// One block with the carry updated IN PLACE, returning (starts, bad) in two
+/// registers. Returning the ~72-byte carry by value made every driver unpack
+/// it, repack it to the stack before the call and reload it after (~60
+/// instructions per block, as much as the GPT-2 rules themselves).
+#[inline(always)]
+pub fn block_m(kind: Pretok, b: &[u8], base: usize, c: &mut Carry) -> (u64, u64) {
     match kind {
-        Pretok::Generic { max_digits, .. } => generic_block(b, base, max_digits, c),
-        Pretok::CamelCase { contractions, max_digits } => camel_block(b, base, contractions, max_digits, c),
-        Pretok::Word(indiv) => word_block(b, base, indiv, c),
+        Pretok::Generic { max_digits, .. } => generic_m(b, base, max_digits, c),
+        Pretok::CamelCase { contractions, max_digits } => camel_m(b, base, contractions, max_digits, c),
+        Pretok::Word(indiv) => word_m(b, base, indiv, c),
     }
+}
+
+#[inline(never)]
+fn word_m(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
+    let (s, bad, out) = word_block(b, base, indiv, *c);
+    *c = out;
+    (s, bad)
+}
+
+#[inline(never)]
+fn generic_m(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
+    let (s, bad, out) = generic_block(b, base, max_digits, *c);
+    *c = out;
+    (s, bad)
+}
+
+#[inline(never)]
+fn camel_m(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
+    let (s, bad, out) = camel_block(b, base, contractions, max_digits, *c);
+    *c = out;
+    (s, bad)
 }
 
 /// Iterate the chunks of [start, stop) (both proven chunk boundaries) for any
@@ -794,7 +830,7 @@ pub fn chunks_batched(kind: Pretok, b: &[u8], start: usize, stop: usize, mut fb:
             base = pos;
             carry = Carry { forced: 1, ..Carry::default() };
         }
-        let (starts, bad, next_carry) = block(kind, b, base, carry);
+        let (starts, bad) = block_m(kind, b, base, &mut carry);
         let lim = (base + 64).min(stop);
         let lim_mask = if lim - base >= 64 { u64::MAX } else { (1u64 << (lim - base)) - 1 };
         let above0 = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
@@ -864,7 +900,6 @@ pub fn chunks_batched(kind: Pretok, b: &[u8], start: usize, stop: usize, mut fb:
             }
         }
         base += 64;
-        carry = next_carry;
     }
 }
 
@@ -920,7 +955,7 @@ impl Scan {
                 base = pos;
                 carry = Carry { forced: 1, ..Carry::default() };
             }
-            let (starts, bad, next_carry) = block(kind, b, base, carry);
+            let (starts, bad) = block_m(kind, b, base, &mut carry);
             let lim = (base + 64).min(stop);
             let lim_mask = if lim - base >= 64 { u64::MAX } else { (1u64 << (lim - base)) - 1 };
             let above0 = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
@@ -983,15 +1018,17 @@ impl Scan {
                     k += 1;
                     pos = end;
                     if k >= limit + SCAN_SLACK - 1 {
+                        // stop mid-block: resume by restarting the block scan
+                        // at pos, a proven chunk boundary (the carry has
+                        // already advanced past this block)
                         self.pos = pos;
-                        self.base = base;
-                        self.carry = carry;
+                        self.base = pos;
+                        self.carry = Carry { forced: 1, ..Carry::default() };
                         return k;
                     }
                 }
             }
             base += 64;
-            carry = next_carry;
         }
         self.pos = pos;
         self.base = base;
