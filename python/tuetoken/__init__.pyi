@@ -42,7 +42,11 @@ class Tokenizer:
         first split into documents on it (like ``bytes.split``), inside Rust."""
 
     def encode_ordinary_to_buffer(
-        self, texts: Sequence[str | bytes], num_threads: int = ..., separator: bytes | None = ...
+        self,
+        texts: Sequence[str | bytes],
+        num_threads: int = ...,
+        separator: bytes | None = ...,
+        dtype: Any = ...,
     ) -> dict[str, Any]:
         """Bulk-corpus fast path: encode many texts in parallel and return all ids
         as one flat ``uint32`` numpy array plus an ``int64`` offsets array (length
@@ -51,7 +55,9 @@ class Tokenizer:
         tokenize a whole corpus offline. Returns ``{"data", "offsets"}``. Needs numpy.
         With ``separator`` (e.g. ``b"<|endoftext|>"``), each text is first split into
         documents on it exactly like ``bytes.split`` (separators dropped, one row per
-        piece), in parallel inside Rust — no Python list of documents needed."""
+        piece), in parallel inside Rust — no Python list of documents needed.
+        ``dtype="uint16"`` (or ``np.uint16``) returns 2-byte ids — half the memory —
+        for vocabularies of at most 65,536 ids (e.g. GPT-2); default ``uint32``."""
 
     def encode_batch(
         self,

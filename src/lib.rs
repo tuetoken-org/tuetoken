@@ -603,6 +603,33 @@ enum Src<'a> {
     Raw(&'a [u8]),
 }
 
+/// Element type of the batch engine's final output buffer. Workers always
+/// encode into `u32` scratch (cache-resident); only the copy into the final
+/// buffer narrows, so `u16` output halves the bytes written to fresh memory
+/// (and its page faults).
+trait OutTok: Copy + Send + Sync + 'static {
+    /// Write `src` to `dst[..src.len()]`.
+    /// SAFETY: `dst` valid for `src.len()` writes.
+    unsafe fn put(src: &[u32], dst: *mut Self);
+}
+impl OutTok for u32 {
+    #[inline]
+    unsafe fn put(src: &[u32], dst: *mut u32) {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+}
+impl OutTok for u16 {
+    #[inline]
+    unsafe fn put(src: &[u32], dst: *mut u16) {
+        // ids < vocab_size <= 65536 (checked by the caller); vectorizes to
+        // narrowing moves
+        let d = std::slice::from_raw_parts_mut(dst, src.len());
+        for (x, &y) in d.iter_mut().zip(src) {
+            *x = y as u16;
+        }
+    }
+}
+
 /// Document ranges of `b` split on `sep` (non-empty): exactly `bytes.split`
 /// (leftmost, non-overlapping matches; separators dropped; empty pieces kept).
 /// Large inputs are searched in parallel pieces (SIMD substring search); all
@@ -722,6 +749,7 @@ struct TokenBuffer {
 /// Raw parts of the Vec a TokenBuffer owns (element type decides the layout
 /// it is freed with).
 enum Owned {
+    U16(*mut u16, usize, usize),
     U32(*mut u32, usize, usize),
     I64(*mut i64, usize, usize),
 }
@@ -738,6 +766,12 @@ impl TokenBuffer {
         TokenBuffer { ptr: p as *mut u8, bytes: l * 4, owned: Owned::U32(p, l, c) }
     }
 
+    fn new_u16(v: Vec<u16>) -> Self {
+        let mut v = std::mem::ManuallyDrop::new(v);
+        let (p, l, c) = (v.as_mut_ptr(), v.len(), v.capacity());
+        TokenBuffer { ptr: p as *mut u8, bytes: l * 2, owned: Owned::U16(p, l, c) }
+    }
+
     fn new_i64(v: Vec<i64>) -> Self {
         let mut v = std::mem::ManuallyDrop::new(v);
         let (p, l, c) = (v.as_mut_ptr(), v.len(), v.capacity());
@@ -750,6 +784,7 @@ impl Drop for TokenBuffer {
         // SAFETY: the raw parts came from a Vec of that element type we own.
         unsafe {
             match self.owned {
+                Owned::U16(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
                 Owned::U32(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
                 Owned::I64(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
             }
@@ -1829,6 +1864,10 @@ impl Tokenizer {
     /// documents on that byte string (exactly like Python's `bytes.split`,
     /// separators dropped), in parallel inside Rust.
     fn encode_batch_sep(&self, texts: &[TextArg], num_threads: usize, want_output: bool, sep: Option<&[u8]>) -> PyResult<(Vec<u32>, Vec<usize>)> {
+        self.encode_batch_sep_t::<u32>(texts, num_threads, want_output, sep)
+    }
+
+    fn encode_batch_sep_t<O: OutTok>(&self, texts: &[TextArg], num_threads: usize, want_output: bool, sep: Option<&[u8]>) -> PyResult<(Vec<O>, Vec<usize>)> {
         let src = texts_as_src(texts, self.norm_form == 0)?;
         let src = match sep {
             Some(sep) if !sep.is_empty() => {
@@ -1852,7 +1891,7 @@ impl Tokenizer {
             Some(_) => return Err(PyValueError::new_err("separator must not be empty")),
             None => src,
         };
-        self.encode_src(&src, num_threads, want_output)
+        self.encode_src_t::<O>(&src, num_threads, want_output)
             .map_err(|i| PyValueError::new_err(format!("item {i}: bytes are not valid UTF-8")))
     }
 
@@ -1864,6 +1903,10 @@ impl Tokenizer {
     /// The batch engine over `Src` inputs. Err(i): item i is `bytes` that are
     /// not valid UTF-8 (validated lazily, per item, by the encoding worker).
     fn encode_src(&self, texts: &[Src<'_>], num_threads: usize, want_output: bool) -> Result<(Vec<u32>, Vec<usize>), usize> {
+        self.encode_src_t::<u32>(texts, num_threads, want_output)
+    }
+
+    fn encode_src_t<O: OutTok>(&self, texts: &[Src<'_>], num_threads: usize, want_output: bool) -> Result<(Vec<O>, Vec<usize>), usize> {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
         let (norm, items, tasks) = self.plan(texts, num_threads);
         // Size the learned table for this call up front: distinct chunks grow
@@ -1921,14 +1964,23 @@ impl Tokenizer {
             if bad != usize::MAX {
                 return Err(bad);
             }
-            return Ok((if want_output { out } else { Vec::new() }, doc_counts));
+            if !want_output {
+                return Ok((Vec::new(), doc_counts));
+            }
+            let mut o: Vec<O> = Vec::with_capacity(out.len());
+            // SAFETY: capacity out.len(); every element written by put.
+            unsafe {
+                O::put(&out, o.as_mut_ptr());
+                o.set_len(out.len());
+            }
+            return Ok((o, doc_counts));
         }
 
         const UNK: u64 = u64::MAX;
         let total_bytes: usize = tasks.iter().map(|t| t.2).sum();
 
         let cap = if want_output { total_bytes / 2 + 4096 } else { 0 };
-        let mut out: Vec<u32> = Vec::with_capacity(cap);
+        let mut out: Vec<O> = Vec::with_capacity(cap);
         struct SendPtr<P>(*mut P);
         // SAFETY: tasks write disjoint index ranges through these pointers.
         unsafe impl<P> Sync for SendPtr<P> {}
@@ -1997,7 +2049,7 @@ impl Tokenizer {
             incl[k].store(base + len as u64, Release);
             // SAFETY: [base, base+len) is task k's exclusive range within cap;
             // the claim on placed[k] makes this the only writer.
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out_ptr.get().add(base as usize), len) };
+            unsafe { O::put(&v, out_ptr.get().add(base as usize)) };
             pool.lock().unwrap_or_else(|e| e.into_inner()).push(v);
             true
         };
@@ -2040,7 +2092,7 @@ impl Tokenizer {
                             incl[k].store(base + cnt, Release);
                             // SAFETY: [base, base+cnt) is this task's exclusive range
                             // of the final buffer and lies within `cap`.
-                            unsafe { std::ptr::copy_nonoverlapping(s.out.as_ptr(), out_ptr.get().add(base as usize), s.out.len()) };
+                            unsafe { O::put(&s.out, out_ptr.get().add(base as usize)) };
                             placed[k].store(true, Release);
                             ready = true;
                         }
@@ -2118,7 +2170,7 @@ impl Tokenizer {
             stashed.par_iter().filter(|(k, _)| !placed[*k].load(Relaxed)).for_each(|(k, v)| {
                 // SAFETY: task k's range [pref[k], pref[k]+len) is within cap and
                 // was not written by anyone else.
-                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), dst.get().add(pref[*k]), v.len()) };
+                unsafe { O::put(v, dst.get().add(pref[*k])) };
             });
             // SAFETY: every task's range was written (directly or from the stash),
             // and the ranges tile [0, total).
@@ -2126,22 +2178,26 @@ impl Tokenizer {
             return Ok((out, doc_counts));
         }
         // estimate exceeded (pathological input): assemble an exact buffer
-        let mut exact: Vec<u32> = Vec::with_capacity(total);
+        let mut exact: Vec<O> = Vec::with_capacity(total);
         let mut by_task: Vec<Option<&Vec<u32>>> = vec![None; ntask];
         for (k, v) in &stashed {
             by_task[*k] = Some(v);
         }
         for k in 0..ntask {
+            let len = pref[k + 1] - pref[k];
+            // SAFETY: capacity total = pref[ntask]; [pref[k], pref[k+1]) written below.
+            let dst = unsafe { exact.as_mut_ptr().add(pref[k]) };
             match by_task[k] {
-                Some(v) => exact.extend_from_slice(v),
+                Some(v) => unsafe { O::put(v, dst) },
                 None => {
                     debug_assert!(placed[k].load(Relaxed));
                     // SAFETY: task k was copied into out[pref[k]..pref[k+1]] (< cap).
-                    let src = unsafe { std::slice::from_raw_parts(out.as_ptr().add(pref[k]), pref[k + 1] - pref[k]) };
-                    exact.extend_from_slice(src);
+                    unsafe { std::ptr::copy_nonoverlapping(out.as_ptr().add(pref[k]), dst, len) };
                 }
             }
         }
+        // SAFETY: the task ranges tile [0, total).
+        unsafe { exact.set_len(total) };
         Ok((exact, doc_counts))
     }
 
@@ -2992,19 +3048,47 @@ impl Tokenizer {
     /// to numpy in a single copy. This is the right path for tokenizing a whole
     /// corpus offline (data prep), where per-token boxing otherwise dominates.
     /// Ragged (no padding), so no wasted work on uneven document lengths.
-    #[pyo3(signature = (texts, num_threads = 0, separator = None))]
+    #[pyo3(signature = (texts, num_threads = 0, separator = None, dtype = None))]
     fn encode_ordinary_to_buffer<'py>(
         &self,
         py: Python<'py>,
         texts: Vec<TextArg>,
         num_threads: usize,
         separator: Option<Vec<u8>>,
+        dtype: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        // dtype: None / "uint32" (default) or "uint16" (any spelling numpy
+        // accepts, e.g. np.uint16): half the output memory, for vocabularies of
+        // at most 65,536 ids.
+        let np_mod = || py.import("numpy").map_err(|_| PyValueError::new_err("encode_ordinary_to_buffer requires numpy (pip install numpy)"));
+        let narrow = match &dtype {
+            None => false,
+            Some(d) => {
+                let name: String = np_mod()?.call_method1("dtype", (d,))?.getattr("name")?.extract()?;
+                match name.as_str() {
+                    "uint32" => false,
+                    "uint16" => {
+                        if self.vocab_size > 1 << 16 {
+                            return Err(PyValueError::new_err(format!(
+                                "dtype uint16 needs a vocabulary of at most 65536 ids (this one has {})",
+                                self.vocab_size
+                            )));
+                        }
+                        true
+                    }
+                    other => return Err(PyValueError::new_err(format!("dtype must be uint16 or uint32, not {other}"))),
+                }
+            }
+        };
         // Encode in parallel (GIL released) into a few contiguous task buffers,
         // then scatter them in parallel straight into a numpy-owned bytearray.
-        let (data, counts) = py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> {
-            self.encode_batch_sep(&texts, num_threads, true, separator.as_deref())
-        })?;
+        let (data_ba, counts) = if narrow {
+            let (d, c) = py.detach(|| self.encode_batch_sep_t::<u16>(&texts, num_threads, true, separator.as_deref()))?;
+            (Bound::new(py, TokenBuffer::new_u16(d))?, c)
+        } else {
+            let (d, c) = py.detach(|| self.encode_batch_sep_t::<u32>(&texts, num_threads, true, separator.as_deref()))?;
+            (Bound::new(py, TokenBuffer::new(d))?, c)
+        };
         let mut offsets = Vec::with_capacity(counts.len() + 1);
         offsets.push(0i64);
         let mut total = 0usize;
@@ -3012,14 +3096,10 @@ impl Tokenizer {
             total += c;
             offsets.push(total as i64);
         }
-        debug_assert_eq!(data.len(), total);
-        let data_ba = Bound::new(py, TokenBuffer::new(data))?;
-
-        let np = py.import("numpy").map_err(|_| {
-            PyValueError::new_err("encode_ordinary_to_buffer requires numpy (pip install numpy)")
-        })?;
+        let np = np_mod()?;
         // data: zero-copy writable view over the bytearray (shares its memory).
-        let data_arr = np.call_method1("frombuffer", (data_ba, "uint32"))?;
+        let data_arr = np.call_method1("frombuffer", (data_ba, if narrow { "uint16" } else { "uint32" }))?;
+        let _ = total;
         // offsets are tiny (rows+1); one copy is negligible.
         let off_u8 = unsafe {
             std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 8)
