@@ -699,8 +699,15 @@ impl<const W: usize> SharedTable<W> {
             return;
         }
         let t = self.table();
-        if t.count.0.load(Ordering::Relaxed) * 2 >= t.len && t.bits() < self.max_bits.load(Ordering::Relaxed) {
-            self.grow(t);
+        let count = t.count.0.load(Ordering::Relaxed);
+        if count * 2 >= t.len {
+            if t.bits() < self.max_bits.load(Ordering::Relaxed) {
+                self.grow(t);
+            } else if count * 8 >= t.len * 5 {
+                // At the memory cap: stop at 5/8 load. Filling further makes
+                // every probe (hits AND misses) walk long clusters.
+                return;
+            }
         }
         // A growth in progress is copying the old table; an insert landing there
         // now could be missed by the copy. Don't wait for it (threads would pile
@@ -818,6 +825,25 @@ mod shared_tests {
         let v: Vec<u32> = (1..=11).collect();
         t.put(5, 1 << 56, hash(5, 1 << 56), &v);
         assert_eq!(t.get(5, 1 << 56, hash(5, 1 << 56)), Some(([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 11)));
+    }
+
+    /// At the memory cap the table stops inserting at 5/8 load instead of
+    /// filling up (which would make every probe walk long clusters).
+    #[test]
+    fn shared_table_stops_at_cap() {
+        let t: SharedTable = SharedTable::new(1); // 1 MiB = 32768 slots
+        for k in 1..200_000u64 {
+            t.put(k, 1 << 56, hash(k, 1 << 56), &[1]);
+        }
+        let slots = (1usize << 20) / 32;
+        assert!(t.len() <= slots * 5 / 8 + 1, "len {} > 5/8 of {slots}", t.len());
+        assert!(t.len() >= slots / 2);
+        // what is stored is still found
+        let mut found = 0;
+        for k in 1..200_000u64 {
+            if t.get(k, 1 << 56, hash(k, 1 << 56)).is_some() { found += 1; }
+        }
+        assert_eq!(found, t.len());
     }
 
     #[test]
