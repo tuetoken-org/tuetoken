@@ -579,47 +579,72 @@ fn camel_block(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Ca
     (starts & x.valid, bad & x.valid, out)
 }
 
+/// The GPT-2 rules for a pure-ASCII block under a clean carry: word-wide bit
+/// operations; only whitespace runs touching the block edges are uncertain.
+/// None if a contraction runs into the next block (the full rules handle it).
+#[inline(always)]
+fn word_fast(b: &[u8], base: usize, indiv: bool, c: &Carry, m: &Classes) -> Option<Block> {
+    let o = !(m.l | m.d | m.ws);
+    let sp_before = p1(m.sp, c.sp);
+    let ostart = o & !p1(o, c.o) & !sp_before;
+    let lstart = m.l & !p1(m.l, c.l) & !sp_before;
+    let dstart = if indiv { m.d } else { m.d & !p1(m.d, c.d) & !sp_before };
+    let mut starts = ostart | lstart | dstart;
+    let mut qc = m.q & ostart;
+    let mut suppress = 0u64;
+    while qc != 0 {
+        let i = qc.trailing_zeros() as usize;
+        qc &= qc - 1;
+        let len = contraction_len(b, base + i, false);
+        if len != 0 {
+            let end = i + len;
+            if end >= 64 {
+                return None; // the contraction runs into the next block
+            }
+            suppress |= run_mask(i + 1, end);
+            starts |= 1u64 << end;
+        }
+    }
+    let next = b[base + 64];
+    let (next_ws, next_na) = (is_ws(next), next >= 0x80);
+    let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, next_ws));
+    let cont = m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
+    let lr = long & !cont;
+    let r = lr & !(lr << 1);
+    let last = lr & !(lr >> 1);
+    // only the run reaching bit 63 can be uncertain (its end is in the
+    // next block): smear its top bit down over the run
+    let top = last & (1u64 << 63);
+    let wsbad = (lr.reverse_bits().wrapping_add(top.reverse_bits()) ^ lr.reverse_bits()).reverse_bits() & lr;
+    let good = lr & !wsbad;
+    let no_digit_rule = if indiv { !(m.d >> 1) } else { u64::MAX };
+    starts |= (m.ws & !long) | (r & good) | (last & good & (u64::MAX >> 1) & no_digit_rule);
+    starts &= !suppress;
+    let bad = cont | wsbad | (m.ws & ((next_na as u64) << 63));
+    let top1 = |v: u64| v >> 63 & 1 == 1;
+    let out = Carry {
+        o: top1(o),
+        sp: top1(m.sp),
+        d: top1(m.d),
+        ws: top1(m.ws),
+        l: top1(m.l),
+        bad3: bad >> 61,
+        ..Carry::default()
+    };
+    Some((starts, bad, out))
+}
+
 fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
     let n = b.len();
     let m = classify(b, base);
-    // Fast path — the common block: full, pure ASCII, no chunk-starting
-    // apostrophe, and a clean carry (no uncertainty, contraction or non-ASCII
-    // spilling in). Then nothing is uncertain except whitespace runs touching
-    // the block edges, and the rules are a few word-wide bit operations.
-    if m.na == 0 && base + 64 < n && !c.na && (c.na4 | c.bad_in | c.suppress | c.forced) == 0 {
-        let o = !(m.l | m.d | m.ws);
-        let sp_before = p1(m.sp, c.sp);
-        let ostart = o & !p1(o, c.o) & !sp_before;
-        if m.q & ostart == 0 {
-            let next = b[base + 64];
-            let (next_ws, next_na) = (is_ws(next), next >= 0x80);
-            let lstart = m.l & !p1(m.l, c.l) & !sp_before;
-            let dstart = if indiv { m.d } else { m.d & !p1(m.d, c.d) & !sp_before };
-            let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, next_ws));
-            let cont = m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
-            let lr = long & !cont;
-            let r = lr & !(lr << 1);
-            let last = lr & !(lr >> 1);
-            // only the run reaching bit 63 can be uncertain (its end is in the
-            // next block): smear its top bit down over the run
-            let top = last & (1u64 << 63);
-            let wsbad = (lr.reverse_bits().wrapping_add(top.reverse_bits()) ^ lr.reverse_bits()).reverse_bits() & lr;
-            let good = lr & !wsbad;
-            let no_digit_rule = if indiv { !(m.d >> 1) } else { u64::MAX };
-            let wsstart = (m.ws & !long) | (r & good) | (last & good & (u64::MAX >> 1) & no_digit_rule);
-            let starts = ostart | lstart | dstart | wsstart;
-            let bad = cont | wsbad | (m.ws & ((next_na as u64) << 63));
-            let top1 = |v: u64| v >> 63 & 1 == 1;
-            let out = Carry {
-                o: top1(o),
-                sp: top1(m.sp),
-                d: top1(m.d),
-                ws: top1(m.ws),
-                l: top1(m.l),
-                bad3: bad >> 61,
-                ..Carry::default()
-            };
-            return (starts, bad, out);
+    // Fast path — the common block: full, pure ASCII, contractions ending
+    // inside the block, and a clean carry. (Routing blocks with resolvable
+    // non-ASCII here too measured slower: the extra path cost the hot one.)
+    if base + 64 < n && !c.na && (c.na4 | c.bad_in | c.suppress | c.forced) == 0 {
+        if m.na == 0 {
+            if let Some(r) = word_fast(b, base, indiv, &c, &m) {
+                return r;
+            }
         }
     }
     let x = ctx_m::<true, false>(b, base, m);
