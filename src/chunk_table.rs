@@ -99,7 +99,13 @@ impl ChunkTable {
         let dense = DENSE.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         let dense = false;
-        while if dense { cap * 3 < pairs.len() * 4 } else { cap < pairs.len() * 2 } {
+        // Load factor <= 1/4 while the table stays small (<= 8 MiB, i.e. in L2):
+        // fewer displaced keys -> fewer unpredictable probe-loop branches
+        // (+5-7% single-core encode on GPT-2 vs <= 1/2). Large vocabularies keep
+        // <= 1/2 so the table doesn't outgrow the cache.
+        let fits = |cap: usize| cap * std::mem::size_of::<Entry>() <= 8 << 20;
+        let spread = if fits((pairs.len() * 4).next_power_of_two()) { 4 } else { 2 };
+        while if dense { cap * 3 < pairs.len() * 4 } else { cap < pairs.len() * spread } {
             cap <<= 1;
         }
         let bits = cap.trailing_zeros();
@@ -677,6 +683,13 @@ impl<const W: usize> SharedTable<W> {
             }
             i = (i + 1) & t.mask;
         }
+    }
+
+    /// Test-only: replace the (empty) table with an empty one of 2^bits slots.
+    #[cfg(test)]
+    pub fn presize(&self, bits: u32) {
+        let old = self.cur.swap(Box::into_raw(STable::<W>::new(bits)), Ordering::AcqRel);
+        self.retired.lock().unwrap().push(old);
     }
 
     /// Double the table (one thread at a time; others keep using the old one).

@@ -3259,10 +3259,11 @@ mod perf {
             run(&a, 14, "A: second call");
             let b = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
             run(&b, 14, "B: fresh tokenizer, warm threads, 14t");
-            let c = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
-            c.learned.set_limit_mib(0);
-            run(&c, 14, "C: fresh, learned table OFF, 14t");
-            run(&c, 14, "C: second call (learned OFF)");
+            let d = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+            d.learned.presize(22);
+            run(&d, 14, "D: fresh, learned table pre-sized 2^22, 14t");
+            let e = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+            run(&e, 1, "E: fresh, 1 thread (x14 = ideal)");
             return;
         }
         for nt in [1usize, 14] {
