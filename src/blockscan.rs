@@ -612,9 +612,24 @@ fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
     }
     starts &= !suppress;
     let _ = n;
-    let mut out = carry_out(&x, ostart, 0, false, forced, sup_next);
-    out.bad_in = bad_next;
-    out.bad3 = bad >> 61;
+    // Only the fields the Word rules read: building the shared carry here made
+    // the classifier compute the NL and uppercase masks (for c.nl / c.lw, which
+    // only the Generic/CamelCase rules use) on every block.
+    let top = |v: u64| v >> 63 & 1 == 1;
+    let out = Carry {
+        o: top(x.o),
+        sp: top(m.sp),
+        d: top(m.d),
+        ws: top(m.ws),
+        l: top(m.l),
+        na: top(m.na),
+        na4: (m.na >> 60).reverse_bits() >> 60,
+        bad_in: bad_next,
+        bad3: bad >> 61,
+        forced,
+        suppress: sup_next,
+        ..Carry::default()
+    };
     (starts & x.valid, bad & x.valid, out)
 }
 

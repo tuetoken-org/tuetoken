@@ -544,37 +544,39 @@ pub struct View<'a, const W: usize> {
 }
 
 impl View<'_, 3> {
-    /// Hot-loop lookup: Some((tokens, count)) only for a published entry of
-    /// 1..=3 inline tokens; anything else (miss, spilled marker) is None.
-    /// All fields of the home slot are loaded unconditionally and checked with
-    /// ONE combined test — key equal, and meta == 2 | n << 2 with n in 1..=3
-    /// (i.e. `meta & !0b1100 == 2`) — instead of a branch per field.
+    /// Address of the home slot for hash `h` (as an integer; never 0).
     #[inline(always)]
-    pub fn get_inline(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; 3], usize)> {
-        let mut i = (h >> self.shift) as usize;
+    pub fn slot_addr(&self, h: u64) -> u64 {
+        // SAFETY: (h >> shift) < 2^bits == table length.
+        unsafe { self.base.add((h >> self.shift) as usize) as u64 }
+    }
+
+    /// [`Self::get_inline`] starting from a home-slot address computed by
+    /// [`Self::slot_addr`] of THIS view (phase 1 computes it anyway for the
+    /// prefetch, so phase 2 skips the shift/add). Published inline entries
+    /// have meta in {6, 10, 14} (2 | n << 2, n = 1..=3; n = 4 is never stored
+    /// and the spill marker is 2 | 63 << 2), i.e. (meta - 6) & !0b1100 == 0.
+    #[inline(always)]
+    pub fn get_inline_at(&self, lo: u64, hi: u64, addr: u64) -> Option<([u32; 3], usize)> {
+        let mut p = addr as *const SSlot<3>;
         for _ in 0..PROBE_MAX {
-            // SAFETY: i <= mask < table length; the table outlives the view.
-            let s = unsafe { &*self.base.add(i) };
+            // SAFETY: p points at a slot of this view's table (home slot, or
+            // advanced with wrap-around below); the table outlives the view.
+            let s = unsafe { &*p };
             let m = s.meta.load(Ordering::Acquire);
             let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
             let t = [s.toks[0].load(Ordering::Relaxed), s.toks[1].load(Ordering::Relaxed), s.toks[2].load(Ordering::Relaxed)];
-            if (l ^ lo) | (g ^ hi) | ((m & !0b1100) ^ 2) as u64 == 0 && m >= 4 {
+            if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
                 return Some((t, (m >> 2) as usize));
             }
             if m == 0 || (l == lo && g == hi) {
-                return None; // empty slot, or our key with a non-inline entry
+                return None;
             }
-            i = (i + 1) & self.mask;
+            // SAFETY: p is within the table; next index wraps by the mask.
+            let i = (unsafe { p.offset_from(self.base) } as usize + 1) & self.mask;
+            p = unsafe { self.base.add(i) };
         }
         None
-    }
-}
-
-impl<const W: usize> View<'_, W> {
-    #[inline(always)]
-    pub fn prefetch(&self, h: u64) {
-        // SAFETY: (h >> shift) < 2^bits == table length.
-        prefetch(unsafe { self.base.add((h >> self.shift) as usize) } as *const u8);
     }
 }
 
