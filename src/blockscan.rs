@@ -321,18 +321,14 @@ fn ctx_r(b: &[u8], base: usize, resolve: bool) -> Ctx {
 fn common_bad(x: &Ctx, c: &Carry) -> u64 {
     let m = &x.m;
     let mut bad = m.na | (m.na << 1) | (m.na << 2) | (m.na << 3) | (m.na << 4);
-    if c.na4 != 0 {
-        for k in 1..=4u32 {
-            if c.na4 >> (k - 1) & 1 == 1 {
-                bad |= (1u64 << (5 - k)) - 1; // NA at base-k taints bits 0..=4-k
-            }
-        }
-    }
+    // NA at base-k (k = 1..4, bit k-1 of na4) taints bits 0..=4-k; the union is
+    // decided by the nearest one: k = tz + 1 -> bits 0..=3-tz. Branch-free
+    // (these branches were data-dependent mispredicts).
+    bad |= (16u64 >> c.na4.trailing_zeros().min(63)).saturating_sub(1);
     bad |= m.ws & (p1(m.na, c.na) | n1(m.na, x.next_na));
-    if c.ws && m.ws & 1 == 1 {
-        let lead = (!m.ws).trailing_zeros();
-        bad |= if lead >= 64 { u64::MAX } else { (1u64 << lead) - 1 };
-    }
+    // whitespace continuing from the previous block: its leading run is BAD.
+    // trailing ones of ws = ws & !(ws + 1); selected by c.ws without a branch.
+    bad |= m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
     bad
 }
 
@@ -577,7 +573,7 @@ fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
     //   good runs start a chunk at r, and at last (= e-1) when text follows
     //   (e < n) — unless individual digits and a digit follows.
     let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, x.next_ws));
-    let cont = if c.ws { run_mask(0, (!m.ws).trailing_zeros() as usize) } else { 0 };
+    let cont = m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
     let lr = long & !cont;
     let r = lr & !(lr << 1);
     let last = lr & !(lr >> 1);
