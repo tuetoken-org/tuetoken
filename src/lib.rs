@@ -3027,6 +3027,59 @@ mod perf {
     pub static NO_PIPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub static NO_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+    /// Component costs of the batched pipeline (single core, warm).
+    #[test]
+    #[ignore]
+    fn split_costs() {
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let b = &data[..300 << 20];
+        let n = b.len();
+        let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+        let mut s = Scratch::default();
+        s.dyn_cache.claim(t.uid);
+        t.encode_range(b, 0, n, &mut s);
+        let mb = |d: f64| n as f64 / d / 1e6;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let mut ends = vec![0u32; 512 + blockscan::SCAN_SLACK];
+            let mut sc = blockscan::Scan::new(0);
+            let mut acc = 0usize;
+            loop { let k = sc.fill(t.kind, b, n, &mut ends, 0, 512); if k == 0 { break; } acc += k; }
+            let d_scan = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            let mut sc = blockscan::Scan::new(0);
+            let view = t.learned.view();
+            let mut recs = vec![(0usize, 0usize, 0u64, 0u64, 0u64); 512 + blockscan::SCAN_SLACK];
+            let mut a = 0usize;
+            let bp = b.as_ptr();
+            let mut x = 0u64;
+            loop {
+                let k = sc.fill(t.kind, b, n, &mut ends, 0, 512);
+                if k == 0 { break; }
+                for (c, &e) in ends[..k].iter().enumerate() {
+                    let e = e as usize;
+                    let len = e - a;
+                    if a + 16 > n { a = e; continue; }
+                    let (lo, hi) = unsafe { chunk_table::pack_wide_any(bp.add(a), len) };
+                    let p = view.slot_addr(chunk_table::hash(lo, hi));
+                    chunk_table::prefetch(p as *const u8);
+                    let p = std::hint::select_unpredictable(len.wrapping_sub(1) < 15, p, 0);
+                    recs[c] = (a, e, lo, hi, p);
+                    a = e;
+                }
+                x = x.wrapping_add(recs[k / 2].4);
+            }
+            let d_fill = t0.elapsed().as_secs_f64();
+            s.out.clear();
+            let t0 = std::time::Instant::now();
+            t.encode_range(b, 0, n, &mut s);
+            let d_full = t0.elapsed().as_secs_f64();
+            println!("scan {:.0} MB/s | +fill {:.0} | full {:.0} || ns/B: scan {:.3} fill {:.3} probe+emit {:.3} ({acc} {x})",
+                mb(d_scan), mb(d_fill), mb(d_full), d_scan / n as f64 * 1e9, (d_fill - d_scan) / n as f64 * 1e9, (d_full - d_fill) / n as f64 * 1e9);
+        }
+    }
+
     #[test]
     #[ignore]
     fn ab_scan() {
