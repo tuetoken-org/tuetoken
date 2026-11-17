@@ -1489,7 +1489,14 @@ impl Tokenizer {
         let placed: Vec<AtomicBool> = (0..ntask).map(|_| AtomicBool::new(false)).collect();
         // per-task stash slots (no shared lock): output of tasks whose offset
         // wasn't known yet when they finished
-        let stash: Vec<OnceLock<Vec<u32>>> = (0..ntask).map(|_| OnceLock::new()).collect();
+        let stash: Vec<std::sync::Mutex<Option<Vec<u32>>>> = (0..ntask).map(|_| std::sync::Mutex::new(None)).collect();
+        // buffers of parked tasks that have been placed, reused for the next
+        // park: keeps the parked working set cache-sized instead of growing to
+        // the whole output (fresh pages, cold copies)
+        let pool: std::sync::Mutex<Vec<Vec<u32>>> = std::sync::Mutex::new(Vec::new());
+        fn lock(m: &std::sync::Mutex<Option<Vec<u32>>>) -> std::sync::MutexGuard<'_, Option<Vec<u32>>> {
+            m.lock().unwrap_or_else(|e| e.into_inner())
+        }
         let next = AtomicUsize::new(0);
 
         // offset of task k, or None if a predecessor is still running
@@ -1519,15 +1526,19 @@ impl Tokenizer {
         // placeable (offset unknown or over the cap); then the final pass does it.
         let place = |k: usize| -> bool {
             let base = if k == 0 { 0 } else { incl[k - 1].load(Acquire) };
-            let v = stash[k].get().expect("parked");
-            if base == UNK || base as usize + v.len() > cap {
+            let mut g = lock(&stash[k]);
+            let len = g.as_ref().expect("parked").len();
+            if base == UNK || base as usize + len > cap {
                 placed[k].store(false, Release);
                 return false;
             }
-            incl[k].store(base + v.len() as u64, Release);
+            let v = g.take().expect("parked");
+            drop(g);
+            incl[k].store(base + len as u64, Release);
             // SAFETY: [base, base+len) is task k's exclusive range within cap;
             // the claim on placed[k] makes this the only writer.
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out_ptr.get().add(base as usize), v.len()) };
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out_ptr.get().add(base as usize), len) };
+            pool.lock().unwrap_or_else(|e| e.into_inner()).push(v);
             true
         };
         let worker = || {
@@ -1568,7 +1579,10 @@ impl Tokenizer {
                         // park the tokens (by move, no copy) for a successor-helper
                         // or the final pass
                         let c = s.out.capacity();
-                        let _ = stash[k].set(std::mem::replace(&mut s.out, Vec::with_capacity(c)));
+                        let spare = pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                        let mut spare = spare.unwrap_or_else(|| Vec::with_capacity(c));
+                        spare.clear();
+                        *lock(&stash[k]) = Some(std::mem::replace(&mut s.out, spare));
                         // a predecessor may have finished meanwhile without seeing our stash
                         if look_back(k).is_some() && !placed[k].swap(true, AcqRel) {
                             place(k);
@@ -1578,7 +1592,7 @@ impl Tokenizer {
                     }
                     // help forward: place parked successors whose offset is now known
                     let mut j = k + 1;
-                    while j < ntask && stash[j].get().is_some() && !placed[j].load(Acquire) {
+                    while j < ntask && !placed[j].load(Acquire) && lock(&stash[j]).is_some() {
                         if placed[j].swap(true, AcqRel) {
                             break;
                         }
@@ -1618,7 +1632,12 @@ impl Tokenizer {
         }
         let total = pref[ntask];
         let stashed: Vec<(usize, Vec<u32>)> =
-            stash.into_iter().enumerate().filter_map(|(k, v)| v.into_inner().map(|v| (k, v))).collect();
+            stash.into_iter().enumerate().filter_map(|(k, v)| v.into_inner().unwrap_or_else(|e| e.into_inner()).map(|v| (k, v))).collect();
+        #[cfg(test)]
+        if std::env::var("TT_DIAG").is_ok() {
+            let fin = stashed.iter().filter(|(k, _)| !placed[*k].load(Relaxed)).count();
+            eprintln!("diag: tasks {ntask} | parked {} | final-pass {fin} | total {total} cap {cap}", stashed.len());
+        }
         if total <= cap {
             // place the still-parked outputs in parallel (disjoint ranges)
             let dst = SendPtr(out.as_mut_ptr());
@@ -3057,6 +3076,50 @@ mod perf {
             let t3 = t0.elapsed();
             println!("encode {:?} ({} task bufs) | gather {:?} | free {:?} | total {:.2} GB/s",
                 t1, 0, t2 - t1, t3 - t2, data.len() as f64 / t3.as_secs_f64() / 1e9);
+        }
+    }
+
+    /// Cold vs warm learning cost on one big blob: merges per call by thread count.
+    #[test]
+    #[ignore]
+    fn cold_learn() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read_to_string(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let want = std::env::var("TT_OUT").is_ok();
+        let run = |t: &Tokenizer, nt: usize, label: &str| {
+            MERGES.store(0, Relaxed);
+            let t0 = std::time::Instant::now();
+            let (v, c) = t.encode_direct(&[data.as_str()], nt, want);
+            let dt = t0.elapsed().as_secs_f64();
+            drop(v);
+            println!("{label:40} {:.2} GB/s | merges {:.3}%", data.len() as f64 / dt / 1e9, MERGES.load(Relaxed) as f64 / c[0] as f64 * 100.0);
+        };
+        if std::env::var("TT_ISO").is_ok() {
+            let a = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+            run(&a, 14, "A: fresh tokenizer, fresh threads, 14t");
+            run(&a, 14, "A: second call");
+            let b = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+            run(&b, 14, "B: fresh tokenizer, warm threads, 14t");
+            let c = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+            c.learned.set_limit_mib(0);
+            run(&c, 14, "C: fresh, learned table OFF, 14t");
+            run(&c, 14, "C: second call (learned OFF)");
+            return;
+        }
+        for nt in [1usize, 14] {
+            let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+            for pass in 0..2 {
+                MERGES.store(0, Relaxed);
+                let t0 = std::time::Instant::now();
+                let (v, c) = t.encode_direct(&[data.as_str()], nt, want);
+                let dt = t0.elapsed().as_secs_f64();
+                let t1 = std::time::Instant::now();
+                drop(v);
+                if want { eprintln!("  drop {:?}", t1.elapsed()); }
+                println!("threads {nt:2} pass {pass}: {:.2} GB/s | merges {:.3}% of {} tokens | learned {}",
+                    data.len() as f64 / dt / 1e9, MERGES.load(Relaxed) as f64 / c[0] as f64 * 100.0, c[0], t.learned.len());
+            }
         }
     }
 

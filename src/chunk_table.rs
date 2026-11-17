@@ -463,12 +463,21 @@ struct SSlot<const W: usize> {
     toks: [AtomicU32; W],
 }
 
+/// Its own 128-byte line (Apple M-series lines are 128 B): the insert counter
+/// must not share a cache line with the fields every lookup reads.
+#[repr(align(128))]
+struct PaddedCount(AtomicUsize);
+
+/// Read-only after construction except `count`, which is padded away from
+/// `ptr`/`mask`/`shift` — otherwise every insert (any thread) would invalidate
+/// the line every lookup (every thread) reads: classic false sharing.
+#[repr(C, align(128))]
 struct STable<const W: usize> {
     ptr: *mut SSlot<W>,
     len: usize,
     mask: usize,
     shift: u32,
-    count: AtomicUsize,
+    count: PaddedCount,
 }
 
 impl<const W: usize> STable<W> {
@@ -487,7 +496,7 @@ impl<const W: usize> STable<W> {
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        Box::new(STable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: AtomicUsize::new(0) })
+        Box::new(STable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
     }
 
     #[inline(always)]
@@ -576,7 +585,7 @@ impl<const W: usize> SharedTable<W> {
 
     /// Learned entries currently stored (approximate under concurrency).
     pub fn len(&self) -> usize {
-        self.table().count.load(Ordering::Relaxed)
+        self.table().count.0.load(Ordering::Relaxed)
     }
 
     /// Hint the slot a lookup with hash `h` reads first into cache.
@@ -615,7 +624,7 @@ impl<const W: usize> SharedTable<W> {
             return;
         }
         let t = self.table();
-        if t.count.load(Ordering::Relaxed) * 2 >= t.len && t.bits() < self.max_bits.load(Ordering::Relaxed) {
+        if t.count.0.load(Ordering::Relaxed) * 2 >= t.len && t.bits() < self.max_bits.load(Ordering::Relaxed) {
             self.grow(t);
         }
         // A growth in progress is copying the old table; an insert landing there
@@ -638,7 +647,7 @@ impl<const W: usize> SharedTable<W> {
                             d.store(toks.get(k).copied().unwrap_or(0), Ordering::Relaxed);
                         }
                         s.meta.store(2 | (n as u32) << 2, Ordering::Release);
-                        t.count.fetch_add(1, Ordering::Relaxed);
+                        t.count.0.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                     Err(cur) => m = cur,
@@ -662,6 +671,8 @@ impl<const W: usize> SharedTable<W> {
             self.growing.store(false, Ordering::Release);
             return;
         }
+        #[cfg(test)]
+        let t0 = std::time::Instant::now();
         let new = STable::<W>::new(old.bits() + 1);
         let mut copied = 0usize;
         for i in 0..old.len {
@@ -687,7 +698,11 @@ impl<const W: usize> SharedTable<W> {
                 j = (j + 1) & new.mask;
             }
         }
-        new.count.store(copied, Ordering::Relaxed);
+        new.count.0.store(copied, Ordering::Relaxed);
+        #[cfg(test)]
+        if std::env::var("TT_DIAG").is_ok() {
+            eprintln!("grow -> 2^{} ({copied} entries) {:?}", new.bits(), t0.elapsed());
+        }
         let newp = Box::into_raw(new);
         // Release: the copied slots are visible to any thread that loads `cur`.
         self.cur.store(newp, Ordering::Release);
