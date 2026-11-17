@@ -107,7 +107,9 @@ ids, offsets = out["data"], out["offsets"]           # doc i = ids[offsets[i]:of
 `separator=` splits each input into documents inside Rust (same result as
 `data.split(b"<|endoftext|>")`, one row per piece, without building a Python list);
 `count_tokens_batch` takes it too. Pass `[data]` without a separator to encode one
-big document.
+big document. `dtype="uint16"` returns 2-byte ids (half the memory, ready for
+`np.memmap`-style training data) when the vocabulary has at most 65,536 ids, as GPT-2's
+does.
 
 Every chunk is resolved with one probe into a table shared by all threads: it
 starts with the vocabulary's own chunks, and anything else is merged once and
