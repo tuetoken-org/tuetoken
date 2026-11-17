@@ -3047,6 +3047,20 @@ mod perf {
             let mut acc = 0usize;
             loop { let k = sc.fill(t.kind, b, n, &mut ends, 0, 512); if k == 0 { break; } acc += k; }
             let d_scan = t0.elapsed().as_secs_f64();
+            // rules only: block_m over every block, carry in place
+            let t0 = std::time::Instant::now();
+            let mut c = blockscan::Carry::default();
+            let mut i = 0usize;
+            let mut z = 0u64;
+            while i + 64 <= n { let (st, bd) = blockscan::block_m(t.kind, b, i, &mut c); z = z.wrapping_add(st ^ bd); i += 64; }
+            let d_rules = t0.elapsed().as_secs_f64();
+            println!("  rules only {:.0} MB/s ({z}) -> extraction+driver {:.3} ns/B", mb(d_rules), (d_scan - d_rules) / n as f64 * 1e9);
+            let asc: Vec<u8> = b.iter().map(|&x| if x >= 0x80 { b'q' } else { x }).collect();
+            let t0 = std::time::Instant::now();
+            let mut c = blockscan::Carry::default();
+            let mut i = 0usize;
+            while i + 64 <= n { let (st, bd) = blockscan::block_m(t.kind, &asc, i, &mut c); z = z.wrapping_add(st ^ bd); i += 64; }
+            println!("  rules only, all-ASCII text {:.0} MB/s ({z})", mb(t0.elapsed().as_secs_f64()));
             let t0 = std::time::Instant::now();
             let mut sc = blockscan::Scan::new(0);
             let view = t.learned.view();
