@@ -1164,13 +1164,16 @@ impl Tokenizer {
     /// look-ahead rules (`\s+(?!\S)`) behave exactly as in an unsplit encode.
     #[inline]
     fn encode_range(&self, bytes: &[u8], start: usize, stop: usize, s: &mut Scratch) {
+        const PIPE_MIN_BYTES: usize = 1024;
         let n = bytes.len();
         // 64-byte block scanner (identical boundaries, see blockscan.rs).
         #[cfg(test)]
         let pipe = !perf::NO_PIPE.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         let pipe = true;
-        if pipe {
+        // Short ranges resolve immediately: the pipeline's batch setup costs
+        // more than its prefetch lead saves below ~1 KB.
+        if pipe && stop - start >= PIPE_MIN_BYTES {
             // Two-phase pipeline: phase 1 buffers ~512 chunks (several blocks)
             // with their keys built and BOTH table slots (vocabulary table and
             // shared learned table) prefetched; phase 2 resolves them in order
@@ -1178,9 +1181,13 @@ impl Tokenizer {
             // time, enough to hide even a DRAM miss in the learned table.
             // (+18-28% single-core on OpenWebText vs resolving immediately.)
             const CAP: usize = 512;
-            let mut buf = [(0usize, 0usize, 0u64, 0u64, 0u64); CAP + 64];
+            // Uninitialized: entries are written before they are read, and
+            // zero-filling ~23 KB per call would dominate short inputs.
+            let mut buf = [std::mem::MaybeUninit::<(usize, usize, u64, u64, u64)>::uninit(); CAP + 64];
             let mut cnt = 0usize;
-            let flush = |buf: &[(usize, usize, u64, u64, u64)], s: &mut Scratch| {
+            let flush = |buf: &[std::mem::MaybeUninit<(usize, usize, u64, u64, u64)>], s: &mut Scratch| {
+                // SAFETY: callers pass only the first `cnt` entries, all written.
+                let buf: &[(usize, usize, u64, u64, u64)] = unsafe { &*(buf as *const _ as *const [(usize, usize, u64, u64, u64)]) };
                 s.out.reserve(3 * buf.len() + 16);
                 let mut w = s.out.len();
                 let mut dst = s.out.as_mut_ptr();
@@ -1215,7 +1222,7 @@ impl Tokenizer {
                 let mut a = first;
                 for &e in ends {
                     let len = e - a;
-                    buf[cnt] = if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                    buf[cnt] = std::mem::MaybeUninit::new(if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
                         // SAFETY: a + 16 <= n.
                         let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(a), len) };
                         let h = chunk_table::hash(lo, hi) | 1;
@@ -1224,7 +1231,7 @@ impl Tokenizer {
                         (a, e, lo, hi, h)
                     } else {
                         (a, e, 0, 0, 0)
-                    };
+                    });
                     cnt += 1;
                     a = e;
                 }
@@ -2852,6 +2859,38 @@ mod perf {
         for _ in 0..6 {
             s.out.clear();
             t.encode_range(b, 0, b.len(), &mut s);
+        }
+    }
+
+    /// Interleaved A/B on SHORT inputs (one encode call per text): pipelined vs immediate.
+    #[test]
+    #[ignore]
+    fn ab_short() {
+        let toks = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read_to_string(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let t = Tokenizer::new(toks.split(',').next().unwrap()).unwrap();
+        for len in [16usize, 64, 256, 512, 1024, 2048, 8192] {
+            let mut texts = Vec::new();
+            let mut i = 0usize;
+            while texts.len() < 200_000 && i + len < data.len() {
+                let mut e = i + len;
+                while !data.is_char_boundary(e) { e += 1; }
+                texts.push(&data[i..e]);
+                i = e + 7;
+                while !data.is_char_boundary(i) { i += 1; }
+            }
+            let mut s = Scratch::default();
+            s.dyn_cache.claim(t.uid);
+            let mut best = [f64::MAX; 2];
+            for round in 0..8 {
+                let v = round % 2;
+                NO_PIPE.store(v == 1, std::sync::atomic::Ordering::Relaxed);
+                let t0 = std::time::Instant::now();
+                for x in &texts { s.out.clear(); t.encode_range(x.as_bytes(), 0, x.len(), &mut s); }
+                best[v] = best[v].min(t0.elapsed().as_secs_f64());
+            }
+            NO_PIPE.store(false, std::sync::atomic::Ordering::Relaxed);
+            println!("{len:5} B texts: pipelined {:.0} ns/text | immediate {:.0} ns/text", best[0] / texts.len() as f64 * 1e9, best[1] / texts.len() as f64 * 1e9);
         }
     }
 
