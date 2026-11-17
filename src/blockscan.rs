@@ -263,7 +263,8 @@ struct Ctx {
 /// character only ever extends a run of its class (Word).
 /// Returns the continuation bytes of the resolved characters (all but their
 /// lead byte), for grammars whose rules look at the previous CHARACTER.
-fn resolve_na(b: &[u8], base: usize, m: &mut Classes) -> u64 {
+#[inline]
+fn resolve_na<const CONT: bool>(b: &[u8], base: usize, m: &mut Classes) -> u64 {
     let lim = (b.len() - base).min(64);
     let mut r = m.na;
     let (mut ul, mut up, mut cont) = (0u64, 0u64, 0u64);
@@ -274,7 +275,9 @@ fn resolve_na(b: &[u8], base: usize, m: &mut Classes) -> u64 {
             let d = b[base + i + 1];
             let w = 3u64 << i;
             if d == 0x97 || d == 0xB7 { up |= w } else { ul |= w }
-            cont |= 2u64 << i;
+            if CONT {
+                cont |= 2u64 << i;
+            }
             r &= !w;
             continue;
         }
@@ -283,7 +286,9 @@ fn resolve_na(b: &[u8], base: usize, m: &mut Classes) -> u64 {
             if (0x90..=0xA7).contains(&d) || (0xB0..=0xBE).contains(&d) {
                 let w = 7u64 << i;
                 up |= w;
-                cont |= 6u64 << i;
+                if CONT {
+                    cont |= 6u64 << i;
+                }
                 r &= !w;
                 continue;
             }
@@ -302,12 +307,17 @@ fn ctx(b: &[u8], base: usize) -> Ctx {
 
 #[inline(always)]
 fn ctx_r(b: &[u8], base: usize, resolve: bool) -> Ctx {
+    if resolve { ctx_m::<true, true>(b, base, classify(b, base)) } else { ctx_m::<false, false>(b, base, classify(b, base)) }
+}
+
+/// RESOLVE: classify common non-ASCII in-block; CONT: also track the resolved
+/// characters' continuation bytes (only the Generic rules need them).
+#[inline(always)]
+fn ctx_m<const RESOLVE: bool, const CONT: bool>(b: &[u8], base: usize, mut m: Classes) -> Ctx {
     let n = b.len();
-    #[allow(unused_mut)]
-    let mut m = classify(b, base);
     let mut cont = 0u64;
-    if resolve && m.na != 0 {
-        cont = resolve_na(b, base, &mut m);
+    if RESOLVE && m.na != 0 {
+        cont = resolve_na::<CONT>(b, base, &mut m);
     }
     let valid = if base + 64 <= n { u64::MAX } else { (1u64 << (n - base)) - 1 };
     let next = b.get(base + 64).copied();
@@ -571,7 +581,48 @@ fn camel_block(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Ca
 
 fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
     let n = b.len();
-    let x = ctx_r(b, base, true);
+    let m = classify(b, base);
+    // Fast path — the common block: full, pure ASCII, no chunk-starting
+    // apostrophe, and a clean carry (no uncertainty, contraction or non-ASCII
+    // spilling in). Then nothing is uncertain except whitespace runs touching
+    // the block edges, and the rules are a few word-wide bit operations.
+    if m.na == 0 && base + 64 < n && !c.na && (c.na4 | c.bad_in | c.suppress | c.forced) == 0 {
+        let o = !(m.l | m.d | m.ws);
+        let sp_before = p1(m.sp, c.sp);
+        let ostart = o & !p1(o, c.o) & !sp_before;
+        if m.q & ostart == 0 {
+            let next = b[base + 64];
+            let (next_ws, next_na) = (is_ws(next), next >= 0x80);
+            let lstart = m.l & !p1(m.l, c.l) & !sp_before;
+            let dstart = if indiv { m.d } else { m.d & !p1(m.d, c.d) & !sp_before };
+            let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, next_ws));
+            let cont = m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
+            let lr = long & !cont;
+            let r = lr & !(lr << 1);
+            let last = lr & !(lr >> 1);
+            // only the run reaching bit 63 can be uncertain (its end is in the
+            // next block): smear its top bit down over the run
+            let top = last & (1u64 << 63);
+            let wsbad = (lr.reverse_bits().wrapping_add(top.reverse_bits()) ^ lr.reverse_bits()).reverse_bits() & lr;
+            let good = lr & !wsbad;
+            let no_digit_rule = if indiv { !(m.d >> 1) } else { u64::MAX };
+            let wsstart = (m.ws & !long) | (r & good) | (last & good & (u64::MAX >> 1) & no_digit_rule);
+            let starts = ostart | lstart | dstart | wsstart;
+            let bad = cont | wsbad | (m.ws & ((next_na as u64) << 63));
+            let top1 = |v: u64| v >> 63 & 1 == 1;
+            let out = Carry {
+                o: top1(o),
+                sp: top1(m.sp),
+                d: top1(m.d),
+                ws: top1(m.ws),
+                l: top1(m.l),
+                bad3: bad >> 61,
+                ..Carry::default()
+            };
+            return (starts, bad, out);
+        }
+    }
+    let x = ctx_m::<true, false>(b, base, m);
     let (m, o) = (&x.m, x.o);
     let sp_before = p1(m.sp, c.sp);
     let ostart = o & !p1(o, c.o) & !sp_before;
