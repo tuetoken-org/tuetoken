@@ -1236,6 +1236,10 @@ impl Tokenizer {
                 let mut c = cnt;
                 let mut a = first;
                 let bufp = buf.as_mut_ptr();
+                // By-value copies: captured by reference, `n` and `bp` were
+                // reloaded from the stack after every record store (the raw
+                // pointer stores might alias them, as far as LLVM can tell).
+                let (n, bp) = (n, bp);
                 for &e in ends {
                     let len = e - a;
                     let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
