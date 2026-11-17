@@ -1192,19 +1192,21 @@ impl Tokenizer {
             // zero-filling ~23 KB per call would dominate short inputs.
             let mut buf = [std::mem::MaybeUninit::<(usize, usize, u64, u64, u64)>::uninit(); CAP + 72];
             let mut cnt = 0usize;
-            let flush = |buf: &[std::mem::MaybeUninit<(usize, usize, u64, u64, u64)>], s: &mut Scratch| {
+            // Each record holds the home-slot ADDRESS (0 = no key) of the table
+            // view the batch was built with, so phase 2 needn't recompute it.
+            let mut bview = self.learned.view();
+            let flush = |buf: &[std::mem::MaybeUninit<(usize, usize, u64, u64, u64)>], s: &mut Scratch, view: chunk_table::View<'_, 3>| {
                 // SAFETY: callers pass only the first `cnt` entries, all written.
                 let buf: &[(usize, usize, u64, u64, u64)] = unsafe { &*(buf as *const _ as *const [(usize, usize, u64, u64, u64)]) };
                 s.out.reserve(3 * buf.len() + 16);
                 let mut w = s.out.len();
                 let mut dst = s.out.as_mut_ptr();
-                let view = self.learned.view();
                 // One probe per chunk into the unified table (vocabulary entries
                 // seeded at load + everything learned); a miss (or an entry
                 // too long for it) takes the exact path.
                 for (k, &(a, e, lo, hi, h)) in buf.iter().enumerate() {
                     if h != 0 {
-                        if let Some((ts, c)) = view.get_inline(lo, hi, h) {
+                        if let Some((ts, c)) = view.get_inline_at(lo, hi, h) {
                             // SAFETY: capacity >= w + 3 * remaining entries (reserved).
                             unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
                             w += c;
@@ -1227,7 +1229,10 @@ impl Tokenizer {
                 // `cnt` was loaded/stored through memory for every chunk (a
                 // store-to-load forwarding chain), and the table header was
                 // re-read (one acquire load + 2 dependent loads) per chunk.
-                let view = self.learned.view();
+                if cnt == 0 {
+                    bview = self.learned.view();
+                }
+                let view = bview;
                 let mut c = cnt;
                 let mut a = first;
                 let bufp = buf.as_mut_ptr();
@@ -1236,9 +1241,9 @@ impl Tokenizer {
                     let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
                         // SAFETY: a + 16 <= n.
                         let (lo, hi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
-                        let h = chunk_table::hash(lo, hi) | 1;
-                        view.prefetch(h);
-                        (a, e, lo, hi, h)
+                        let p = view.slot_addr(chunk_table::hash(lo, hi));
+                        chunk_table::prefetch(p as *const u8);
+                        (a, e, lo, hi, p)
                     } else {
                         (a, e, 0, 0, 0)
                     };
@@ -1250,11 +1255,11 @@ impl Tokenizer {
                 }
                 cnt = c;
                 if cnt >= CAP {
-                    flush(&buf[..cnt], s);
+                    flush(&buf[..cnt], s, bview);
                     cnt = 0;
                 }
             });
-            flush(&buf[..cnt], s);
+            flush(&buf[..cnt], s, bview);
             return;
         }
         blockscan::chunks_batched(self.kind, bytes, start, stop, |first, ends| {
