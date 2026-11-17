@@ -14,6 +14,12 @@ struct Entry {
 pub struct MergeMap {
     entries: Vec<Entry>,
     mask: usize,
+    shift: u32,
+    // Dense (rank, target) for pairs of ids < 256: a chunk's first round of
+    // lookups is all byte-token pairs (ids 0..255 in GPT-2 / cl100k / Qwen /
+    // Llama-3 vocabularies), and this turns each into one array load from a
+    // 512 KiB table instead of a hash probe. Other pairs use the hash map.
+    dense: Vec<(u32, u32)>,
 }
 
 impl MergeMap {
@@ -22,6 +28,7 @@ impl MergeMap {
         while cap < merges.len().saturating_mul(3) {
             cap <<= 1;
         }
+        let bits = cap.trailing_zeros();
         let mut m = MergeMap {
             entries: vec![
                 Entry {
@@ -32,10 +39,18 @@ impl MergeMap {
                 cap
             ],
             mask: cap - 1,
+            shift: 64 - bits,
+            dense: vec![(u32::MAX, 0); 1 << 16],
         };
         for (i, &(t1, t2, tg)) in merges.iter().enumerate() {
+            if t1 < 256 && t2 < 256 {
+                let d = &mut m.dense[(t1 as usize) << 8 | t2 as usize];
+                if d.0 == u32::MAX {
+                    *d = (i as u32, tg);
+                }
+            }
             let key = Self::key(t1, t2);
-            let mut idx = (Self::hash(key) as usize) & m.mask;
+            let mut idx = m.slot(key);
             while m.entries[idx].key != 0 {
                 idx = (idx + 1) & m.mask;
             }
@@ -60,20 +75,20 @@ impl MergeMap {
         }
     }
 
+    /// Home slot: one multiply, top bits (they mix every key bit).
     #[inline]
-    fn hash(mut k: u64) -> u64 {
-        k ^= k >> 33;
-        k = k.wrapping_mul(0xff51afd7ed558ccd);
-        k ^= k >> 33;
-        k = k.wrapping_mul(0xc4ceb9fe1a85ec53);
-        k ^= k >> 33;
-        k
+    fn slot(&self, key: u64) -> usize {
+        ((key ^ (key >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
     }
 
     #[inline]
     fn lookup(&self, t1: u32, t2: u32) -> (u32, u32) {
+        if (t1 | t2) < 256 {
+            // SAFETY: t1, t2 < 256, so the index is < 65536 == dense.len().
+            return unsafe { *self.dense.get_unchecked((t1 as usize) << 8 | t2 as usize) };
+        }
         let key = Self::key(t1, t2);
-        let mut idx = (Self::hash(key) as usize) & self.mask;
+        let mut idx = self.slot(key);
         loop {
             // SAFETY: idx is always `& self.mask`, so idx < capacity == entries.len().
             let e = unsafe { *self.entries.get_unchecked(idx) };
