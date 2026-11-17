@@ -378,28 +378,30 @@ fn digit_starts(m: &Classes, c: &Carry, k: u32, prefix_sp: bool) -> (u64, u64) {
         0 => (runs & !joined, 0),
         1 => (m.d, 0),
         k => {
-            let k = k as usize;
-            let (mut st, mut bad) = (0u64, 0u64);
-            let after_na = p1(m.na, c.na);
-            let mut rr = runs;
-            while rr != 0 {
-                let r = rr.trailing_zeros() as usize;
-                rr &= rr - 1;
-                let e = (r + ((!m.d) >> r).trailing_zeros() as usize).min(64);
-                if after_na >> r & 1 == 1 {
-                    bad |= run_mask(r, e);
-                    continue;
-                }
-                let mut j = r;
-                while j < e {
-                    st |= 1u64 << j;
-                    j += k;
-                }
+            // Branch-free digit groups: a run starting at r starts chunks at
+            // r, r+k, r+2k, ... Doubling: with D_s = "s consecutive digits end
+            // here", S |= (S << s) & D_s for s = k, 2k, 4k, ... (D_2s =
+            // D_s & (D_s << s)) — no loop over runs (those loops' exits were
+            // the rules' top mispredicts).
+            let k = k as u32;
+            let mut dm = m.d;
+            for t in 1..k {
+                dm &= m.d << t;
             }
-            if c.d {
-                let lead = (!m.d).trailing_zeros();
-                bad |= if lead >= 64 { u64::MAX } else { (1u64 << lead) - 1 };
+            // runs right after non-ASCII are uncertain (a Unicode digit might
+            // lead the group): their bits are BAD, smeared over the run
+            let flag = runs & p1(m.na, c.na);
+            let mut bad = (m.d.wrapping_add(flag) ^ m.d) & m.d;
+            let mut st = runs & !flag;
+            let mut sh = k;
+            while sh < 64 {
+                st |= (st << sh) & dm;
+                dm &= dm << sh;
+                sh <<= 1;
             }
+            st &= !bad;
+            // a run continuing from the previous block: alignment unknown
+            bad |= m.d & !m.d.wrapping_add(1) & (c.d as u64).wrapping_neg();
             (st, bad)
         }
     }
