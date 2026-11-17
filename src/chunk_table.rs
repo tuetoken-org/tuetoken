@@ -68,6 +68,29 @@ pub unsafe fn pack_wide(p: *const u8, len: usize) -> (u64, u64) {
     (k as u64, ((k >> 64) as u64) | ((len as u64) << 56))
 }
 
+/// `pack_wide` for chunk `b[pos..pos + len]` (1 <= len <= MAX_KEY) wherever it
+/// lies: within 16 bytes of the end of `b` the key is built from a zero-padded
+/// copy — the same key, since bytes past `len` are masked off anyway. (Those
+/// chunks — the last ones of every text — used to skip every table.)
+#[inline(always)]
+pub fn pack_at(b: &[u8], pos: usize, len: usize) -> (u64, u64) {
+    if pos + 16 <= b.len() {
+        // SAFETY: 16 bytes readable at pos.
+        unsafe { pack_wide(b.as_ptr().add(pos), len) }
+    } else {
+        pack_tail(&b[pos..pos + len])
+    }
+}
+
+#[cold]
+#[inline(never)]
+pub fn pack_tail(c: &[u8]) -> (u64, u64) {
+    let mut t = [0u8; 16];
+    t[..c.len()].copy_from_slice(c);
+    // SAFETY: t is 16 bytes; c.len() in 1..=MAX_KEY.
+    unsafe { pack_wide(t.as_ptr(), c.len()) }
+}
+
 static KEY_MASK: [u128; 16] = {
     let mut m = [0u128; 16];
     let mut i = 1;

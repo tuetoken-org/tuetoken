@@ -603,6 +603,49 @@ enum Src<'a> {
     Raw(&'a [u8]),
 }
 
+/// Document ranges of `b` split on `sep` (non-empty): exactly `bytes.split`
+/// (leftmost, non-overlapping matches; separators dropped; empty pieces kept).
+/// Large inputs are searched in parallel pieces (SIMD substring search); all
+/// occurrences are collected, then the leftmost non-overlapping ones kept.
+fn split_on(b: &[u8], sep: &[u8], num_threads: usize) -> Vec<(usize, usize)> {
+    let n = b.len();
+    let k = sep.len();
+    let finder = memchr::memmem::Finder::new(sep);
+    let find_all = |lo: usize, hi: usize| -> Vec<usize> {
+        // occurrences starting in [lo, hi), overlapping ones included
+        let end = (hi + k - 1).min(n);
+        let mut v = Vec::new();
+        let mut p = lo;
+        while p < hi {
+            match finder.find(&b[p..end]) {
+                Some(i) if p + i < hi => {
+                    v.push(p + i);
+                    p += i + 1;
+                }
+                _ => break,
+            }
+        }
+        v
+    };
+    const PIECE: usize = 8 << 20;
+    let occ: Vec<usize> = if n >= 2 * PIECE && num_threads != 1 && parallel_ok() {
+        let cuts: Vec<usize> = (0..n.div_ceil(PIECE)).map(|i| i * PIECE).collect();
+        cuts.par_iter().map(|&lo| find_all(lo, (lo + PIECE).min(n))).collect::<Vec<_>>().concat()
+    } else {
+        find_all(0, n)
+    };
+    let mut docs = Vec::with_capacity(occ.len() + 1);
+    let mut start = 0usize;
+    for o in occ {
+        if o >= start {
+            docs.push((start, o));
+            start = o + k;
+        }
+    }
+    docs.push((start, n));
+    docs
+}
+
 /// Inputs for the batch engine. With `lazy` (models without a normalizer),
 /// `bytes` items are NOT validated here: each worker validates the slice it
 /// is about to encode, so the input is read once instead of twice (an
@@ -1268,40 +1311,7 @@ impl Tokenizer {
                     }
                     let view = self.learned.view();
                     let bufp = buf.as_mut_ptr();
-                    let (n, bp) = (n, bp);
-                    let last = ends[k - 1] as usize;
-                    if last + 16 <= n {
-                        for (c, &e) in ends[..k].iter().enumerate() {
-                            let e = e as usize;
-                            let len = e - a;
-                            // SAFETY: a < e <= last, so a + 16 <= n.
-                            let (lo, hi) = unsafe { chunk_table::pack_wide_any(bp.add(a), len) };
-                            let p = view.slot_addr(chunk_table::hash(lo, hi));
-                            chunk_table::prefetch(p as *const u8);
-                            let ok = len.wrapping_sub(1) < chunk_table::MAX_KEY;
-                            let p = std::hint::select_unpredictable(ok, p, 0);
-                            // SAFETY: k <= CAP + SCAN_SLACK <= buf.len().
-                            unsafe { (*bufp.add(c)).write((a, e, lo, hi, p)) };
-                            a = e;
-                        }
-                    } else {
-                        for (c, &e) in ends[..k].iter().enumerate() {
-                            let e = e as usize;
-                            let len = e - a;
-                            let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
-                                // SAFETY: a + 16 <= n.
-                                let (lo, hi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
-                                let p = view.slot_addr(chunk_table::hash(lo, hi));
-                                chunk_table::prefetch(p as *const u8);
-                                (a, e, lo, hi, p)
-                            } else {
-                                (a, e, 0, 0, 0)
-                            };
-                            // SAFETY: as above.
-                            unsafe { (*bufp.add(c)).write(v) };
-                            a = e;
-                        }
-                    }
+                    a = Self::fill_recs(bytes, &ends, 0, k, a, bufp, view);
                     flush(&buf[..k], s, view);
                 }
                 return;
@@ -1357,6 +1367,174 @@ impl Tokenizer {
         });
     }
 
+    /// Phase 1 records for chunk ends `ends[lo..hi]` (the first chunk starts at
+    /// `a`): key, home-slot address (prefetched) per chunk; returns the last
+    /// end. Straight-line (branch-free, wide loads) for every chunk that has 16
+    /// readable bytes; only the last few chunks of the buffer take the checked
+    /// loop, with zero-padded keys.
+    #[inline(always)]
+    fn fill_recs(
+        bytes: &[u8],
+        ends: &[u32],
+        lo: usize,
+        hi: usize,
+        mut a: usize,
+        bufp: *mut std::mem::MaybeUninit<(usize, usize, u64, u64, u64)>,
+        view: chunk_table::View<'_, 3>,
+    ) -> usize {
+        let n = bytes.len();
+        let bp = bytes.as_ptr();
+        let mut j = hi;
+        while j > lo && ends[j - 1] as usize + 16 > n {
+            j -= 1;
+        }
+        for c in lo..j {
+            let e = ends[c] as usize;
+            let len = e - a;
+            // SAFETY: a < e <= ends[j - 1] and ends[j - 1] + 16 <= n.
+            let (klo, khi) = unsafe { chunk_table::pack_wide_any(bp.add(a), len) };
+            let p = view.slot_addr(chunk_table::hash(klo, khi));
+            chunk_table::prefetch(p as *const u8);
+            let ok = len.wrapping_sub(1) < chunk_table::MAX_KEY;
+            let p = std::hint::select_unpredictable(ok, p, 0);
+            // SAFETY: callers' buffers hold CAP + SCAN_SLACK >= hi records.
+            unsafe { (*bufp.add(c)).write((a, e, klo, khi, p)) };
+            a = e;
+        }
+        for c in j..hi {
+            let e = ends[c] as usize;
+            let len = e - a;
+            let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY {
+                let (klo, khi) = chunk_table::pack_at(bytes, a, len);
+                let p = view.slot_addr(chunk_table::hash(klo, khi));
+                chunk_table::prefetch(p as *const u8);
+                (a, e, klo, khi, p)
+            } else {
+                (a, e, 0, 0, 0)
+            };
+            // SAFETY: as above.
+            unsafe { (*bufp.add(c)).write(v) };
+            a = e;
+        }
+        a
+    }
+
+    /// Whether batch items take the plain byte-level path (`encode_bytes` ->
+    /// `encode_range`), so `encode_items_piped` applies.
+    #[inline]
+    fn items_pipe_ok(&self) -> bool {
+        #[cfg(test)]
+        {
+            if perf::NO_PIPE.load(std::sync::atomic::Ordering::Relaxed) || perf::NO_SCAN.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+        }
+        self.meta_mode == 0 && !self.byte_fallback && !self.cjk && self.fallback_re.is_empty()
+    }
+
+    /// Phase 2 of the pipeline for records of one buffer `bytes` (len `n`).
+    #[inline(always)]
+    fn flush_recs(&self, bytes: &[u8], n: usize, buf: &[(usize, usize, u64, u64, u64)], s: &mut Scratch, view: chunk_table::View<'_, 3>) {
+        s.out.reserve(3 * buf.len() + 16);
+        let mut w = s.out.len();
+        let mut dst = s.out.as_mut_ptr();
+        for (k, &(a, e, lo, hi, h)) in buf.iter().enumerate() {
+            if h != 0 {
+                if let Some((ts, c)) = view.get_inline_at(lo, hi, h) {
+                    // SAFETY: capacity >= w + 3 * remaining entries (reserved).
+                    unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
+                    w += c;
+                    continue;
+                }
+            }
+            // SAFETY: [0, w) initialized.
+            unsafe { s.out.set_len(w) };
+            self.emit_chunk_cold(bytes, a, e, n, s);
+            s.out.reserve(3 * (buf.len() - k) + 16);
+            w = s.out.len();
+            dst = s.out.as_mut_ptr();
+        }
+        // SAFETY: [0, w) initialized.
+        unsafe { s.out.set_len(w) };
+    }
+
+    /// Encode a run of batch items through ONE two-phase pipeline whose record
+    /// batch carries across item boundaries: a short document no longer pays
+    /// its own pipeline setup and end drain (its last partial batch probed
+    /// with almost no prefetch lead). Phase 2 resolves a batch segment by
+    /// segment (one per item), so per-item token counts stay exact; they are
+    /// ADDED to `counts[i]`. Items that are not valid UTF-8 are reported via
+    /// `bad(doc)` and produce nothing. Requires `items_pipe_ok()`.
+    fn encode_items_piped(
+        &self,
+        norm: &[std::borrow::Cow<'_, [u8]>],
+        trusted: &[bool],
+        items: &[(u32, usize, usize, bool)],
+        s: &mut Scratch,
+        counts: &mut [u32],
+        bad: &mut dyn FnMut(u32),
+    ) {
+        const CAP: usize = 512;
+        type Rec = (usize, usize, u64, u64, u64);
+        let mut buf = [std::mem::MaybeUninit::<Rec>::uninit(); CAP + blockscan::SCAN_SLACK];
+        let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
+        // (record end, item index) per item segment of the pending batch
+        let mut segs: Vec<(usize, usize)> = Vec::with_capacity(64);
+        let mut cnt = 0usize;
+        let mut view = self.learned.view();
+        let flush = |buf: &[std::mem::MaybeUninit<Rec>], segs: &[(usize, usize)], s: &mut Scratch, counts: &mut [u32], view: chunk_table::View<'_, 3>| {
+            // SAFETY: callers pass only written entries.
+            let buf: &[Rec] = unsafe { &*(buf as *const _ as *const [Rec]) };
+            let mut st = 0usize;
+            for &(end, ii) in segs {
+                let d: &[u8] = &norm[items[ii].0 as usize];
+                let before = s.out.len();
+                self.flush_recs(d, d.len(), &buf[st..end], s, view);
+                counts[ii] += (s.out.len() - before) as u32;
+                st = end;
+            }
+        };
+        for (ii, &(doc, a0, b0, seg)) in items.iter().enumerate() {
+            let d: &[u8] = &norm[doc as usize];
+            if !trusted[doc as usize] && simdutf8::basic::from_utf8(&d[a0..b0]).is_err() {
+                bad(doc);
+                continue;
+            }
+            let n = d.len();
+            let (start, stop) = if seg { (a0, b0) } else { (0, n) };
+            if n > u32::MAX as usize {
+                flush(&buf[..cnt], &segs, s, counts, view);
+                cnt = 0;
+                segs.clear();
+                let before = s.out.len();
+                self.encode_range(d, start, stop, s);
+                counts[ii] += (s.out.len() - before) as u32;
+                continue;
+            }
+            let mut scan = blockscan::Scan::new(start);
+            let mut a = start;
+            loop {
+                if cnt == 0 {
+                    view = self.learned.view();
+                }
+                let k1 = scan.fill(self.kind, d, stop, &mut ends, cnt, CAP);
+                if k1 == cnt {
+                    break;
+                }
+                let bufp = buf.as_mut_ptr();
+                a = Self::fill_recs(d, &ends, cnt, k1, a, bufp, view);
+                segs.push((k1, ii));
+                cnt = k1;
+                if cnt >= CAP {
+                    flush(&buf[..cnt], &segs, s, counts, view);
+                    cnt = 0;
+                    segs.clear();
+                }
+            }
+        }
+        flush(&buf[..cnt], &segs, s, counts, view);
+    }
+
     /// Out-of-line `emit_chunk` for the hot loop's miss path, so the hot loop
     /// doesn't carry the merge/cache code (and its register pressure) inline.
     #[cold]
@@ -1377,9 +1555,8 @@ impl Tokenizer {
     #[inline(always)]
     fn emit_chunk_impl<const VOCAB: bool>(&self, bytes: &[u8], pos: usize, end: usize, n: usize, s: &mut Scratch) {
         let len = end - pos;
-        if len.wrapping_sub(1) < chunk_table::MAX_KEY && pos + 16 <= n {
-            // SAFETY: pos + 16 <= n, so 16 bytes are readable at pos.
-            let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(pos), len) };
+        if len.wrapping_sub(1) < chunk_table::MAX_KEY {
+            let (lo, hi) = chunk_table::pack_at(&bytes[..n], pos, len);
             let h = chunk_table::hash(lo, hi);
             if VOCAB {
                 if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
@@ -1645,7 +1822,36 @@ impl Tokenizer {
     /// Batch entry for Python inputs: `bytes` are validated lazily (per item, by
     /// the worker) when the model has no normalizer, up front otherwise.
     fn encode_batch_src(&self, texts: &[TextArg], num_threads: usize, want_output: bool) -> PyResult<(Vec<u32>, Vec<usize>)> {
+        self.encode_batch_sep(texts, num_threads, want_output, None)
+    }
+
+    /// As `encode_batch_src`; with `sep`, every input is first split into
+    /// documents on that byte string (exactly like Python's `bytes.split`,
+    /// separators dropped), in parallel inside Rust.
+    fn encode_batch_sep(&self, texts: &[TextArg], num_threads: usize, want_output: bool, sep: Option<&[u8]>) -> PyResult<(Vec<u32>, Vec<usize>)> {
         let src = texts_as_src(texts, self.norm_form == 0)?;
+        let src = match sep {
+            Some(sep) if !sep.is_empty() => {
+                let mut docs = Vec::new();
+                for t in &src {
+                    match *t {
+                        Src::Str(s) => {
+                            if std::str::from_utf8(sep).is_err() {
+                                return Err(PyValueError::new_err("separator must be valid UTF-8 for str inputs"));
+                            }
+                            // SAFETY: s is valid UTF-8 and sep is a valid UTF-8 string,
+                            // so every piece between matches starts and ends on char
+                            // boundaries.
+                            docs.extend(split_on(s.as_bytes(), sep, num_threads).into_iter().map(|(a, b)| Src::Str(unsafe { std::str::from_utf8_unchecked(&s.as_bytes()[a..b]) })));
+                        }
+                        Src::Raw(b) => docs.extend(split_on(b, sep, num_threads).into_iter().map(|(a, e)| Src::Raw(&b[a..e]))),
+                    }
+                }
+                docs
+            }
+            Some(_) => return Err(PyValueError::new_err("separator must not be empty")),
+            None => src,
+        };
         self.encode_src(&src, num_threads, want_output)
             .map_err(|i| PyValueError::new_err(format!("item {i}: bytes are not valid UTF-8")))
     }
@@ -1665,6 +1871,7 @@ impl Tokenizer {
         let ntask = tasks.len();
         let mut doc_counts = vec![0usize; texts.len()];
         let nt = if num_threads == 0 { rayon::current_num_threads() } else { num_threads.min(1024) };
+        let piped = self.items_pipe_ok();
 
         if nt <= 1 || ntask <= 1 || !parallel_ok() {
             // serial: encode straight into the output (no extra buffers at all)
@@ -1674,14 +1881,31 @@ impl Tokenizer {
                 if want_output {
                     s.out.reserve(total_bytes / 4 + 16);
                 }
-                for &it in &items {
-                    let before = s.out.len();
-                    if !self.encode_item(&norm, &trusted, it, s) {
-                        bad_doc.fetch_min(it.0 as usize, Relaxed);
+                if piped {
+                    let mut ic: Vec<u32> = Vec::new();
+                    for &(x, y, _) in &tasks {
+                        ic.clear();
+                        ic.resize(y - x, 0);
+                        self.encode_items_piped(&norm, &trusted, &items[x..y], s, &mut ic, &mut |d| {
+                            bad_doc.fetch_min(d as usize, Relaxed);
+                        });
+                        for (ii, &c) in ic.iter().enumerate() {
+                            doc_counts[items[x + ii].0 as usize] += c as usize;
+                        }
+                        if !want_output {
+                            s.out.clear();
+                        }
                     }
-                    doc_counts[it.0 as usize] += s.out.len() - before;
-                    if !want_output {
-                        s.out.clear();
+                } else {
+                    for &it in &items {
+                        let before = s.out.len();
+                        if !self.encode_item(&norm, &trusted, it, s) {
+                            bad_doc.fetch_min(it.0 as usize, Relaxed);
+                        }
+                        doc_counts[it.0 as usize] += s.out.len() - before;
+                        if !want_output {
+                            s.out.clear();
+                        }
                     }
                 }
                 std::mem::replace(&mut s.out, saved)
@@ -1780,13 +2004,21 @@ impl Tokenizer {
                     }
                     let (x, y, _) = tasks[k];
                     s.out.clear();
-                    for (ii, &it) in items[x..y].iter().enumerate() {
-                        let before = s.out.len();
-                        if !self.encode_item(&norm, &trusted, it, s) {
-                            bad_doc.fetch_min(it.0 as usize, Relaxed);
+                    if piped {
+                        // SAFETY: items x..y belong to task k only.
+                        let ic = unsafe { std::slice::from_raw_parts_mut(ic_ptr.get().add(x), y - x) };
+                        self.encode_items_piped(&norm, &trusted, &items[x..y], s, ic, &mut |d| {
+                            bad_doc.fetch_min(d as usize, Relaxed);
+                        });
+                    } else {
+                        for (ii, &it) in items[x..y].iter().enumerate() {
+                            let before = s.out.len();
+                            if !self.encode_item(&norm, &trusted, it, s) {
+                                bad_doc.fetch_min(it.0 as usize, Relaxed);
+                            }
+                            // SAFETY: item x+ii belongs to task k only.
+                            unsafe { *ic_ptr.get().add(x + ii) = (s.out.len() - before) as u32 };
                         }
-                        // SAFETY: item x+ii belongs to task k only.
-                        unsafe { *ic_ptr.get().add(x + ii) = (s.out.len() - before) as u32 };
                     }
                     let cnt = s.out.len() as u64;
                     counts[k].store(cnt, Release);
@@ -2680,9 +2912,9 @@ impl Tokenizer {
 
 
     /// Token counts for many texts, in parallel (no Python list of ids built).
-    #[pyo3(signature = (texts, num_threads = 0))]
-    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<TextArg>, num_threads: usize) -> PyResult<Vec<usize>> {
-        py.detach(|| self.encode_batch_src(&texts, num_threads, false).map(|r| r.1))
+    #[pyo3(signature = (texts, num_threads = 0, separator = None))]
+    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<TextArg>, num_threads: usize, separator: Option<Vec<u8>>) -> PyResult<Vec<usize>> {
+        py.detach(|| self.encode_batch_sep(&texts, num_threads, false, separator.as_deref()).map(|r| r.1))
     }
 
     /// Training-loader helper: encode `texts` and return a fixed-width, padded
@@ -2753,17 +2985,19 @@ impl Tokenizer {
     /// to numpy in a single copy. This is the right path for tokenizing a whole
     /// corpus offline (data prep), where per-token boxing otherwise dominates.
     /// Ragged (no padding), so no wasted work on uneven document lengths.
-    #[pyo3(signature = (texts, num_threads = 0))]
+    #[pyo3(signature = (texts, num_threads = 0, separator = None))]
     fn encode_ordinary_to_buffer<'py>(
         &self,
         py: Python<'py>,
         texts: Vec<TextArg>,
         num_threads: usize,
+        separator: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         // Encode in parallel (GIL released) into a few contiguous task buffers,
         // then scatter them in parallel straight into a numpy-owned bytearray.
-        let (data, counts) =
-            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { self.encode_batch_src(&texts, num_threads, true) })?;
+        let (data, counts) = py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> {
+            self.encode_batch_sep(&texts, num_threads, true, separator.as_deref())
+        })?;
         let mut offsets = Vec::with_capacity(counts.len() + 1);
         offsets.push(0i64);
         let mut total = 0usize;
@@ -3593,6 +3827,52 @@ mod perf {
                 best = best.min(t0.elapsed().as_secs_f64());
             }
             println!("SEG {:>8}: {label}: {:.0} MB/s", std::env::var("TT_SEG").unwrap_or("65536".into()), text.len() as f64 / best / 1e6);
+        }
+    }
+
+    /// `split_on` == `bytes.split` semantics (leftmost, non-overlapping) for
+    /// inputs large enough to take the parallel path, with matches placed
+    /// across every 8 MiB piece boundary, incl. self-overlapping separators.
+    #[test]
+    fn split_on_matches_naive() {
+        fn naive(b: &[u8], sep: &[u8]) -> Vec<(usize, usize)> {
+            let mut v = Vec::new();
+            let (mut st, mut i) = (0usize, 0usize);
+            while i + sep.len() <= b.len() {
+                if &b[i..i + sep.len()] == sep {
+                    v.push((st, i));
+                    i += sep.len();
+                    st = i;
+                } else {
+                    i += 1;
+                }
+            }
+            v.push((st, b.len()));
+            v
+        }
+        const P: usize = 8 << 20;
+        let mut seed = 7u64;
+        for (sep, fill) in [(&b"<|endoftext|>"[..], b'x'), (&b"aa"[..], b'a'), (&b"aba"[..], b'b'), (&b"\n"[..], b'q')] {
+            let n = 3 * P + 12345;
+            let mut b: Vec<u8> = (0..n).map(|i| if i % 7 == 0 { b' ' } else { fill }).collect();
+            // separators straddling / touching every piece cut, plus random ones
+            for cut in [P, 2 * P, 3 * P] {
+                for off in 0..=sep.len() {
+                    let at = cut - off + 40 * off;
+                    if at + sep.len() <= n {
+                        b[at..at + sep.len()].copy_from_slice(sep);
+                    }
+                }
+                let at = cut - sep.len() / 2 - 1;
+                b[at..at + sep.len()].copy_from_slice(sep);
+            }
+            for _ in 0..2000 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let at = (seed >> 20) as usize % (n - sep.len());
+                b[at..at + sep.len()].copy_from_slice(sep);
+            }
+            assert_eq!(split_on(&b, sep, 0), naive(&b, sep), "sep {:?}", sep);
+            assert_eq!(split_on(&b, sep, 1), naive(&b, sep), "sep {:?} serial", sep);
         }
     }
 

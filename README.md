@@ -100,10 +100,14 @@ a copy:
 
 ```python
 data = open("corpus.txt", "rb").read()
-docs = data.split(b"<|endoftext|>")
-out  = enc.encode_ordinary_to_buffer(docs)          # or [data] for one big document
+out  = enc.encode_ordinary_to_buffer([data], separator=b"<|endoftext|>")
 ids, offsets = out["data"], out["offsets"]           # doc i = ids[offsets[i]:offsets[i+1]]
 ```
+
+`separator=` splits each input into documents inside Rust (same result as
+`data.split(b"<|endoftext|>")`, one row per piece, without building a Python list);
+`count_tokens_batch` takes it too. Pass `[data]` without a separator to encode one
+big document.
 
 Every chunk is resolved with one probe into a table shared by all threads: it
 starts with the vocabulary's own chunks, and anything else is merged once and
