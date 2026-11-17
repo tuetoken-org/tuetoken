@@ -96,17 +96,20 @@ pub fn classify_scalar(b: &[u8], base: usize) -> Classes {
 #[inline(always)]
 unsafe fn classify64(p: *const u8) -> Classes {
     use std::arch::aarch64::*;
-    const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    let w = vld1q_u8(W.as_ptr());
-    // 4 x (0xFF/0x00 lanes) -> 64-bit mask, bit i = lane i (simdjson's to_bitmask)
+    // De-interleaving load: x[j] lane i = byte 4i + j. Then a 0xFF/0x00 mask
+    // per vector folds into a 64-bit mask in NATURAL byte order with three
+    // shift-right-and-insert ops + one narrowing shift (5 instructions per
+    // class instead of 4 AND + 4 pairwise-add + move).
     let tomask = |a: [uint8x16_t; 4]| -> u64 {
-        let s0 = vpaddq_u8(vandq_u8(a[0], w), vandq_u8(a[1], w));
-        let s1 = vpaddq_u8(vandq_u8(a[2], w), vandq_u8(a[3], w));
-        let s = vpaddq_u8(s0, s1);
-        let s = vpaddq_u8(s, s);
-        vgetq_lane_u64(vreinterpretq_u64_u8(s), 0)
+        let t0 = vsriq_n_u8::<1>(a[1], a[0]); // bit7 = byte 4i+1, bit6 = 4i
+        let t1 = vsriq_n_u8::<1>(a[3], a[2]); // bit7 = 4i+3, bit6 = 4i+2
+        let t2 = vsriq_n_u8::<2>(t1, t0); // bits 7..4 = 4i+3 .. 4i
+        let t3 = vsriq_n_u8::<4>(t2, t2); // low nibble = high nibble
+        let t4 = vshrn_n_u16::<4>(vreinterpretq_u16_u8(t3)); // nibble per lane, packed
+        vget_lane_u64::<0>(vreinterpret_u64_u8(t4))
     };
-    let x = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
+    let v = vld4q_u8(p);
+    let x = [v.0, v.1, v.2, v.3];
     let k = |v: u8| vdupq_n_u8(v);
     Classes {
         l: tomask(x.map(|v| vcltq_u8(vsubq_u8(vorrq_u8(v, k(0x20)), k(b'a')), k(26)))),
