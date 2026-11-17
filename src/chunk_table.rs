@@ -573,11 +573,11 @@ impl SharedTable {
             }
             // at the cap: keep inserting until probes get long (PROBE_MAX)
         }
-        // A growth in progress copies the old table; an insert landing there now
-        // could be missed by the copy. Inserts are rare (cache misses), so just
-        // wait for the new table to be published.
-        while self.growing.load(Ordering::Acquire) {
-            std::thread::yield_now();
+        // A growth in progress is copying the old table; an insert landing there
+        // now could be missed by the copy. Don't wait for it (threads would pile
+        // up): skip — the chunk is simply merged again if it recurs.
+        if self.growing.load(Ordering::Acquire) {
+            return;
         }
         let t = self.table();
         let mut i = (h >> t.shift) as usize;
@@ -611,6 +611,11 @@ impl SharedTable {
     /// Double the table (one thread at a time; others keep using the old one).
     #[cold]
     fn grow(&self, old: &STable) {
+        self.grow_to(old, old.bits() + 1)
+    }
+
+    #[cold]
+    fn grow_to(&self, old: &STable, bits: u32) {
         if self.growing.swap(true, Ordering::Acquire) {
             return;
         }
@@ -619,7 +624,7 @@ impl SharedTable {
             self.growing.store(false, Ordering::Release);
             return;
         }
-        let new = STable::new(old.bits() + 1);
+        let new = STable::new(bits.max(old.bits() + 1));
         let mut copied = 0usize;
         for s in old.slots.iter() {
             let m = s.meta.load(Ordering::Acquire);
