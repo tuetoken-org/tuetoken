@@ -66,6 +66,21 @@ pub unsafe fn pack_wide(p: *const u8, len: usize) -> (u64, u64) {
     (k as u64, ((k >> 64) as u64) | ((len as u64) << 56))
 }
 
+/// Portable read-prefetch hint (no-op where unsupported).
+#[inline(always)]
+pub fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
 #[inline(always)]
 pub fn hash(lo: u64, hi: u64) -> u64 {
     // Two multiplies; callers use the TOP bits, which mix every input bit.
@@ -558,6 +573,15 @@ impl SharedTable {
             i = (i + 1) & t.mask;
         }
         None
+    }
+
+    /// Hint the slot a lookup with hash `h` reads first into cache.
+    #[inline(always)]
+    pub fn prefetch(&self, h: u64) {
+        let t = self.table();
+        let i = (h >> t.shift) as usize;
+        // SAFETY: i < slots.len().
+        prefetch(unsafe { t.slots.as_ptr().add(i) } as *const u8);
     }
 
     /// Insert a learned encoding of 1..=3 tokens (longer ones are ignored).

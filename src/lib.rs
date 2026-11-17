@@ -2670,6 +2670,178 @@ mod perf {
             MERGES.load(Relaxed), DYN_HITS.load(Relaxed), s.out.len());
     }
 
+    /// PROTOTYPE (falsification test): word-level ("unit") memoization.
+    /// Units = text between spaces preceded by an ASCII non-whitespace byte
+    /// (proven chunk boundaries). Boundaries from a SWAR mask; each unit is one
+    /// probe into a 64-byte-slot table (key + up to 11 tokens inline); misses run
+    /// the exact serial chunk path on the unit and insert. Verifies output.
+    #[test]
+    #[ignore]
+    fn unit_proto() {
+        #[derive(Clone, Copy, Default)]
+        #[repr(C, align(64))]
+        struct Slot { lo: u64, hi: u64, n: u32, toks: [u32; 11] }
+        struct UTable { e: Vec<Slot>, mask: usize, shift: u32, len: usize }
+        impl UTable {
+            fn new(bits: u32) -> Self { UTable { e: vec![Slot::default(); 1 << bits], mask: (1 << bits) - 1, shift: 64 - bits, len: 0 } }
+            #[inline(always)]
+            fn get(&self, lo: u64, hi: u64, h: u64) -> Option<&Slot> {
+                let mut i = (h >> self.shift) as usize;
+                loop {
+                    let x = unsafe { self.e.get_unchecked(i) };
+                    if x.lo == lo && x.hi == hi { return Some(x); }
+                    if x.hi == 0 { return None; }
+                    i = (i + 1) & self.mask;
+                }
+            }
+            fn put(&mut self, lo: u64, hi: u64, h: u64, t: &[u32]) {
+                if t.len() > 11 || self.len * 2 > self.e.len() { return; }
+                let mut i = (h >> self.shift) as usize;
+                while self.e[i].hi != 0 { i = (i + 1) & self.mask; }
+                let mut toks = [0u32; 11];
+                toks[..t.len()].copy_from_slice(t);
+                self.e[i] = Slot { lo, hi, n: t.len() as u32, toks };
+                self.len += 1;
+            }
+            #[inline(always)]
+            fn prefetch(&self, h: u64) {
+                chunk_table::prefetch(unsafe { self.e.as_ptr().add((h >> self.shift) as usize) } as *const u8);
+            }
+        }
+        const HI: u64 = 0x8080_8080_8080_8080;
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        #[inline(always)]
+        fn rng(x: u64, lo: u8, hi: u8) -> u64 {
+            let y = x | HI;
+            (y.wrapping_sub(ONES * lo as u64)) & !(y.wrapping_sub(ONES * (hi as u64 + 1))) & !x & HI
+        }
+        let is_nw = |c: u8| c < 0x80 && !(c == b' ' || (0x09..=0x0d).contains(&c));
+        // unit-boundary bitmask for bytes [i, i+64) (needs i >= 1, i + 64 <= n)
+        let unit_mask = |b: &[u8], i: usize| -> u64 {
+            let mut m = 0u64;
+            let mut carry = is_nw(b[i - 1]) as u64;
+            for w in 0..8 {
+                let x = u64::from_le(unsafe { (b.as_ptr().add(i + 8 * w) as *const u64).read_unaligned() });
+                let sp = rng(x, b' ', b' ');
+                let nw = !x & HI & !sp & !rng(x, 0x09, 0x0d);
+                let prev = (nw << 8) | (carry << 7);
+                let bits = (((sp & prev) >> 7).wrapping_mul(0x0102_0408_1020_4080)) >> 56;
+                m |= bits << (8 * w);
+                carry = nw >> 63;
+            }
+            m
+        };
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let mb: usize = std::env::var("PROTO_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+        let mut end = (mb << 20).min(data.len());
+        while end < data.len() && data[end] & 0xC0 == 0x80 { end += 1; }
+        let b = &data[..end];
+        let n = b.len();
+        let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+        let mut sref = Scratch::default();
+        sref.dyn_cache.claim(t.uid);
+        t.encode_range(b, 0, n, &mut sref);
+        let want = std::mem::take(&mut sref.out);
+        let mut table = UTable::new(22); // 16M slots x 64 B = 1 GiB virtual, lazily touched
+        for pass in 0..3 {
+            let mut s = Scratch::default();
+            s.dyn_cache.claim(t.uid);
+            s.out = Vec::with_capacity(n / 3 + 64);
+            let (mut misses, mut units) = (0usize, 0usize);
+            let t0 = std::time::Instant::now();
+            let mut pos = 0usize;
+            let mut i = 1usize;
+            const GROUP: usize = 8; // blocks per phase: ~80 units of prefetch lead
+            let mut ends = [0usize; 64 * GROUP];
+            let mut keys = [(0u64, 0u64, 0u64); 64 * GROUP];
+            while i + 64 <= n {
+                let mut k = 0;
+                let mut a = pos;
+                let mut g = 0;
+                while g < GROUP && i + 64 <= n {
+                    let mut m = unit_mask(b, i);
+                    while m != 0 {
+                        let q = i + m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let len = q - a;
+                        keys[k] = if len <= chunk_table::MAX_KEY && a + 16 <= n {
+                            let (lo, hi) = unsafe { chunk_table::pack_wide(b.as_ptr().add(a), len) };
+                            let h = chunk_table::hash(lo, hi) | 1;
+                            table.prefetch(h);
+                            (lo, hi, h)
+                        } else { (0, 0, 0) };
+                        ends[k] = q;
+                        k += 1;
+                        a = q;
+                    }
+                    i += 64;
+                    g += 1;
+                }
+                units += k;
+                // branch-light emit: always store 4 tokens, advance by the count
+                s.out.reserve(4 * k + 16);
+                let mut w = s.out.len();
+                let mut dst = s.out.as_mut_ptr();
+                for j in 0..k {
+                    let q = ends[j];
+                    let (lo, hi, h) = keys[j];
+                    if h != 0 {
+                        if let Some(x) = table.get(lo, hi, h) {
+                            if x.n <= 4 {
+                                unsafe { (dst.add(w) as *mut [u32; 4]).write_unaligned([x.toks[0], x.toks[1], x.toks[2], x.toks[3]]) };
+                                w += x.n as usize;
+                                pos = q;
+                                continue;
+                            }
+                            unsafe { s.out.set_len(w) };
+                            s.out.extend_from_slice(&x.toks[..x.n as usize]);
+                            s.out.reserve(4 * (k - j) + 16);
+                            w = s.out.len();
+                            dst = s.out.as_mut_ptr();
+                            pos = q;
+                            continue;
+                        }
+                    }
+                    unsafe { s.out.set_len(w) };
+                    misses += 1;
+                    let st = s.out.len();
+                    let mut p = pos;
+                    while p < q {
+                        let e = pretok::next_chunk_end(t.kind, b, p);
+                        t.emit_chunk(b, p, e, n, &mut s);
+                        p = e;
+                    }
+                    if h != 0 { let r = s.out[st..].to_vec(); table.put(lo, hi, h, &r); }
+                    pos = q;
+                    s.out.reserve(4 * (k - j) + 16);
+                    w = s.out.len();
+                    dst = s.out.as_mut_ptr();
+                }
+                unsafe { s.out.set_len(w) };
+            }
+            // tail: exact chunk path
+            let mut p = pos;
+            while p < n {
+                let e = pretok::next_chunk_end(t.kind, b, p);
+                t.emit_chunk(b, p, e, n, &mut s);
+                p = e;
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            assert!(s.out == want, "unit prototype output differs from the chunk engine");
+            println!("pass {pass} ({}): {:.0} MB/s single thread | units {} | miss {:.2}% | table entries {}",
+                if pass == 0 { "cold" } else { "warm" }, n as f64 / dt / 1e6, units,
+                misses as f64 / units as f64 * 100.0, table.len);
+        }
+        let mut s = Scratch::default();
+        s.dyn_cache.claim(t.uid);
+        t.encode_range(b, 0, n, &mut s);
+        s.out.clear();
+        let t0 = std::time::Instant::now();
+        t.encode_range(b, 0, n, &mut s);
+        println!("chunk engine (warm): {:.0} MB/s", n as f64 / t0.elapsed().as_secs_f64() / 1e6);
+    }
+
     /// Phase timing for one big blob through the direct-output engine.
     #[test]
     #[ignore]
