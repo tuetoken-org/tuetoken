@@ -419,3 +419,280 @@ impl LongCache {
         m.map.insert(key.into(), (off, toks.len() as u32));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared learned table
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// One slot, 32 bytes. `meta`: 0 = empty, 1 = being written, else
+/// `2 | n << 2` = published with `n` (1..=3) tokens. A slot is written exactly
+/// once (claimed by CAS 0 -> 1, filled, then published with a Release store),
+/// and never changes afterwards, so a reader that sees it published (Acquire)
+/// reads a consistent entry.
+#[repr(C, align(32))]
+struct SSlot {
+    meta: AtomicU32,
+    t2: AtomicU32,
+    lo: AtomicU64,
+    hi: AtomicU64,
+    t01: AtomicU64,
+}
+
+const _: () = assert!(std::mem::size_of::<SSlot>() == 32);
+
+struct STable {
+    slots: Vec<SSlot>,
+    mask: usize,
+    shift: u32,
+    count: AtomicUsize,
+}
+
+impl STable {
+    fn new(bits: u32) -> Box<STable> {
+        let n = 1usize << bits;
+        let layout = std::alloc::Layout::array::<SSlot>(n).expect("table layout");
+        // SAFETY: all-zero bytes are a valid SSlot (atomics of 0 = empty); the
+        // Vec owns exactly this layout (len == cap == n, SSlot's alignment).
+        let slots = unsafe {
+            let p = std::alloc::alloc_zeroed(layout) as *mut SSlot;
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Vec::from_raw_parts(p, n, n)
+        };
+        Box::new(STable { slots, mask: n - 1, shift: 64 - bits, count: AtomicUsize::new(0) })
+    }
+
+    fn bits(&self) -> u32 {
+        64 - self.shift
+    }
+}
+
+const PROBE_MAX: usize = 32;
+const SHARED_MIN_BITS: u32 = 14; // 512 KiB
+
+/// Grow-only, lock-free table of LEARNED chunk encodings (multi-token results
+/// the load-time table can't hold), shared by every thread using a tokenizer.
+///
+/// Natural text has a very long tail of distinct multi-token pre-tokens (names,
+/// numbers, URL pieces, typos). Bounded per-thread caches keep evicting them —
+/// and each thread re-learns what the others already merged. This table keeps
+/// everything any thread has learned, growing on demand up to a memory cap.
+///
+/// * Reads take no lock: one Acquire load of the table pointer, then linear
+///   probing over published slots.
+/// * Inserts claim an empty slot with one CAS; entries are never overwritten.
+///   Two threads racing on the same key may both insert it (harmless).
+/// * Growth: when half full, one thread builds a 2x table, copies the entries
+///   and swaps the pointer. Inserts that land in the old table meanwhile may be
+///   lost — fine, because every entry is just `f(bytes)` for the exact merge
+///   function: a missing entry only means that chunk gets merged again.
+/// * Old tables stay allocated until the tokenizer is dropped (so a concurrent
+///   reader can never see freed memory); geometric growth bounds that overhead
+///   to the size of the final table.
+pub struct SharedTable {
+    cur: AtomicPtr<STable>,
+    retired: std::sync::Mutex<Vec<*mut STable>>,
+    growing: AtomicBool,
+    max_bits: AtomicU32,
+}
+
+// SAFETY: all shared state is atomic or behind the Mutex; the raw table
+// pointers are owned by this struct and freed only in Drop (exclusive access).
+unsafe impl Send for SharedTable {}
+unsafe impl Sync for SharedTable {}
+
+impl SharedTable {
+    /// `max_mib`: memory cap of the live table (0 disables learning).
+    pub fn new(max_mib: usize) -> Self {
+        let t = SharedTable {
+            cur: AtomicPtr::new(Box::into_raw(STable::new(SHARED_MIN_BITS))),
+            retired: std::sync::Mutex::new(Vec::new()),
+            growing: AtomicBool::new(false),
+            max_bits: AtomicU32::new(SHARED_MIN_BITS),
+        };
+        t.set_limit_mib(max_mib);
+        t
+    }
+
+    /// Change the memory cap (MiB) of the live table. 0 = stop learning.
+    pub fn set_limit_mib(&self, max_mib: usize) {
+        let slots = (max_mib << 20) / std::mem::size_of::<SSlot>();
+        let bits = if slots < 2 { 0 } else { usize::BITS - 1 - slots.leading_zeros() };
+        self.max_bits.store(bits, Ordering::Relaxed);
+    }
+
+    pub fn limit_mib(&self) -> usize {
+        let b = self.max_bits.load(Ordering::Relaxed);
+        if b == 0 { 0 } else { ((1usize << b) * std::mem::size_of::<SSlot>()) >> 20 }
+    }
+
+    #[inline(always)]
+    fn table(&self) -> &STable {
+        // SAFETY: `cur` always points to a live table; tables are freed only in Drop.
+        unsafe { &*self.cur.load(Ordering::Acquire) }
+    }
+
+    /// Learned entries currently stored (approximate under concurrency).
+    pub fn len(&self) -> usize {
+        self.table().count.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn get(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; 3], usize)> {
+        let t = self.table();
+        let mut i = (h >> t.shift) as usize;
+        for _ in 0..PROBE_MAX {
+            // SAFETY: i is masked to < slots.len().
+            let s = unsafe { t.slots.get_unchecked(i) };
+            let m = s.meta.load(Ordering::Acquire);
+            if m == 0 {
+                return None;
+            }
+            if m & 3 == 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
+                let t01 = s.t01.load(Ordering::Relaxed);
+                return Some(([t01 as u32, (t01 >> 32) as u32, s.t2.load(Ordering::Relaxed)], (m >> 2) as usize));
+            }
+            i = (i + 1) & t.mask;
+        }
+        None
+    }
+
+    /// Insert a learned encoding of 1..=3 tokens (longer ones are ignored).
+    pub fn put(&self, lo: u64, hi: u64, h: u64, toks: &[u32]) {
+        let n = toks.len();
+        if n == 0 || n > 3 || self.max_bits.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let t = self.table();
+        if t.count.load(Ordering::Relaxed) * 2 >= t.slots.len() {
+            if t.bits() < self.max_bits.load(Ordering::Relaxed) {
+                self.grow(t);
+            }
+            // at the cap: keep inserting until probes get long (PROBE_MAX)
+        }
+        let t = self.table();
+        let mut i = (h >> t.shift) as usize;
+        for _ in 0..PROBE_MAX {
+            // SAFETY: i is masked to < slots.len().
+            let s = unsafe { t.slots.get_unchecked(i) };
+            let mut m = s.meta.load(Ordering::Relaxed);
+            if m == 0 {
+                match s.meta.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+                    Ok(_) => {
+                        s.lo.store(lo, Ordering::Relaxed);
+                        s.hi.store(hi, Ordering::Relaxed);
+                        let t0 = toks[0] as u64;
+                        let t1 = toks.get(1).copied().unwrap_or(0) as u64;
+                        s.t01.store(t0 | t1 << 32, Ordering::Relaxed);
+                        s.t2.store(toks.get(2).copied().unwrap_or(0), Ordering::Relaxed);
+                        s.meta.store(2 | (n as u32) << 2, Ordering::Release);
+                        t.count.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(cur) => m = cur,
+                }
+            }
+            if m & 3 == 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
+                return; // already learned
+            }
+            i = (i + 1) & t.mask;
+        }
+    }
+
+    /// Double the table (one thread at a time; others keep using the old one).
+    #[cold]
+    fn grow(&self, old: &STable) {
+        if self.growing.swap(true, Ordering::Acquire) {
+            return;
+        }
+        let cur = self.cur.load(Ordering::Acquire);
+        if !std::ptr::eq(cur, old) {
+            self.growing.store(false, Ordering::Release);
+            return;
+        }
+        let new = STable::new(old.bits() + 1);
+        let mut copied = 0usize;
+        for s in old.slots.iter() {
+            let m = s.meta.load(Ordering::Acquire);
+            if m & 3 != 2 {
+                continue;
+            }
+            let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+            let mut i = (hash(lo, hi) >> new.shift) as usize;
+            loop {
+                let d = &new.slots[i];
+                if d.meta.load(Ordering::Relaxed) == 0 {
+                    d.lo.store(lo, Ordering::Relaxed);
+                    d.hi.store(hi, Ordering::Relaxed);
+                    d.t01.store(s.t01.load(Ordering::Relaxed), Ordering::Relaxed);
+                    d.t2.store(s.t2.load(Ordering::Relaxed), Ordering::Relaxed);
+                    d.meta.store(m, Ordering::Relaxed);
+                    copied += 1;
+                    break;
+                }
+                i = (i + 1) & new.mask;
+            }
+        }
+        new.count.store(copied, Ordering::Relaxed);
+        let newp = Box::into_raw(new);
+        // Release: the copied slots are visible to any thread that loads `cur`.
+        self.cur.store(newp, Ordering::Release);
+        self.retired.lock().unwrap_or_else(|e| e.into_inner()).push(cur);
+        self.growing.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for SharedTable {
+    fn drop(&mut self) {
+        // SAFETY: exclusive access; every pointer came from Box::into_raw and is
+        // freed exactly once.
+        unsafe {
+            drop(Box::from_raw(*self.cur.get_mut()));
+            for p in self.retired.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                drop(Box::from_raw(p));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+
+    #[test]
+    fn shared_table_concurrent_insert_get() {
+        let t = SharedTable::new(64);
+        let keys: Vec<(u64, u64)> = (0..200_000u64).map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15), (i % 15 + 1) << 56)).collect();
+        std::thread::scope(|sc| {
+            for w in 0..8 {
+                let (t, keys) = (&t, &keys);
+                sc.spawn(move || {
+                    for (j, &(lo, hi)) in keys.iter().enumerate() {
+                        if j % 8 == w {
+                            let v = [j as u32, (j as u32) ^ 0xABCD, 7];
+                            t.put(lo, hi, hash(lo, hi), &v[..(j % 3) + 1]);
+                        }
+                        // concurrent readers must only ever see exact entries
+                        if let Some((v, n)) = t.get(lo, hi, hash(lo, hi)) {
+                            assert_eq!(n, (j % 3) + 1);
+                            assert_eq!(v[0], j as u32);
+                            if n > 1 { assert_eq!(v[1], (j as u32) ^ 0xABCD); }
+                        }
+                    }
+                });
+            }
+        });
+        // after the dust settles, most keys are present and all present ones exact
+        let mut found = 0;
+        for (j, &(lo, hi)) in keys.iter().enumerate() {
+            if let Some((v, n)) = t.get(lo, hi, hash(lo, hi)) {
+                assert_eq!((v[0], n), (j as u32, (j % 3) + 1));
+                found += 1;
+            }
+        }
+        assert!(found > keys.len() * 9 / 10, "found {found}");
+    }
+}
