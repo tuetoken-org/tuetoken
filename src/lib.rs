@@ -572,10 +572,24 @@ thread_local! {
 /// buffer), so a multi-GB `bytes` read straight from a file costs nothing to
 /// pass in — whereas a non-ASCII `str` must first be encoded to UTF-8 by Python
 /// on one thread.
-#[derive(FromPyObject)]
 enum TextArg {
     Str(PyBackedStr),
     Bytes(pyo3::pybacked::PyBackedBytes),
+}
+
+// Hand-written instead of `#[derive(FromPyObject)]`: the derive tries `str`
+// first and, for a `bytes` item, builds (and drops) a Python exception before
+// trying `bytes` — ~0.5 us per item, i.e. 200 ms on a 400k-document batch.
+// A type check picks the right variant directly.
+impl<'a, 'py> FromPyObject<'a, 'py> for TextArg {
+    type Error = PyErr;
+    fn extract(obj: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if obj.is_instance_of::<pyo3::types::PyBytes>() || obj.is_instance_of::<pyo3::types::PyByteArray>() {
+            Ok(TextArg::Bytes(obj.extract().map_err(Into::<PyErr>::into)?))
+        } else {
+            Ok(TextArg::Str(obj.extract().map_err(Into::<PyErr>::into)?))
+        }
+    }
 }
 
 /// Borrow every item as `&str`. `bytes` items must be valid UTF-8 (the same
