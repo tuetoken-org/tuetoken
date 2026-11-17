@@ -571,6 +571,12 @@ const PROBE_MAX: usize = 32;
 pub const SPILLED: usize = 63;
 const SHARED_MIN_BITS: u32 = 14;
 
+/// Inserts a thread batches before publishing them to a table's count.
+const COUNT_BATCH: usize = 64;
+thread_local! {
+    static PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// See [`SharedTable::view`].
 #[derive(Clone, Copy)]
 pub struct View<'a, const W: usize> {
@@ -768,7 +774,21 @@ impl<const W: usize> SharedTable<W> {
                             d.store(toks.get(k).copied().unwrap_or(0), Ordering::Relaxed);
                         }
                         s.meta.store(2 | (n as u32) << 2, Ordering::Release);
-                        t.count.0.fetch_add(1, Ordering::Relaxed);
+                        // Sloppy counter: each thread publishes its inserts in
+                        // batches of COUNT_BATCH — one shared fetch_add per insert
+                        // from every thread made the count's cache line ping-pong
+                        // (cold multi-thread calls insert millions of entries).
+                        // The count only drives growth / the load cap, so being
+                        // off by < COUNT_BATCH per thread is harmless.
+                        PENDING.with(|c| {
+                            let v = c.get() + 1;
+                            if v >= COUNT_BATCH {
+                                t.count.0.fetch_add(v, Ordering::Relaxed);
+                                c.set(0);
+                            } else {
+                                c.set(v);
+                            }
+                        });
                         return;
                     }
                     Err(cur) => m = cur,
@@ -788,9 +808,29 @@ impl<const W: usize> SharedTable<W> {
         self.retired.lock().unwrap().push(old);
     }
 
+    /// Make room for about `entries` learned entries up front (one growth to the
+    /// final size instead of a chain of doublings, each a serial copy during
+    /// which other threads cannot learn). Bounded by the memory cap.
+    pub fn reserve(&self, entries: usize) {
+        let max = self.max_bits.load(Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        let want = (usize::BITS - (entries.max(1) * 2 - 1).leading_zeros()).min(max);
+        let t = self.table();
+        if t.bits() < want {
+            self.grow_to(t, want);
+        }
+    }
+
     /// Double the table (one thread at a time; others keep using the old one).
     #[cold]
     fn grow(&self, old: &STable<W>) {
+        self.grow_to(old, old.bits() + 1);
+    }
+
+    #[cold]
+    fn grow_to(&self, old: &STable<W>, bits: u32) {
         if self.growing.swap(true, Ordering::Acquire) {
             return;
         }
@@ -801,7 +841,7 @@ impl<const W: usize> SharedTable<W> {
         }
         #[cfg(test)]
         let t0 = std::time::Instant::now();
-        let new = STable::<W>::new(old.bits() + 1);
+        let new = STable::<W>::new(bits);
         let mut copied = 0usize;
         for i in 0..old.len {
             let s = old.slot(i);
