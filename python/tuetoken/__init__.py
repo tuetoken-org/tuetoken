@@ -24,4 +24,12 @@ Two entry points:
 from ._core import Tokenizer, __version__
 from ._auto import AutoTokenizer
 
+try:
+    # The buffer/array APIs (encode_ordinary_to_buffer, encode_batch, ...) hand
+    # their results to numpy. Import it here, once, rather than inside the first
+    # such call, where it added ~25 ms to that call. No-op if already imported.
+    import numpy as _np  # noqa: F401
+except ImportError:  # numpy is optional; only those APIs need it
+    pass
+
 __all__ = ["Tokenizer", "AutoTokenizer", "__version__"]
