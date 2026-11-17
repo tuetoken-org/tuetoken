@@ -533,6 +533,9 @@ struct Tokenizer {
     // Grow-only table of learned multi-token chunk encodings, shared by all
     // threads (see chunk_table::SharedTable). Memory-capped.
     learned: chunk_table::SharedTable,
+    // Learned encodings too long for `learned` (> 15 bytes or > 3 tokens),
+    // shared by all threads, behind the per-thread caches.
+    spill: chunk_table::SpillMap,
     // Pre-built Python ints for every token id (lazily, under the GIL), so a
     // result list is filled with INCREF'd pointers instead of allocating a fresh
     // PyLong per token — the dominant cost of returning list[int].
@@ -1176,10 +1179,12 @@ impl Tokenizer {
                             continue;
                         }
                         if let Some((ts, c)) = self.learned.get(lo, hi, h) {
-                            // SAFETY: capacity >= w + 3 * remaining entries (reserved below).
-                            unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
-                            w += c;
-                            continue;
+                            if c <= 3 {
+                                // SAFETY: capacity >= w + 3 * remaining entries (reserved below).
+                                unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
+                                w += c;
+                                continue;
+                            }
                         }
                     }
                     // SAFETY: [0, w) initialized.
@@ -1240,11 +1245,15 @@ impl Tokenizer {
                 return;
             }
             // Load-time table miss: what any thread already learned (shared) ...
+            let mut spilled = false;
             if let Some((ts, k)) = self.learned.get(lo, hi, h) {
                 #[cfg(test)]
                 perf::DYN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                s.out.extend_from_slice(&ts[..k]);
-                return;
+                if k <= 3 {
+                    s.out.extend_from_slice(&ts[..k]);
+                    return;
+                }
+                spilled = k == chunk_table::SPILLED;
             }
             // ... then this thread's cache (results longer than 3 tokens), then merge.
             if s.dyn_cache.owned_by(self.uid) {
@@ -1254,9 +1263,14 @@ impl Tokenizer {
                     s.out.extend_from_slice(ts); // disjoint field borrows
                     return;
                 }
+                let st = s.out.len();
+                if spilled && self.spill.get_into(&bytes[pos..end], &mut s.out) {
+                    let (out, dc) = (&s.out, &mut s.dyn_cache);
+                    dc.put(lo, hi, &out[st..]);
+                    return;
+                }
                 #[cfg(test)]
                 perf::MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let st = s.out.len();
                 self.process_chunk(&bytes[pos..end], s, Merge::Auto);
                 let (out, dc) = (&s.out, &mut s.dyn_cache);
                 let res = &out[st..];
@@ -1264,6 +1278,9 @@ impl Tokenizer {
                     self.learned.put(lo, hi, h, res);
                 } else {
                     dc.put(lo, hi, res);
+                    if self.spill.put(&bytes[pos..end], res) {
+                        self.learned.put_spilled(lo, hi, h);
+                    }
                 }
                 return;
             }
@@ -1275,9 +1292,17 @@ impl Tokenizer {
                 return;
             }
             let st = s.out.len();
+            if self.spill.get_into(key, &mut s.out) {
+                let (out, lc) = (&s.out, &mut s.long_cache);
+                lc.put(self.uid, key, &out[st..]);
+                return;
+            }
+            #[cfg(test)]
+            perf::LONG_MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.process_chunk(key, s, Merge::Auto);
             let (out, lc) = (&s.out, &mut s.long_cache);
             lc.put(self.uid, key, &out[st..]);
+            let _ = self.spill.put(key, &out[st..]);
             return;
         }
         self.emit(&bytes[pos..end], s, Merge::Auto);
@@ -2145,6 +2170,7 @@ impl Tokenizer {
             chunk_table: chunk_table::ChunkTable::empty(),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             learned: chunk_table::SharedTable::new(DEFAULT_CACHE_MIB),
+            spill: chunk_table::SpillMap::new((DEFAULT_CACHE_MIB << 20) / 4),
             int_table: OnceLock::new(),
         };
         tk.build_chunk_table();
@@ -2161,6 +2187,7 @@ impl Tokenizer {
 
     fn set_cache_limit_mb(&self, mb: usize) {
         self.learned.set_limit_mib(mb);
+        self.spill.set_limit((mb << 20) / 4);
     }
 
     /// Number of chunk encodings learned so far (approximate under concurrency).
@@ -2760,6 +2787,40 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod perf {
     use super::*;
+    pub static LONG_MERGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Interleaved cold A/B (fresh tokenizer per run, one thread): spill map on/off.
+    #[test]
+    #[ignore]
+    fn ab_cold() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let mut end = (300usize << 20).min(data.len());
+        while end < data.len() && data[end] & 0xC0 == 0x80 { end += 1; }
+        let b = &data[..end];
+        let mut best = [f64::MAX; 2];
+        for round in 0..8 {
+            let spill = round % 2;
+            let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+            if spill == 0 { t.spill.set_limit(0); }
+            let mut s = Scratch::default();
+            s.dyn_cache.claim(t.uid);
+            let t0 = std::time::Instant::now();
+            t.encode_range(b, 0, b.len(), &mut s);
+            best[spill] = best[spill].min(t0.elapsed().as_secs_f64());
+            if round == 1 {
+                println!("spill gets {} puts {} | merges {} long merges {}", chunk_table::SPILL_GETS.load(Relaxed),
+                    chunk_table::SPILL_PUTS.load(Relaxed), MERGES.load(Relaxed), LONG_MERGES.load(Relaxed));
+            }
+            chunk_table::SPILL_GETS.store(0, Relaxed); chunk_table::SPILL_PUTS.store(0, Relaxed);
+            MERGES.store(0, Relaxed); LONG_MERGES.store(0, Relaxed);
+        }
+        for spill in 0..2 {
+            println!("cold 1 thread, spill map {}: {:.0} MB/s", ["off", "on "][spill], b.len() as f64 / best[spill] / 1e6);
+        }
+    }
+
     pub static NO_PIPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Profiling loop: pipelined chunk engine only, warm, repeated.
@@ -3130,9 +3191,12 @@ mod perf {
             });
             println!("scan+vocab probe     {:6.0} MB/s ({acc})", mb(t0.elapsed()));
             s.out.clear();
+            MERGES.store(0, std::sync::atomic::Ordering::Relaxed);
+            LONG_MERGES.store(0, std::sync::atomic::Ordering::Relaxed);
             let t0 = std::time::Instant::now();
             t.encode_range(b, 0, n, &mut s);
-            println!("full engine          {:6.0} MB/s", mb(t0.elapsed()));
+            println!("full engine          {:6.0} MB/s | warm merges: short>3tok {} long>15B {} (of {} chunks)", mb(t0.elapsed()),
+                MERGES.load(std::sync::atomic::Ordering::Relaxed), LONG_MERGES.load(std::sync::atomic::Ordering::Relaxed), 65345842);
         }
         println!("chunk table: {} slots x {} B", t.chunk_table.slots(), t.chunk_table.entry_bytes());
         // block statistics + ASCII-only variant
