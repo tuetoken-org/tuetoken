@@ -523,6 +523,8 @@ impl<const W: usize> Drop for STable<W> {
 }
 
 const PROBE_MAX: usize = 32;
+/// Token count `SharedTable::get` reports for an entry stored in the SpillMap.
+pub const SPILLED: usize = 63;
 const SHARED_MIN_BITS: u32 = 14;
 
 /// Grow-only, lock-free table of LEARNED chunk encodings (multi-token results
@@ -624,8 +626,20 @@ impl<const W: usize> SharedTable<W> {
 
     /// Insert a learned encoding of 1..=W tokens (longer ones are ignored).
     pub fn put(&self, lo: u64, hi: u64, h: u64, toks: &[u32]) {
-        let n = toks.len();
-        if n == 0 || n > W || self.max_bits.load(Ordering::Relaxed) == 0 {
+        if toks.is_empty() || toks.len() > W {
+            return;
+        }
+        self.put_n(lo, hi, h, toks, toks.len());
+    }
+
+    /// Record that `key`'s encoding lives in the [`SpillMap`]: `get` then
+    /// returns a count of [`SPILLED`] (and no tokens).
+    pub fn put_spilled(&self, lo: u64, hi: u64, h: u64) {
+        self.put_n(lo, hi, h, &[], SPILLED);
+    }
+
+    fn put_n(&self, lo: u64, hi: u64, h: u64, toks: &[u32], n: usize) {
+        if self.max_bits.load(Ordering::Relaxed) == 0 {
             return;
         }
         let t = self.table();
@@ -780,5 +794,98 @@ mod shared_tests {
         }
         let found = keys.iter().filter(|&&(lo, hi)| t.get(lo, hi, hash(lo, hi)).is_some()).count();
         assert!(found * 100 >= keys.len() * 99, "found {found} of {}", keys.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared spill map: learned encodings that don't fit the inline table
+// ---------------------------------------------------------------------------
+
+/// Learned encodings of chunks the [`SharedTable`] can't hold — longer than 15
+/// bytes or more than its inline token count (URLs, long words, numbers,
+/// identifiers). Shared by all threads and kept for the tokenizer's lifetime
+/// (up to a memory cap), behind the bounded per-thread caches.
+///
+/// These chunks are rare (~0.1% of chunks on web text) but each costs a full
+/// merge, and their distinct count is large: a bounded per-thread cache that
+/// is cleared when full re-merged ~58k of them on EVERY pass over 300 MB.
+/// Sharded by key hash into 64 RwLock'd maps so concurrent readers rarely
+/// touch the same lock word. Lookups and inserts never wait (try-lock; a busy
+/// shard is a miss / a skipped insert), so the map can't stall a worker or
+/// deadlock a forked child.
+pub struct SpillMap {
+    shards: Box<[std::sync::RwLock<rustc_hash::FxHashMap<Box<[u8]>, Box<[u32]>>>]>,
+    bytes: PaddedCount,
+    limit: AtomicUsize,
+}
+
+const SPILL_SHARDS: usize = 64;
+#[cfg(test)]
+pub static SPILL_GETS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub static SPILL_PUTS: AtomicU64 = AtomicU64::new(0);
+
+impl SpillMap {
+    pub fn new(limit_bytes: usize) -> Self {
+        SpillMap {
+            shards: (0..SPILL_SHARDS).map(|_| std::sync::RwLock::new(Default::default())).collect(),
+            bytes: PaddedCount(AtomicUsize::new(0)),
+            limit: AtomicUsize::new(limit_bytes),
+        }
+    }
+
+    pub fn set_limit(&self, limit_bytes: usize) {
+        self.limit.store(limit_bytes, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn shard(&self, key: &[u8]) -> &std::sync::RwLock<rustc_hash::FxHashMap<Box<[u8]>, Box<[u32]>>> {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let mut h = rustc_hash::FxBuildHasher.build_hasher();
+        key.hash(&mut h);
+        &self.shards[(h.finish() >> 58) as usize]
+    }
+
+    /// Append the stored encoding of `key` to `out`; false if not stored.
+    #[inline]
+    pub fn get_into(&self, key: &[u8], out: &mut Vec<u32>) -> bool {
+        #[cfg(test)]
+        SPILL_GETS.fetch_add(1, Ordering::Relaxed);
+        // Never block: a shard being written (or a lock orphaned by fork()) is
+        // simply a miss — the caller merges, which is always correct.
+        let g = match self.shard(key).try_read() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        match g.get(key) {
+            Some(t) => {
+                out.extend_from_slice(t);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Store `key`'s encoding; false if it isn't stored (over the cap / too long).
+    pub fn put(&self, key: &[u8], toks: &[u32]) -> bool {
+        if key.len() > LONG_MAX_BYTES {
+            return false;
+        }
+        let cost = key.len() + 4 * toks.len() + 64;
+        if self.bytes.0.load(Ordering::Relaxed) + cost > self.limit.load(Ordering::Relaxed) {
+            return false;
+        }
+        #[cfg(test)]
+        SPILL_PUTS.fetch_add(1, Ordering::Relaxed);
+        let mut g = match self.shard(key).try_write() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        if g.insert(key.into(), toks.into()).is_none() {
+            self.bytes.0.fetch_add(cost, Ordering::Relaxed);
+        }
+        true
     }
 }
