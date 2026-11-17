@@ -1535,15 +1535,12 @@ impl Tokenizer {
     /// Returns (normalized docs, items (doc, start, end, is_segment), tasks
     /// (first item, end item, bytes)).
     #[allow(clippy::type_complexity)]
-    #[allow(clippy::type_complexity)]
     fn plan<'t>(
         &self,
         texts: &[Src<'t>],
         num_threads: usize,
     ) -> (Vec<std::borrow::Cow<'t, [u8]>>, Vec<(u32, usize, usize, bool)>, Vec<(usize, usize, usize)>) {
         use std::borrow::Cow;
-        const SEG: usize = 1 << 16;
-        const TASK_BYTES: usize = 1 << 16;
         let splittable = self.splittable();
         let to_bytes = |c: Cow<'t, str>| -> Cow<'t, [u8]> {
             match c {
@@ -1567,11 +1564,23 @@ impl Tokenizer {
                 texts.par_iter().with_min_len(64).map(|t| to_bytes(self.normalize(as_str(t)))).collect()
             }
         };
+        // Work-unit size: ~64 tasks per thread, between 64 KiB and 1 MiB. Bigger
+        // units cut per-task overhead (hand-off, offset look-back, parking):
+        // 2 GB on 14 threads, 64 KiB -> 1 MiB units: +9%; smaller inputs keep
+        // enough tasks to balance.
+        let total: usize = norm.iter().map(|d| d.len()).sum();
+        let nt = if num_threads == 0 { rayon::current_num_threads() } else { num_threads }.max(1);
+        #[cfg(test)]
+        let forced: Option<usize> = std::env::var("TT_SEG").ok().and_then(|v| v.parse().ok());
+        #[cfg(not(test))]
+        let forced: Option<usize> = None;
+        let unit = forced.unwrap_or_else(|| (total / (nt * 64)).clamp(1 << 16, 1 << 20));
+        let (seg_bytes, task_bytes) = (unit, unit);
         let mut items: Vec<(u32, usize, usize, bool)> = Vec::with_capacity(texts.len());
         for (i, d) in norm.iter().enumerate() {
             let b: &[u8] = d;
             if splittable && b.len() >= SPLIT_MIN {
-                let pts = Self::split_points(b, SEG);
+                let pts = Self::split_points(b, seg_bytes);
                 for w in pts.windows(2) {
                     items.push((i as u32, w[0], w[1], true));
                 }
@@ -1583,7 +1592,7 @@ impl Tokenizer {
         let (mut st, mut acc) = (0usize, 0usize);
         for (k, it) in items.iter().enumerate() {
             acc += it.2 - it.1;
-            if acc >= TASK_BYTES {
+            if acc >= task_bytes {
                 tasks.push((st, k + 1, acc));
                 st = k + 1;
                 acc = 0;
@@ -3558,6 +3567,32 @@ mod perf {
             let mut i = 0usize; let mut carry = blockscan::Carry::default(); let mut acc = 0u64;
             while i + 64 <= n { let (st, bad, c) = blockscan::block(t.kind, b, i, carry); carry = c; acc = acc.wrapping_add(st ^ bad); i += 64; }
             println!("block() only, REAL    {:6.0} MB/s ({acc})", mb(t0.elapsed()));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn seg_size() {
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read_to_string(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+        let _ = t.encode_direct(&[data.as_str()], 0, false);
+        let mut end = 300usize << 20;
+        while !data.is_char_boundary(end) { end += 1; }
+        let small = &data[..end];
+        let mut s = Scratch::default();
+        s.dyn_cache.claim(t.uid);
+        let t0 = std::time::Instant::now();
+        t.encode_range(small.as_bytes(), 0, small.len(), &mut s);
+        println!("one encode_range call, 300 MB, 1 thread: {:.0} MB/s", small.len() as f64 / t0.elapsed().as_secs_f64() / 1e6);
+        for (label, text, nt) in [("1 thread, 300 MB", small, 1usize), ("all threads, 2 GB", data.as_str(), 0)] {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                let _ = t.encode_direct(&[text], nt, true);
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            println!("SEG {:>8}: {label}: {:.0} MB/s", std::env::var("TT_SEG").unwrap_or("65536".into()), text.len() as f64 / best / 1e6);
         }
     }
 
