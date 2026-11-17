@@ -78,6 +78,17 @@ static KEY_MASK: [u128; 16] = {
     m
 };
 
+/// `pack_wide` for any `len`; meaningful only for 1 <= len <= 15 (callers
+/// discard it otherwise). The mask index is clamped: never out of bounds.
+///
+/// SAFETY: `p .. p+16` must be readable.
+#[inline(always)]
+pub unsafe fn pack_wide_any(p: *const u8, len: usize) -> (u64, u64) {
+    let raw = u128::from_le((p as *const u128).read_unaligned());
+    let k = raw & *KEY_MASK.get_unchecked(len & 15);
+    (k as u64, ((k >> 64) as u64) | ((len as u64) << 56))
+}
+
 /// Portable read-prefetch hint (no-op where unsupported).
 #[inline(always)]
 pub fn prefetch(p: *const u8) {
@@ -95,8 +106,11 @@ pub fn prefetch(p: *const u8) {
 
 #[inline(always)]
 pub fn hash(lo: u64, hi: u64) -> u64 {
-    // Two multiplies; callers use the TOP bits, which mix every input bit.
-    (lo.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ hi).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+    // ONE multiply: callers index with the TOP bits, and every top bit of a
+    // product depends on every bit of the multiplicand. `hi` is rotated so its
+    // bytes (8..15 and the length) don't line up with `lo`'s. Collisions only
+    // lengthen probes (keys are compared in full).
+    (lo ^ hi.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 impl ChunkTable {

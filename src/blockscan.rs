@@ -868,6 +868,138 @@ pub fn chunks_batched(kind: Pretok, b: &[u8], start: usize, stop: usize, mut fb:
     }
 }
 
+/// Set-bit positions of every byte value as 8 u32 lanes (unused lanes 0).
+static POS32: [[u32; 8]; 256] = {
+    let mut t = [[0u32; 8]; 256];
+    let mut v = 0;
+    while v < 256 {
+        let (mut x, mut j, mut bit) = (v, 0usize, 0u32);
+        while x != 0 {
+            if x & 1 == 1 {
+                t[v][j] = bit;
+                j += 1;
+            }
+            x >>= 1;
+            bit += 1;
+        }
+        v += 1;
+    }
+    t
+};
+
+/// Slack `Scan::fill` needs past `limit` in its output buffer.
+pub const SCAN_SLACK: usize = 80;
+
+/// Resumable batch scanner: appends chunk END positions (u32) of many blocks
+/// to one buffer, so the consumer runs one long loop per batch. A block's ends
+/// come from a table (8 positions per mask byte, stored whole at the byte's
+/// exclusive prefix popcount; all prefix sums from one multiply), with no loop
+/// over bits; the block's last end is computed from the mask, never read back
+/// from those overlapping vector stores (that read stalls on forwarding).
+pub struct Scan {
+    pos: usize,
+    base: usize,
+    carry: Carry,
+}
+
+impl Scan {
+    pub fn new(start: usize) -> Self {
+        Scan { pos: start, base: start, carry: Carry { forced: 1, ..Carry::default() } }
+    }
+
+    /// Append ends to `out[k..]` until `k >= limit` (checked per block) or
+    /// `stop`; returns the new length. `out.len() >= limit + SCAN_SLACK`,
+    /// `b.len() <= u32::MAX`.
+    #[inline]
+    pub fn fill(&mut self, kind: Pretok, b: &[u8], stop: usize, out: &mut [u32], mut k: usize, limit: usize) -> usize {
+        assert!(out.len() >= limit + SCAN_SLACK);
+        let (mut pos, mut base, mut carry) = (self.pos, self.base, self.carry);
+        let op = out.as_mut_ptr();
+        while pos < stop && k < limit {
+            if base + 64 <= pos {
+                base = pos;
+                carry = Carry { forced: 1, ..Carry::default() };
+            }
+            let (starts, bad, next_carry) = block(kind, b, base, carry);
+            let lim = (base + 64).min(stop);
+            let lim_mask = if lim - base >= 64 { u64::MAX } else { (1u64 << (lim - base)) - 1 };
+            let above0 = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
+            let trusted = starts & !bad & lim_mask & above0;
+            let bad = bad & lim_mask;
+            if bad & above0 == 0 {
+                let x = trusted - ((trusted >> 1) & 0x5555_5555_5555_5555);
+                let x = (x & 0x3333_3333_3333_3333) + ((x >> 2) & 0x3333_3333_3333_3333);
+                let cnts = (x + (x >> 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+                let incl = cnts.wrapping_mul(0x0101_0101_0101_0101);
+                let excl = incl << 8;
+                let b32 = base as u32;
+                for j in 0..8 {
+                    let row = &POS32[(trusted >> (8 * j)) as u8 as usize];
+                    let add = b32 + 8 * j as u32;
+                    let mut v = [0u32; 8];
+                    for t in 0..8 {
+                        v[t] = row[t] + add;
+                    }
+                    let at = k + ((excl >> (8 * j)) as u8 as usize);
+                    // SAFETY: k < limit at block start; at + 8 <= k + 64 <= out.len().
+                    unsafe { (op.add(at) as *mut [u32; 8]).write_unaligned(v) };
+                }
+                k += (incl >> 56) as usize;
+                if trusted != 0 {
+                    pos = base + 63 - trusted.leading_zeros() as usize;
+                }
+                if lim == stop && pos < stop {
+                    out[k] = stop as u32;
+                    k += 1;
+                    pos = stop;
+                }
+            } else {
+                loop {
+                    if pos >= lim {
+                        break;
+                    }
+                    let above = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
+                    let cand = trusted & above;
+                    let badm = bad & above;
+                    if cand != 0 {
+                        let c = cand.trailing_zeros();
+                        if badm & ((1u64 << c) - 1) == 0 {
+                            let end = base + c as usize;
+                            out[k] = end as u32;
+                            k += 1;
+                            pos = end;
+                            continue;
+                        }
+                    } else if badm == 0 {
+                        if lim == stop {
+                            out[k] = stop as u32;
+                            k += 1;
+                            pos = stop;
+                        }
+                        break;
+                    }
+                    let end = next_chunk_end(kind, b, pos);
+                    out[k] = end as u32;
+                    k += 1;
+                    pos = end;
+                    if k >= limit + SCAN_SLACK - 1 {
+                        self.pos = pos;
+                        self.base = base;
+                        self.carry = carry;
+                        return k;
+                    }
+                }
+            }
+            base += 64;
+            carry = next_carry;
+        }
+        self.pos = pos;
+        self.base = base;
+        self.carry = carry;
+        k
+    }
+}
+
 /// Per-chunk form of `chunks_batched` (tests / simple callers).
 #[cfg(test)]
 pub fn chunks(kind: Pretok, b: &[u8], start: usize, stop: usize, mut f: impl FnMut(usize, usize)) {
@@ -980,6 +1112,18 @@ mod tests {
             let mut got = Vec::new();
             chunks(kind, b, 0, b.len(), |a, e| got.push((a, e)));
             assert!(got == want, "{kind:?} {}", first_diff(&got, &want, b));
+            for lim in [7usize, 512] {
+                let mut sc = Scan::new(0);
+                let mut out = vec![0u32; lim + SCAN_SLACK];
+                let mut got3 = Vec::new();
+                let mut a = 0usize;
+                loop {
+                    let k = sc.fill(kind, b, b.len(), &mut out, 0, lim);
+                    if k == 0 { break; }
+                    for &e in &out[..k] { got3.push((a, e as usize)); a = e as usize; }
+                }
+                assert!(got3 == want, "Scan[{lim}] {kind:?} {}", first_diff(&got3, &want, b));
+            }
             for frac in [5usize, 2] {
                 if want.len() > 10 {
                     let s0 = want[want.len() / frac].0;
