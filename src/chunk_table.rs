@@ -449,43 +449,51 @@ impl LongCache {
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// One slot, 32 bytes. `meta`: 0 = empty, 1 = being written, else
-/// `2 | n << 2` = published with `n` (1..=3) tokens. A slot is written exactly
-/// once (claimed by CAS 0 -> 1, filled, then published with a Release store),
-/// and never changes afterwards, so a reader that sees it published (Acquire)
+/// One slot: 16-byte key, `meta` (0 = empty, 1 = being written, else
+/// `2 | n << 2` = published with `n` tokens) and up to `W` inline tokens.
+/// W = 3 -> 32 bytes, W = 11 -> 64 bytes. A slot is written exactly once
+/// (claimed by CAS 0 -> 1, filled, then published with a Release store) and
+/// never changes afterwards, so a reader that sees it published (Acquire)
 /// reads a consistent entry.
-#[repr(C, align(32))]
-struct SSlot {
-    meta: AtomicU32,
-    t2: AtomicU32,
+#[repr(C)]
+struct SSlot<const W: usize> {
     lo: AtomicU64,
     hi: AtomicU64,
-    t01: AtomicU64,
+    meta: AtomicU32,
+    toks: [AtomicU32; W],
 }
 
-const _: () = assert!(std::mem::size_of::<SSlot>() == 32);
-
-struct STable {
-    slots: Vec<SSlot>,
+struct STable<const W: usize> {
+    ptr: *mut SSlot<W>,
+    len: usize,
     mask: usize,
     shift: u32,
     count: AtomicUsize,
 }
 
-impl STable {
-    fn new(bits: u32) -> Box<STable> {
+impl<const W: usize> STable<W> {
+    fn layout(n: usize) -> std::alloc::Layout {
+        let sz = std::mem::size_of::<SSlot<W>>();
+        // cache-line aligned so a slot never straddles two lines
+        std::alloc::Layout::from_size_align(sz * n, sz.next_power_of_two().clamp(8, 64)).expect("table layout")
+    }
+
+    fn new(bits: u32) -> Box<STable<W>> {
         let n = 1usize << bits;
-        let layout = std::alloc::Layout::array::<SSlot>(n).expect("table layout");
-        // SAFETY: all-zero bytes are a valid SSlot (atomics of 0 = empty); the
-        // Vec owns exactly this layout (len == cap == n, SSlot's alignment).
-        let slots = unsafe {
-            let p = std::alloc::alloc_zeroed(layout) as *mut SSlot;
-            if p.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            Vec::from_raw_parts(p, n, n)
-        };
-        Box::new(STable { slots, mask: n - 1, shift: 64 - bits, count: AtomicUsize::new(0) })
+        let layout = Self::layout(n);
+        // SAFETY: non-zero size; all-zero bytes are a valid SSlot (atomics of
+        // 0 = empty). Freed in Drop with the same layout.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut SSlot<W>;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Box::new(STable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: AtomicUsize::new(0) })
+    }
+
+    #[inline(always)]
+    fn slot(&self, i: usize) -> &SSlot<W> {
+        // SAFETY: callers pass i <= mask < len; the allocation lives as long as self.
+        unsafe { &*self.ptr.add(i) }
     }
 
     fn bits(&self) -> u32 {
@@ -493,11 +501,19 @@ impl STable {
     }
 }
 
+impl<const W: usize> Drop for STable<W> {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with exactly this layout.
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len)) };
+    }
+}
+
 const PROBE_MAX: usize = 32;
-const SHARED_MIN_BITS: u32 = 14; // 512 KiB
+const SHARED_MIN_BITS: u32 = 14;
 
 /// Grow-only, lock-free table of LEARNED chunk encodings (multi-token results
 /// the load-time table can't hold), shared by every thread using a tokenizer.
+/// `W` = tokens stored inline per entry.
 ///
 /// Natural text has a very long tail of distinct multi-token pre-tokens (names,
 /// numbers, URL pieces, typos). Bounded per-thread caches keep evicting them —
@@ -509,29 +525,29 @@ const SHARED_MIN_BITS: u32 = 14; // 512 KiB
 /// * Inserts claim an empty slot with one CAS; entries are never overwritten.
 ///   Two threads racing on the same key may both insert it (harmless).
 /// * Growth: when half full, one thread builds a 2x table, copies the entries
-///   and swaps the pointer. Inserts that land in the old table meanwhile may be
-///   lost — fine, because every entry is just `f(bytes)` for the exact merge
-///   function: a missing entry only means that chunk gets merged again.
+///   and swaps the pointer; inserts arriving meanwhile are skipped. A missing
+///   entry only means that chunk gets merged again — every entry is just
+///   `f(bytes)` for the exact merge function.
 /// * Old tables stay allocated until the tokenizer is dropped (so a concurrent
 ///   reader can never see freed memory); geometric growth bounds that overhead
 ///   to the size of the final table.
-pub struct SharedTable {
-    cur: AtomicPtr<STable>,
-    retired: std::sync::Mutex<Vec<*mut STable>>,
+pub struct SharedTable<const W: usize = 3> {
+    cur: AtomicPtr<STable<W>>,
+    retired: std::sync::Mutex<Vec<*mut STable<W>>>,
     growing: AtomicBool,
     max_bits: AtomicU32,
 }
 
 // SAFETY: all shared state is atomic or behind the Mutex; the raw table
 // pointers are owned by this struct and freed only in Drop (exclusive access).
-unsafe impl Send for SharedTable {}
-unsafe impl Sync for SharedTable {}
+unsafe impl<const W: usize> Send for SharedTable<W> {}
+unsafe impl<const W: usize> Sync for SharedTable<W> {}
 
-impl SharedTable {
+impl<const W: usize> SharedTable<W> {
     /// `max_mib`: memory cap of the live table (0 disables learning).
     pub fn new(max_mib: usize) -> Self {
         let t = SharedTable {
-            cur: AtomicPtr::new(Box::into_raw(STable::new(SHARED_MIN_BITS))),
+            cur: AtomicPtr::new(Box::into_raw(STable::<W>::new(SHARED_MIN_BITS))),
             retired: std::sync::Mutex::new(Vec::new()),
             growing: AtomicBool::new(false),
             max_bits: AtomicU32::new(SHARED_MIN_BITS),
@@ -542,18 +558,18 @@ impl SharedTable {
 
     /// Change the memory cap (MiB) of the live table. 0 = stop learning.
     pub fn set_limit_mib(&self, max_mib: usize) {
-        let slots = (max_mib << 20) / std::mem::size_of::<SSlot>();
+        let slots = (max_mib << 20) / std::mem::size_of::<SSlot<W>>();
         let bits = if slots < 2 { 0 } else { usize::BITS - 1 - slots.leading_zeros() };
         self.max_bits.store(bits, Ordering::Relaxed);
     }
 
     pub fn limit_mib(&self) -> usize {
         let b = self.max_bits.load(Ordering::Relaxed);
-        if b == 0 { 0 } else { ((1usize << b) * std::mem::size_of::<SSlot>()) >> 20 }
+        if b == 0 { 0 } else { ((1usize << b) * std::mem::size_of::<SSlot<W>>()) >> 20 }
     }
 
     #[inline(always)]
-    fn table(&self) -> &STable {
+    fn table(&self) -> &STable<W> {
         // SAFETY: `cur` always points to a live table; tables are freed only in Drop.
         unsafe { &*self.cur.load(Ordering::Acquire) }
     }
@@ -563,47 +579,44 @@ impl SharedTable {
         self.table().count.load(Ordering::Relaxed)
     }
 
+    /// Hint the slot a lookup with hash `h` reads first into cache.
     #[inline(always)]
-    pub fn get(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; 3], usize)> {
+    pub fn prefetch(&self, h: u64) {
+        let t = self.table();
+        prefetch(t.slot((h >> t.shift) as usize) as *const SSlot<W> as *const u8);
+    }
+
+    #[inline(always)]
+    pub fn get(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; W], usize)> {
         let t = self.table();
         let mut i = (h >> t.shift) as usize;
         for _ in 0..PROBE_MAX {
-            // SAFETY: i is masked to < slots.len().
-            let s = unsafe { t.slots.get_unchecked(i) };
+            let s = t.slot(i);
             let m = s.meta.load(Ordering::Acquire);
             if m == 0 {
                 return None;
             }
             if m & 3 == 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
-                let t01 = s.t01.load(Ordering::Relaxed);
-                return Some(([t01 as u32, (t01 >> 32) as u32, s.t2.load(Ordering::Relaxed)], (m >> 2) as usize));
+                let mut v = [0u32; W];
+                for (d, x) in v.iter_mut().zip(s.toks.iter()) {
+                    *d = x.load(Ordering::Relaxed);
+                }
+                return Some((v, (m >> 2) as usize));
             }
             i = (i + 1) & t.mask;
         }
         None
     }
 
-    /// Hint the slot a lookup with hash `h` reads first into cache.
-    #[inline(always)]
-    pub fn prefetch(&self, h: u64) {
-        let t = self.table();
-        let i = (h >> t.shift) as usize;
-        // SAFETY: i < slots.len().
-        prefetch(unsafe { t.slots.as_ptr().add(i) } as *const u8);
-    }
-
-    /// Insert a learned encoding of 1..=3 tokens (longer ones are ignored).
+    /// Insert a learned encoding of 1..=W tokens (longer ones are ignored).
     pub fn put(&self, lo: u64, hi: u64, h: u64, toks: &[u32]) {
         let n = toks.len();
-        if n == 0 || n > 3 || self.max_bits.load(Ordering::Relaxed) == 0 {
+        if n == 0 || n > W || self.max_bits.load(Ordering::Relaxed) == 0 {
             return;
         }
         let t = self.table();
-        if t.count.load(Ordering::Relaxed) * 2 >= t.slots.len() {
-            if t.bits() < self.max_bits.load(Ordering::Relaxed) {
-                self.grow(t);
-            }
-            // at the cap: keep inserting until probes get long (PROBE_MAX)
+        if t.count.load(Ordering::Relaxed) * 2 >= t.len && t.bits() < self.max_bits.load(Ordering::Relaxed) {
+            self.grow(t);
         }
         // A growth in progress is copying the old table; an insert landing there
         // now could be missed by the copy. Don't wait for it (threads would pile
@@ -614,18 +627,16 @@ impl SharedTable {
         let t = self.table();
         let mut i = (h >> t.shift) as usize;
         for _ in 0..PROBE_MAX {
-            // SAFETY: i is masked to < slots.len().
-            let s = unsafe { t.slots.get_unchecked(i) };
+            let s = t.slot(i);
             let mut m = s.meta.load(Ordering::Relaxed);
             if m == 0 {
                 match s.meta.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
                     Ok(_) => {
                         s.lo.store(lo, Ordering::Relaxed);
                         s.hi.store(hi, Ordering::Relaxed);
-                        let t0 = toks[0] as u64;
-                        let t1 = toks.get(1).copied().unwrap_or(0) as u64;
-                        s.t01.store(t0 | t1 << 32, Ordering::Relaxed);
-                        s.t2.store(toks.get(2).copied().unwrap_or(0), Ordering::Relaxed);
+                        for (k, d) in s.toks.iter().enumerate() {
+                            d.store(toks.get(k).copied().unwrap_or(0), Ordering::Relaxed);
+                        }
                         s.meta.store(2 | (n as u32) << 2, Ordering::Release);
                         t.count.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -642,12 +653,7 @@ impl SharedTable {
 
     /// Double the table (one thread at a time; others keep using the old one).
     #[cold]
-    fn grow(&self, old: &STable) {
-        self.grow_to(old, old.bits() + 1)
-    }
-
-    #[cold]
-    fn grow_to(&self, old: &STable, bits: u32) {
+    fn grow(&self, old: &STable<W>) {
         if self.growing.swap(true, Ordering::Acquire) {
             return;
         }
@@ -656,27 +662,29 @@ impl SharedTable {
             self.growing.store(false, Ordering::Release);
             return;
         }
-        let new = STable::new(bits.max(old.bits() + 1));
+        let new = STable::<W>::new(old.bits() + 1);
         let mut copied = 0usize;
-        for s in old.slots.iter() {
+        for i in 0..old.len {
+            let s = old.slot(i);
             let m = s.meta.load(Ordering::Acquire);
             if m & 3 != 2 {
                 continue;
             }
             let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
-            let mut i = (hash(lo, hi) >> new.shift) as usize;
+            let mut j = (hash(lo, hi) >> new.shift) as usize;
             loop {
-                let d = &new.slots[i];
+                let d = new.slot(j);
                 if d.meta.load(Ordering::Relaxed) == 0 {
                     d.lo.store(lo, Ordering::Relaxed);
                     d.hi.store(hi, Ordering::Relaxed);
-                    d.t01.store(s.t01.load(Ordering::Relaxed), Ordering::Relaxed);
-                    d.t2.store(s.t2.load(Ordering::Relaxed), Ordering::Relaxed);
+                    for (x, y) in d.toks.iter().zip(s.toks.iter()) {
+                        x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
+                    }
                     d.meta.store(m, Ordering::Relaxed);
                     copied += 1;
                     break;
                 }
-                i = (i + 1) & new.mask;
+                j = (j + 1) & new.mask;
             }
         }
         new.count.store(copied, Ordering::Relaxed);
@@ -688,7 +696,7 @@ impl SharedTable {
     }
 }
 
-impl Drop for SharedTable {
+impl<const W: usize> Drop for SharedTable<W> {
     fn drop(&mut self) {
         // SAFETY: exclusive access; every pointer came from Box::into_raw and is
         // freed exactly once.
@@ -706,8 +714,18 @@ mod shared_tests {
     use super::*;
 
     #[test]
+    fn shared_slot_sizes() {
+        assert_eq!(std::mem::size_of::<SSlot<3>>(), 32);
+        assert_eq!(std::mem::size_of::<SSlot<11>>(), 64);
+        let t: SharedTable<11> = SharedTable::new(8);
+        let v: Vec<u32> = (1..=11).collect();
+        t.put(5, 1 << 56, hash(5, 1 << 56), &v);
+        assert_eq!(t.get(5, 1 << 56, hash(5, 1 << 56)), Some(([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 11)));
+    }
+
+    #[test]
     fn shared_table_concurrent_insert_get() {
-        let t = SharedTable::new(64);
+        let t: SharedTable = SharedTable::new(64);
         let keys: Vec<(u64, u64)> = (0..200_000u64).map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15), (i % 15 + 1) << 56)).collect();
         std::thread::scope(|sc| {
             for w in 0..8 {
