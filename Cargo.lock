@@ -309,6 +309,7 @@ version = "0.1.6"
 dependencies = [
  "aho-corasick",
  "fancy-regex",
+ "memchr",
  "pyo3",
  "rayon",
  "rustc-hash",
