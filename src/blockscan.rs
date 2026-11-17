@@ -247,6 +247,7 @@ struct Ctx {
     valid: u64,
     next_ws: bool,
     next_na: bool,
+    cont: u64, // continuation bytes of resolved non-ASCII characters
 }
 
 /// Resolve the commonest non-ASCII characters of web text to their regex class
@@ -260,11 +261,12 @@ struct Ctx {
 /// The resolved letter bytes join `l`; resolved punctuation bytes become the
 /// symbol class O (not L/D/WS/NA). Valid for grammars in which a multi-byte
 /// character only ever extends a run of its class (Word).
-#[inline]
-fn resolve_na(b: &[u8], base: usize, m: &mut Classes) {
+/// Returns the continuation bytes of the resolved characters (all but their
+/// lead byte), for grammars whose rules look at the previous CHARACTER.
+fn resolve_na(b: &[u8], base: usize, m: &mut Classes) -> u64 {
     let lim = (b.len() - base).min(64);
     let mut r = m.na;
-    let (mut ul, mut up) = (0u64, 0u64);
+    let (mut ul, mut up, mut cont) = (0u64, 0u64, 0u64);
     while r != 0 {
         let i = r.trailing_zeros() as usize;
         let c = b[base + i];
@@ -272,6 +274,7 @@ fn resolve_na(b: &[u8], base: usize, m: &mut Classes) {
             let d = b[base + i + 1];
             let w = 3u64 << i;
             if d == 0x97 || d == 0xB7 { up |= w } else { ul |= w }
+            cont |= 2u64 << i;
             r &= !w;
             continue;
         }
@@ -280,6 +283,7 @@ fn resolve_na(b: &[u8], base: usize, m: &mut Classes) {
             if (0x90..=0xA7).contains(&d) || (0xB0..=0xBE).contains(&d) {
                 let w = 7u64 << i;
                 up |= w;
+                cont |= 6u64 << i;
                 r &= !w;
                 continue;
             }
@@ -288,6 +292,7 @@ fn resolve_na(b: &[u8], base: usize, m: &mut Classes) {
     }
     m.l |= ul;
     m.na &= !(ul | up);
+    cont
 }
 
 #[inline(always)]
@@ -300,8 +305,9 @@ fn ctx_r(b: &[u8], base: usize, resolve: bool) -> Ctx {
     let n = b.len();
     #[allow(unused_mut)]
     let mut m = classify(b, base);
+    let mut cont = 0u64;
     if resolve && m.na != 0 {
-        resolve_na(b, base, &mut m);
+        cont = resolve_na(b, base, &mut m);
     }
     let valid = if base + 64 <= n { u64::MAX } else { (1u64 << (n - base)) - 1 };
     let next = b.get(base + 64).copied();
@@ -311,6 +317,7 @@ fn ctx_r(b: &[u8], base: usize, resolve: bool) -> Ctx {
         valid,
         next_ws: next.map_or(false, is_ws),
         next_na: next.map_or(false, |c| c >= 0x80),
+        cont,
     }
 }
 
@@ -434,10 +441,17 @@ fn span_bad(bad: &mut u64, bad_next: &mut u64, i: usize, end: usize) {
 
 fn generic_block(b: &[u8], base: usize, max_digits: u32, c: Carry) -> Block {
     let n = b.len();
-    let x = ctx(b, base);
+    // Resolved multi-byte characters (Latin-1 letters, general punctuation)
+    // are classified in-block. A letter run may take ONE preceding symbol
+    // CHARACTER as prefix, so "did the previous symbol start a chunk" is a
+    // per-character question: smear each symbol start over its character's
+    // continuation bytes (resolved characters are at most 3 bytes).
+    let x = ctx_r(b, base, true);
     let (m, o) = (&x.m, x.o);
     let ostart = o & !p1(o, c.o) & !p1(m.sp, c.sp);
-    let lstart = m.l & (p1(m.d, c.d) | p1(m.nl, c.nl) | (p1(o, c.o) & !p1(ostart, c.ostart)));
+    let ostart_c = ostart | ((ostart << 1) & x.cont);
+    let ostart_c = ostart_c | ((ostart_c << 1) & x.cont);
+    let lstart = m.l & (p1(m.d, c.d) | p1(m.nl, c.nl) | (p1(o, c.o) & !p1(ostart_c, c.ostart)));
     let (dstart, dbad) = digit_starts(m, &c, max_digits, false);
     let (wsstart, wsbad, _) = ws_starts_nl(&x, &c, base, n);
     let mut starts = ostart | lstart | dstart | wsstart | c.forced;
@@ -458,8 +472,13 @@ fn generic_block(b: &[u8], base: usize, max_digits: u32, c: Carry) -> Block {
             span_bad(&mut bad, &mut bad_next, i, i + len);
         }
     }
-    bad |= m.l & p1(o, c.o) & p1(bad, c.bad3 >> 2 & 1 == 1); // reads the O's start status
-    let mut out = carry_out(&x, ostart, 0, false, forced, 0);
+    // a letter after a symbol reads that symbol's start status: uncertain if any
+    // byte of the symbol character is (smear over continuation bytes first)
+    let bad_c = bad | ((bad << 1) & x.cont);
+    let bad_c = bad_c | ((bad_c << 1) & x.cont);
+    bad |= m.l & p1(o, c.o) & p1(bad_c, c.bad3 >> 2 & 1 == 1); // reads the O's start status
+    let bad = bad | ((bad << 1) & x.cont) | ((bad << 2) & x.cont & (x.cont << 1));
+    let mut out = carry_out(&x, ostart_c, 0, false, forced, 0);
     out.bad_in = bad_next;
     out.bad3 = bad >> 61;
     (starts & x.valid, bad & x.valid, out)
