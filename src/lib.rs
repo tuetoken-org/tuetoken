@@ -620,55 +620,6 @@ fn texts_as_str(items: &[TextArg]) -> PyResult<Vec<&str>> {
     }
 }
 
-/// Output of `Tokenizer::encode_flat`: task buffers in document order, plus
-/// tokens per document.
-struct Flat {
-    bufs: Vec<Vec<u32>>,
-    doc_counts: Vec<usize>,
-}
-
-impl Flat {
-    fn total(&self) -> usize {
-        self.bufs.iter().map(|b| b.len()).sum()
-    }
-
-    /// Copy all task buffers, in order, into `dst` (len == total) in parallel.
-    fn scatter(&self, dst: &mut [u32]) {
-        let mut slices: Vec<(&mut [u32], &Vec<u32>)> = Vec::with_capacity(self.bufs.len());
-        let mut rest = dst;
-        for b in &self.bufs {
-            let (head, tail) = rest.split_at_mut(b.len());
-            slices.push((head, b));
-            rest = tail;
-        }
-        if self.bufs.len() <= 1 || self.total() < (1 << 16) || !parallel_ok() {
-            for (d, s) in slices {
-                d.copy_from_slice(s);
-            }
-        } else {
-            slices.into_par_iter().for_each(|(d, s)| d.copy_from_slice(s));
-        }
-    }
-
-    fn scatter_into_vec(&self, out: &mut Vec<u32>) {
-        if self.bufs.len() == 1 {
-            out.extend_from_slice(&self.bufs[0]);
-            return;
-        }
-        let total = self.total();
-        out.clear();
-        out.reserve_exact(total);
-        // SAFETY: capacity >= total; `scatter` writes every one of the `total`
-        // elements exactly once before we set the length (u32 has no invalid
-        // bit patterns, so exposing the writes is sound).
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(out.as_mut_ptr(), total);
-            self.scatter(dst);
-            out.set_len(total);
-        }
-    }
-}
-
 /// A token buffer handed to numpy WITHOUT a copy: it owns the `Vec<u32>` the
 /// encoder filled (in parallel) and exposes it through the buffer protocol, so
 /// `numpy.frombuffer(buf, "uint32")` views that memory directly and keeps the
@@ -852,27 +803,18 @@ impl Tokenizer {
         }
     }
 
-    /// Python list-of-lists straight from a `Flat` (walks the task buffers with
-    /// a cursor; a split document may span several buffers).
-    fn flat_to_pylists<'py>(&self, py: Python<'py>, flat: &Flat) -> Bound<'py, PyList> {
+    /// Python list-of-lists from one contiguous token buffer + per-doc counts.
+    fn data_to_pylists<'py>(&self, py: Python<'py>, data: &[u32], doc_counts: &[usize]) -> Bound<'py, PyList> {
         let table = self.ints(py);
-        let (mut bi, mut off) = (0usize, 0usize);
-        // SAFETY: as in to_pylist — each slot of each new list is filled exactly
-        // once with an owned reference.
+        let mut off = 0usize;
+        // SAFETY: each new list's slots are filled exactly once with owned refs.
         unsafe {
-            let outer = pyo3::ffi::PyList_New(flat.doc_counts.len() as pyo3::ffi::Py_ssize_t);
+            let outer = pyo3::ffi::PyList_New(doc_counts.len() as pyo3::ffi::Py_ssize_t);
             assert!(!outer.is_null(), "list alloc");
-            for (d, &c) in flat.doc_counts.iter().enumerate() {
+            for (d, &c) in doc_counts.iter().enumerate() {
                 let inner = pyo3::ffi::PyList_New(c as pyo3::ffi::Py_ssize_t);
                 assert!(!inner.is_null(), "list alloc");
-                let mut k = 0usize;
-                while k < c {
-                    while off == flat.bufs[bi].len() {
-                        bi += 1;
-                        off = 0;
-                    }
-                    let t = flat.bufs[bi][off];
-                    off += 1;
+                for (k, &t) in data[off..off + c].iter().enumerate() {
                     let obj = match table.get(t as usize) {
                         Some(o) => {
                             let p = o.as_ptr();
@@ -882,8 +824,8 @@ impl Tokenizer {
                         None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
                     };
                     pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj);
-                    k += 1;
                 }
+                off += c;
                 pyo3::ffi::PyList_SET_ITEM(outer, d as pyo3::ffi::Py_ssize_t, inner);
             }
             Bound::from_owned_ptr(py, outer).cast_into_unchecked()
@@ -1322,10 +1264,7 @@ impl Tokenizer {
 
     /// Encode one long document in parallel segments (state-machine path only).
     fn encode_split(&self, text: &str) -> Vec<u32> {
-        let flat = self.encode_flat(&[text], 0);
-        let mut out = Vec::new();
-        flat.scatter_into_vec(&mut out);
-        out
+        self.encode_direct(&[text], 0, true).0
     }
 
     /// Run `f` on this thread's warm Scratch (claimed for this tokenizer), or on a
@@ -1352,11 +1291,20 @@ impl Tokenizer {
     /// released by the caller); the caller then scatters the task buffers into
     /// its destination in parallel. Output is identical to per-document
     /// `encode_one`, in document order.
-    fn encode_flat<T: AsRef<str> + Sync>(&self, texts: &[T], num_threads: usize) -> Flat {
+    /// Split a batch into work items (whole documents, or proven-boundary
+    /// segments of long ones) grouped into tasks of >= TASK_BYTES of input.
+    /// Returns (normalized docs, items (doc, start, end, is_segment), tasks
+    /// (first item, end item, bytes)).
+    #[allow(clippy::type_complexity)]
+    fn plan<'t, T: AsRef<str> + Sync>(
+        &self,
+        texts: &'t [T],
+        num_threads: usize,
+    ) -> (Vec<std::borrow::Cow<'t, str>>, Vec<(u32, usize, usize, bool)>, Vec<(usize, usize, usize)>) {
         const SEG: usize = 1 << 16;
         const TASK_BYTES: usize = 1 << 16;
         let splittable = self.splittable();
-        let norm: Vec<std::borrow::Cow<'_, str>> = if self.norm_form == 0 {
+        let norm: Vec<std::borrow::Cow<'t, str>> = if self.norm_form == 0 {
             texts.iter().map(|t| std::borrow::Cow::Borrowed(t.as_ref())).collect()
         } else {
             // quick-check is ~free on ASCII; only rare runs allocate
@@ -1366,7 +1314,6 @@ impl Tokenizer {
                 texts.par_iter().with_min_len(64).map(|t| self.normalize(t.as_ref())).collect()
             }
         };
-        // items: (doc, start, end, is_segment)
         let mut items: Vec<(u32, usize, usize, bool)> = Vec::with_capacity(texts.len());
         for (i, d) in norm.iter().enumerate() {
             let b = d.as_bytes();
@@ -1379,7 +1326,7 @@ impl Tokenizer {
                 items.push((i as u32, 0, b.len(), false));
             }
         }
-        let mut tasks: Vec<(usize, usize, usize)> = Vec::new(); // (first item, end item, bytes)
+        let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
         let (mut st, mut acc) = (0usize, 0usize);
         for (k, it) in items.iter().enumerate() {
             acc += it.2 - it.1;
@@ -1392,50 +1339,229 @@ impl Tokenizer {
         if st < items.len() {
             tasks.push((st, items.len(), acc));
         }
-        let run_task = |&(x, y, nbytes): &(usize, usize, usize)| -> (Vec<u32>, Vec<u32>) {
-            self.with_scratch(|s| {
-                let mut counts = Vec::with_capacity(y - x);
-                let saved = std::mem::replace(&mut s.out, Vec::with_capacity(nbytes / 3 + 16));
-                for &(doc, a, b, seg) in &items[x..y] {
-                    let before = s.out.len();
-                    let d: &str = &norm[doc as usize];
-                    if seg {
-                        self.encode_range(d.as_bytes(), a, b, s);
-                    } else {
-                        self.encode_into_norm(d, Merge::Auto, true, s);
-                    }
-                    counts.push((s.out.len() - before) as u32);
+        (norm, items, tasks)
+    }
+
+    /// Encode one item into `s.out` (appends).
+    #[inline]
+    fn encode_item(&self, norm: &[std::borrow::Cow<'_, str>], item: (u32, usize, usize, bool), s: &mut Scratch) {
+        let (doc, a, b, seg) = item;
+        let d: &str = &norm[doc as usize];
+        if seg {
+            self.encode_range(d.as_bytes(), a, b, s);
+        } else {
+            self.encode_into_norm(d, Merge::Auto, true, s);
+        }
+    }
+
+    /// The batch engine: one flat output in document order, plus tokens per
+    /// document. Written directly into the final buffer with a single-pass
+    /// "decoupled look-back" scheme (as in GPU prefix sums):
+    ///
+    /// * worker threads take tasks IN ORDER from an atomic counter and encode
+    ///   each into their own reused scratch buffer (warm cache, no new pages);
+    /// * a finished task publishes its token count, then finds its output
+    ///   offset by walking back over its predecessors (started earlier, so
+    ///   normally already done): the nearest inclusive prefix plus the counts in
+    ///   between; it publishes its own inclusive prefix and copies its tokens
+    ///   straight into the final buffer;
+    /// * if a predecessor is still running past a short spin, the task stashes
+    ///   its tokens and moves on; stashed tasks are placed at the end.
+    ///
+    /// No per-task allocations, no second full-size buffer, no gather pass. The
+    /// final buffer is sized by an estimate (tokens <= bytes / 2 + slack); if a
+    /// pathological input exceeds it, the output is assembled exactly anyway.
+    /// `want_output = false` only counts (no output buffer at all).
+    fn encode_direct<T: AsRef<str> + Sync>(&self, texts: &[T], num_threads: usize, want_output: bool) -> (Vec<u32>, Vec<usize>) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
+        let (norm, items, tasks) = self.plan(texts, num_threads);
+        let ntask = tasks.len();
+        let mut doc_counts = vec![0usize; texts.len()];
+        let nt = if num_threads == 0 { rayon::current_num_threads() } else { num_threads.min(1024) };
+
+        if nt <= 1 || ntask <= 1 || !parallel_ok() {
+            // serial: encode straight into the output (no extra buffers at all)
+            let out = self.with_scratch(|s| {
+                let saved = std::mem::take(&mut s.out);
+                let total_bytes: usize = tasks.iter().map(|t| t.2).sum();
+                if want_output {
+                    s.out.reserve(total_bytes / 4 + 16);
                 }
-                let out = std::mem::replace(&mut s.out, saved);
-                (out, counts)
+                for &it in &items {
+                    let before = s.out.len();
+                    self.encode_item(&norm, it, s);
+                    doc_counts[it.0 as usize] += s.out.len() - before;
+                    if !want_output {
+                        s.out.clear();
+                    }
+                }
+                std::mem::replace(&mut s.out, saved)
+            });
+            return (if want_output { out } else { Vec::new() }, doc_counts);
+        }
+
+        const UNK: u64 = u64::MAX;
+        let total_bytes: usize = tasks.iter().map(|t| t.2).sum();
+
+        let cap = if want_output { total_bytes / 2 + 4096 } else { 0 };
+        let mut out: Vec<u32> = Vec::with_capacity(cap);
+        struct SendPtr<P>(*mut P);
+        // SAFETY: tasks write disjoint index ranges through these pointers.
+        unsafe impl<P> Sync for SendPtr<P> {}
+        impl<P> SendPtr<P> {
+            // a method call makes closures capture the whole (Sync) wrapper,
+            // not the raw-pointer field
+            fn get(&self) -> *mut P {
+                self.0
+            }
+        }
+        let out_ptr = SendPtr(out.as_mut_ptr());
+        let mut item_counts = vec![0u32; items.len()];
+        let ic_ptr = SendPtr(item_counts.as_mut_ptr());
+        let counts: Vec<AtomicU64> = (0..ntask).map(|_| AtomicU64::new(UNK)).collect();
+        let incl: Vec<AtomicU64> = (0..ntask).map(|_| AtomicU64::new(UNK)).collect();
+        let written: Vec<AtomicBool> = (0..ntask).map(|_| AtomicBool::new(false)).collect();
+        // per-task stash slots (no shared lock): output of tasks whose offset
+        // wasn't known yet when they finished
+        let stash: Vec<OnceLock<Vec<u32>>> = (0..ntask).map(|_| OnceLock::new()).collect();
+        let next = AtomicUsize::new(0);
+
+        // offset of task k, or None if a predecessor is still running (after a spin)
+        let look_back = |k: usize| -> Option<u64> {
+            let mut sum = 0u64;
+            let mut j = k;
+            let mut spins = 0u32;
+            let mut started: Option<std::time::Instant> = None;
+            while j > 0 {
+                let i = j - 1;
+                let p = incl[i].load(Acquire);
+                if p != UNK {
+                    return Some(p + sum);
+                }
+                let c = counts[i].load(Acquire);
+                if c == UNK {
+                    // the predecessor is still running: it started before us and
+                    // a task is ~64 KB of work, so wait briefly (~50 us)
+                    spins += 1;
+                    if spins % 256 == 0 {
+                        let t0 = *started.get_or_insert_with(std::time::Instant::now);
+                        if t0.elapsed() > std::time::Duration::from_micros(50) {
+                            return None;
+                        }
+                    }
+                    std::hint::spin_loop();
+                    continue;
+                }
+                sum += c;
+                j = i;
+            }
+            Some(sum)
+        };
+
+        let worker = || {
+            self.with_scratch(|s| {
+                let saved = std::mem::take(&mut s.out);
+                loop {
+                    let k = next.fetch_add(1, Relaxed);
+                    if k >= ntask {
+                        break;
+                    }
+                    let (x, y, _) = tasks[k];
+                    s.out.clear();
+                    for (ii, &it) in items[x..y].iter().enumerate() {
+                        let before = s.out.len();
+                        self.encode_item(&norm, it, s);
+                        // SAFETY: item x+ii belongs to task k only.
+                        unsafe { *ic_ptr.get().add(x + ii) = (s.out.len() - before) as u32 };
+                    }
+                    let cnt = s.out.len() as u64;
+                    counts[k].store(cnt, Release);
+                    if !want_output {
+                        continue;
+                    }
+                    match look_back(k) {
+                        Some(base) => {
+                            incl[k].store(base + cnt, Release);
+                            if (base + cnt) as usize <= cap {
+                                // SAFETY: [base, base+cnt) is this task's exclusive
+                                // range of the final buffer and lies within `cap`.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(s.out.as_ptr(), out_ptr.get().add(base as usize), s.out.len())
+                                };
+                                written[k].store(true, Relaxed);
+                            } else {
+                                let _ = stash[k].set(s.out.clone());
+                            }
+                        }
+                        None => {
+                            let _ = stash[k].set(s.out.clone());
+                        }
+                    }
+                }
+                s.out = saved;
             })
         };
-        let nt = if num_threads == 0 { 0 } else { num_threads.min(1024) };
-        let parts: Vec<(Vec<u32>, Vec<u32>)> = if nt == 1 || tasks.len() <= 1 || !parallel_ok() {
-            tasks.iter().map(run_task).collect()
+        let run = || {
+            rayon::broadcast(|_| worker());
+        };
+        if num_threads == 0 {
+            run();
         } else {
-            let run = || tasks.par_iter().map(run_task).collect();
-            if nt == 0 {
-                run()
-            } else {
-                match fixed_pool(nt) {
-                    Some(pool) => pool.install(run),
-                    None => run(),
+            match fixed_pool(nt) {
+                Some(pool) => pool.install(|| { rayon::broadcast(|_| worker()); }),
+                None => run(),
+            }
+        }
+
+        for (k, it) in items.iter().enumerate() {
+            doc_counts[it.0 as usize] += item_counts[k] as usize;
+        }
+        if !want_output {
+            return (Vec::new(), doc_counts);
+        }
+        // final offsets of every task
+        let mut pref = Vec::with_capacity(ntask + 1);
+        pref.push(0usize);
+        for c in &counts {
+            let last = *pref.last().unwrap();
+            pref.push(last + c.load(Relaxed) as usize);
+        }
+        let total = pref[ntask];
+        let stashed: Vec<(usize, Vec<u32>)> =
+            stash.into_iter().enumerate().filter_map(|(k, v)| v.into_inner().map(|v| (k, v))).collect();
+        if total <= cap {
+            // place stashed outputs in parallel (disjoint ranges)
+            let dst = SendPtr(out.as_mut_ptr());
+            stashed.par_iter().for_each(|(k, v)| {
+                // SAFETY: task k's range [pref[k], pref[k]+len) is within cap and
+                // was not written by anyone else.
+                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), dst.get().add(pref[*k]), v.len()) };
+            });
+            // SAFETY: every task's range was written (directly or from the stash),
+            // and the ranges tile [0, total).
+            unsafe { out.set_len(total) };
+            return (out, doc_counts);
+        }
+        // estimate exceeded (pathological input): assemble an exact buffer
+        let mut exact: Vec<u32> = Vec::with_capacity(total);
+        let mut by_task: Vec<Option<&Vec<u32>>> = vec![None; ntask];
+        for (k, v) in &stashed {
+            by_task[*k] = Some(v);
+        }
+        for k in 0..ntask {
+            match by_task[k] {
+                Some(v) => exact.extend_from_slice(v),
+                None => {
+                    debug_assert!(written[k].load(Relaxed));
+                    // SAFETY: task k was copied into out[pref[k]..pref[k+1]] (< cap).
+                    let src = unsafe { std::slice::from_raw_parts(out.as_ptr().add(pref[k]), pref[k + 1] - pref[k]) };
+                    exact.extend_from_slice(src);
                 }
             }
-        };
-        let mut doc_counts = vec![0usize; texts.len()];
-        let mut bufs = Vec::with_capacity(parts.len());
-        let mut k = 0usize;
-        for (buf, counts) in parts {
-            for c in counts {
-                doc_counts[items[k].0 as usize] += c as usize;
-                k += 1;
-            }
-            bufs.push(buf);
         }
-        Flat { bufs, doc_counts }
+        (exact, doc_counts)
     }
+
 
     /// Fallback path: pre-tokenize via the model's actual Split regex(es)
     /// (`fancy-regex`), composing multiple Split stages with HF "Isolated"
@@ -2199,15 +2325,16 @@ impl Tokenizer {
         texts: Vec<TextArg>,
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyList>> {
-        let flat = py.detach(|| -> PyResult<Flat> { Ok(self.encode_flat(&texts_as_str(&texts)?, num_threads)) })?;
-        Ok(self.flat_to_pylists(py, &flat))
+        let (data, counts) =
+            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { Ok(self.encode_direct(&texts_as_str(&texts)?, num_threads, true)) })?;
+        Ok(self.data_to_pylists(py, &data, &counts))
     }
 
 
     /// Token counts for many texts, in parallel (no Python list of ids built).
     #[pyo3(signature = (texts, num_threads = 0))]
     fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<TextArg>, num_threads: usize) -> PyResult<Vec<usize>> {
-        py.detach(|| Ok(self.encode_flat(&texts_as_str(&texts)?, num_threads).doc_counts))
+        py.detach(|| Ok(self.encode_direct(&texts_as_str(&texts)?, num_threads, false).1))
     }
 
     /// Training-loader helper: encode `texts` and return a fixed-width, padded
@@ -2287,22 +2414,15 @@ impl Tokenizer {
     ) -> PyResult<Bound<'py, PyDict>> {
         // Encode in parallel (GIL released) into a few contiguous task buffers,
         // then scatter them in parallel straight into a numpy-owned bytearray.
-        let flat = py.detach(|| -> PyResult<Flat> { Ok(self.encode_flat(&texts_as_str(&texts)?, num_threads)) })?;
-        let mut offsets = Vec::with_capacity(flat.doc_counts.len() + 1);
+        let (data, counts) =
+            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { Ok(self.encode_direct(&texts_as_str(&texts)?, num_threads, true)) })?;
+        let mut offsets = Vec::with_capacity(counts.len() + 1);
         offsets.push(0i64);
         let mut total = 0usize;
-        for &c in &flat.doc_counts {
+        for &c in &counts {
             total += c;
             offsets.push(total as i64);
         }
-        // Gather into one Vec<u32> in parallel (first-touch page faults happen on
-        // the worker threads too), then hand it to numpy without a copy.
-        let data = py.detach(|| {
-            let mut v = Vec::new();
-            flat.scatter_into_vec(&mut v);
-            drop(flat);
-            v
-        });
         debug_assert_eq!(data.len(), total);
         let data_ba = Bound::new(py, TokenBuffer::new(data))?;
 
@@ -2550,7 +2670,7 @@ mod perf {
             MERGES.load(Relaxed), DYN_HITS.load(Relaxed), s.out.len());
     }
 
-    /// Phase timing for one big blob: encode_flat vs gathering into one Vec.
+    /// Phase timing for one big blob through the direct-output engine.
     #[test]
     #[ignore]
     fn blob_phases() {
@@ -2559,12 +2679,10 @@ mod perf {
         let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
         for _ in 0..3 {
             let t0 = std::time::Instant::now();
-            let flat = t.encode_flat(&[data.as_str()], 0);
+            let (v, _) = t.encode_direct(&[data.as_str()], 0, true);
             let t1 = t0.elapsed();
-            let mut v = Vec::new();
-            flat.scatter_into_vec(&mut v);
-            let t2 = t0.elapsed();
-            drop(flat);
+            let t2 = t1;
+            drop(v);
             let t3 = t0.elapsed();
             println!("encode {:?} ({} task bufs) | gather {:?} | free {:?} | total {:.2} GB/s",
                 t1, 0, t2 - t1, t3 - t2, data.len() as f64 / t3.as_secs_f64() / 1e9);
@@ -2588,9 +2706,9 @@ mod perf {
             MERGES.store(0, Relaxed);
             DYN_HITS.store(0, Relaxed);
             let t0 = std::time::Instant::now();
-            let flat = t.encode_flat(&docs, nthreads);
+            let (_, counts) = t.encode_direct(&docs, nthreads, true);
             let dt = t0.elapsed().as_secs_f64();
-            let toks: usize = flat.doc_counts.iter().sum();
+            let toks: usize = counts.iter().sum();
             if pass == 0 {
                 chunks_est = toks; // ~1.09 tokens per chunk; tokens as the denominator
             }
