@@ -564,25 +564,33 @@ fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
     let (dstart, dbad) = if indiv { (m.d, 0) } else { digit_starts(m, &c, 0, true) };
     // whitespace: `\s+(?!\S)|\s+` — run start, and e-1 when >= 2 long and text
     // follows (unless individual digits and a digit follows: no back-off)
+    //
+    // Branch-free over all runs at once (no per-run loop):
+    //   lr    = bits of the long runs that START in this block (a run continuing
+    //           from the previous block is left to common_bad, as before)
+    //   r     = first byte of each such run, last = its last byte in the word
+    //   a run is BAD if it reaches bit 63 (its end is in the next block), or a
+    //   non-ASCII byte sits right before it or right after it (it might be
+    //   Unicode whitespace). Flags at the start are smeared over the run with
+    //   a carry: ((lr + flag) ^ lr) & lr; flags at the end the same way on the
+    //   bit-reversed words.
+    //   good runs start a chunk at r, and at last (= e-1) when text follows
+    //   (e < n) — unless individual digits and a digit follows.
     let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, x.next_ws));
-    let mut wsstart = m.ws & !long;
-    let mut wsbad = 0u64;
-    let mut runs = long & !p1(long, c.ws);
-    while runs != 0 {
-        let r = runs.trailing_zeros() as usize;
-        runs &= runs - 1;
-        let e = r + ((!m.ws) >> r).trailing_zeros() as usize;
-        let na_before = if r == 0 { c.na } else { m.na >> (r - 1) & 1 == 1 };
-        if e >= 64 || na_before || m.na >> e & 1 == 1 {
-            wsbad |= run_mask(r, e);
-            continue;
-        }
-        wsstart |= 1u64 << r;
-        let digit_next = m.d >> e & 1 == 1;
-        if base + e < n && !(indiv && digit_next) {
-            wsstart |= 1u64 << (e - 1);
-        }
-    }
+    let cont = if c.ws { run_mask(0, (!m.ws).trailing_zeros() as usize) } else { 0 };
+    let lr = long & !cont;
+    let r = lr & !(lr << 1);
+    let last = lr & !(lr >> 1);
+    let flag_start = r & p1(m.na, c.na);
+    let flag_end = (last & (m.na >> 1)) | (last & (1u64 << 63));
+    let smear_up = |runs: u64, f: u64| (runs.wrapping_add(f) ^ runs) & runs;
+    let wsbad = smear_up(lr, flag_start)
+        | smear_up(lr.reverse_bits(), flag_end.reverse_bits()).reverse_bits();
+    let good = lr & !wsbad;
+    let text_follows = x.valid >> 1; // byte i+1 exists
+    let no_digit_rule = if indiv { !(m.d >> 1) } else { u64::MAX };
+    let wsstart = (m.ws & !long) | (r & good) | (last & good & text_follows & no_digit_rule);
+    let _ = (base, n);
     let mut starts = ostart | lstart | dstart | wsstart | c.forced;
     let (mut suppress, mut forced, mut sup_next) = (c.suppress, 0u64, 0u64);
     let mut bad = common_bad(&x, &c) | dbad | wsbad | c.bad_in;
