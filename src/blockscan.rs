@@ -246,10 +246,60 @@ struct Ctx {
     next_na: bool,
 }
 
+/// Resolve the commonest non-ASCII characters of web text to their regex class
+/// so they don't make the block BAD (OpenWebText: 20% of blocks contain
+/// non-ASCII, 2.5% once these are resolved). Only characters entirely inside
+/// the block are resolved; everything else stays non-ASCII (BAD), as before.
+///   * U+00C0..U+00FF (lead 0xC3): letters, except U+00D7 × and U+00F7 ÷ (Sm)
+///   * U+2010..U+2027, U+2030..U+203E (E2 80 90..A7 / B0..BE): punctuation —
+///     dashes, curly quotes, bullets, ellipsis, per-mille, primes (none is a
+///     letter, digit or whitespace; U+2028/2029/202F whitespace are excluded)
+/// The resolved letter bytes join `l`; resolved punctuation bytes become the
+/// symbol class O (not L/D/WS/NA). Valid for grammars in which a multi-byte
+/// character only ever extends a run of its class (Word).
+#[inline]
+fn resolve_na(b: &[u8], base: usize, m: &mut Classes) {
+    let lim = (b.len() - base).min(64);
+    let mut r = m.na;
+    let (mut ul, mut up) = (0u64, 0u64);
+    while r != 0 {
+        let i = r.trailing_zeros() as usize;
+        let c = b[base + i];
+        if c == 0xC3 && i + 1 < lim {
+            let d = b[base + i + 1];
+            let w = 3u64 << i;
+            if d == 0x97 || d == 0xB7 { up |= w } else { ul |= w }
+            r &= !w;
+            continue;
+        }
+        if c == 0xE2 && i + 2 < lim && b[base + i + 1] == 0x80 {
+            let d = b[base + i + 2];
+            if (0x90..=0xA7).contains(&d) || (0xB0..=0xBE).contains(&d) {
+                let w = 7u64 << i;
+                up |= w;
+                r &= !w;
+                continue;
+            }
+        }
+        r &= r - 1;
+    }
+    m.l |= ul;
+    m.na &= !(ul | up);
+}
+
 #[inline(always)]
 fn ctx(b: &[u8], base: usize) -> Ctx {
+    ctx_r(b, base, false)
+}
+
+#[inline(always)]
+fn ctx_r(b: &[u8], base: usize, resolve: bool) -> Ctx {
     let n = b.len();
-    let m = classify(b, base);
+    #[allow(unused_mut)]
+    let mut m = classify(b, base);
+    if resolve && m.na != 0 {
+        resolve_na(b, base, &mut m);
+    }
     let valid = if base + 64 <= n { u64::MAX } else { (1u64 << (n - base)) - 1 };
     let next = b.get(base + 64).copied();
     Ctx {
@@ -503,7 +553,7 @@ fn camel_block(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Ca
 
 fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
     let n = b.len();
-    let x = ctx(b, base);
+    let x = ctx_r(b, base, true);
     let (m, o) = (&x.m, x.o);
     let sp_before = p1(m.sp, c.sp);
     let ostart = o & !p1(o, c.o) & !sp_before;
@@ -590,7 +640,7 @@ fn carry_out(x: &Ctx, ostart: u64, abs_nl: u64, contr: bool, forced: u64, suppre
 }
 
 #[inline(always)]
-fn block(kind: Pretok, b: &[u8], base: usize, c: Carry) -> Block {
+pub fn block(kind: Pretok, b: &[u8], base: usize, c: Carry) -> Block {
     match kind {
         Pretok::Generic { max_digits, .. } => generic_block(b, base, max_digits, c),
         Pretok::CamelCase { contractions, max_digits } => camel_block(b, base, contractions, max_digits, c),
@@ -749,6 +799,9 @@ mod tests {
             "\x0c", " \n", "\n\n", ".", ",", "!", "?", "/", "//", "-", "(", ")", "\"", "#",
             "\x01", "\x7f", "é", "É", "漢", "\u{0301}", "\u{00a0}", "\u{3000}", "\u{0663}",
             "½", "€", "😀", "\u{0085}", "\u{2028}", "ǅ", "ʰ",
+            "’", "‘", "“", "”", "—", "–", "…", "•", "‰", "‾", "‿", "×", "÷", "ß", "ÿ", "À",
+            "Ö", "ø", "\u{2000}", "\u{200a}", "\u{200b}", "\u{2029}", "\u{202f}",
+            "\u{205f}", "\u{2070}", "\u{2071}", "don’t", " “Hi”", "café", " é", "’s", "a’",
         ];
         let n = (lcg(seed) % 200) as usize;
         (0..n).map(|_| POOL[(lcg(seed) as usize) % POOL.len()]).collect()
@@ -763,7 +816,8 @@ mod tests {
             "it", " 1", "2", " 2024", "123456", "7", "\n", "\n\n", " \n", "\t", "  ", "   ",
             "\r\n", "#", "//", "/", ";\n//", "->", "==", " = ", "x_y", "(a)", "[0]", "{", "}",
             ";", ":", "--", "...", "a", "B", "Z", "'", " .", "\x0b", "\x0c", "HTTPServer",
-            "camelCase", "getX", "ABc", "é", "\u{a0}", "½",
+            "camelCase", "getX", "ABc", "é", "\u{a0}", "½", "’", " “", "”", "—", " –",
+            "…", "×", "÷", "café", "Ö", "\u{2028}", "\u{202f}", "\u{200b}", "’s", "‘",
         ];
         let n = (lcg(seed) % 600) as usize;
         (0..n)
@@ -824,6 +878,21 @@ mod tests {
         let mut seed = 777u64;
         for _ in 0..iters() {
             check(&soup_text(&mut seed));
+        }
+    }
+
+    /// Dense soup mixing the resolved non-ASCII characters (Latin-1 letters,
+    /// general punctuation) with the ASCII rule characters and the unresolved
+    /// whitespace / format characters right next to them.
+    #[test]
+    fn block_scan_equals_serial_unisoup() {
+        const C: &[char] = &['’', '“', '—', '…', 'é', 'Ö', '×', '÷', ' ', ' ', 'a', 's', 't', 'Z', '1', '9',
+            '.', '\'', '\n', '\r', '\t', '/', '\u{a0}', '\u{2028}', '\u{202f}', '\u{200b}', '\u{2000}', '漢'];
+        let mut seed = 4242u64;
+        for _ in 0..iters() {
+            let n = (lcg(&mut seed) % 300) as usize;
+            let t: String = (0..n).map(|_| C[(lcg(&mut seed) as usize) % C.len()]).collect();
+            check(&t);
         }
     }
 

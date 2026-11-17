@@ -3079,6 +3079,86 @@ mod perf {
         }
     }
 
+    /// Single-core stage costs of the chunk engine on a warm tokenizer.
+    #[test]
+    #[ignore]
+    fn stage_ablate() {
+        let toks = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let mut end = (300usize << 20).min(data.len());
+        while end < data.len() && data[end] & 0xC0 == 0x80 { end += 1; }
+        let b = &data[..end];
+        let n = b.len();
+        let t = Tokenizer::new(toks.split(',').next().unwrap()).unwrap();
+        let mut s = Scratch::default();
+        s.dyn_cache.claim(t.uid);
+        t.encode_range(b, 0, n, &mut s);
+        let ntok = s.out.len();
+        let mb = |dt: std::time::Duration| n as f64 / dt.as_secs_f64() / 1e6;
+        for _ in 0..2 {
+            let t0 = std::time::Instant::now();
+            let mut acc = 0usize;
+            blockscan::chunks_batched(t.kind, b, 0, n, |_, ends| { acc += ends.len(); });
+            println!("scan only            {:6.0} MB/s ({acc} chunks, {:.2} B/chunk, {:.3} tok/chunk)", mb(t0.elapsed()), n as f64 / acc as f64, ntok as f64 / acc as f64);
+            let t0 = std::time::Instant::now();
+            let mut acc = 0u64;
+            blockscan::chunks_batched(t.kind, b, 0, n, |first, ends| {
+                let mut a = first;
+                for &e in ends {
+                    let len = e - a;
+                    if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                        let (lo, hi) = unsafe { chunk_table::pack_wide(b.as_ptr().add(a), len) };
+                        acc = acc.wrapping_add(chunk_table::hash(lo, hi));
+                    }
+                    a = e;
+                }
+            });
+            println!("scan+key+hash        {:6.0} MB/s ({acc})", mb(t0.elapsed()));
+            let t0 = std::time::Instant::now();
+            let mut acc = 0u64;
+            blockscan::chunks_batched(t.kind, b, 0, n, |first, ends| {
+                let mut a = first;
+                for &e in ends {
+                    let len = e - a;
+                    if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                        let (lo, hi) = unsafe { chunk_table::pack_wide(b.as_ptr().add(a), len) };
+                        let h = chunk_table::hash(lo, hi) | 1;
+                        acc = acc.wrapping_add(t.chunk_table.get_h(lo, hi, h).unwrap_or(7) as u64);
+                    }
+                    a = e;
+                }
+            });
+            println!("scan+vocab probe     {:6.0} MB/s ({acc})", mb(t0.elapsed()));
+            s.out.clear();
+            let t0 = std::time::Instant::now();
+            t.encode_range(b, 0, n, &mut s);
+            println!("full engine          {:6.0} MB/s", mb(t0.elapsed()));
+        }
+        println!("chunk table: {} slots x {} B", t.chunk_table.slots(), t.chunk_table.entry_bytes());
+        // block statistics + ASCII-only variant
+        let mut nb = 0usize; let mut nbad = 0usize;
+        let mut i = 0usize;
+        let mut carry = blockscan::Carry::default();
+        while i + 64 <= n { let (_, bad, c) = blockscan::block(t.kind, b, i, carry); carry = c; nb += 1; if bad != 0 { nbad += 1; } i += 64; }
+        let nonascii = b.iter().filter(|&&x| x >= 0x80).count();
+        println!("blocks {nb} | with BAD bits {:.1}% | non-ASCII bytes {:.2}%", nbad as f64 / nb as f64 * 100.0, nonascii as f64 / n as f64 * 100.0);
+        let a: Vec<u8> = b.iter().map(|&x| if x >= 0x80 { b'q' } else { x }).collect();
+        for _ in 0..2 {
+            let t0 = std::time::Instant::now();
+            let mut acc = 0usize;
+            blockscan::chunks_batched(t.kind, &a, 0, n, |_, ends| { acc += ends.len(); });
+            println!("scan only, ASCII-fied {:6.0} MB/s", mb(t0.elapsed()));
+            let t0 = std::time::Instant::now();
+            let mut i = 0usize; let mut carry = blockscan::Carry::default(); let mut acc = 0u64;
+            while i + 64 <= n { let (st, bad, c) = blockscan::block(t.kind, &a, i, carry); carry = c; acc = acc.wrapping_add(st ^ bad); i += 64; }
+            println!("block() only, ASCII   {:6.0} MB/s ({acc})", mb(t0.elapsed()));
+            let t0 = std::time::Instant::now();
+            let mut i = 0usize; let mut acc = 0u64;
+            while i + 64 <= n { let c = blockscan::classify(&a, i); acc = acc.wrapping_add(c.l ^ c.sp ^ c.d ^ c.na); i += 64; }
+            println!("classify() only       {:6.0} MB/s ({acc})", mb(t0.elapsed()));
+        }
+    }
+
     /// Cold vs warm learning cost on one big blob: merges per call by thread count.
     #[test]
     #[ignore]

@@ -131,6 +131,11 @@ impl ChunkTable {
         self.get_h(lo, hi, hash(lo, hi))
     }
 
+    #[cfg(test)]
+    pub fn slots(&self) -> usize { self.entries.len() }
+    #[cfg(test)]
+    pub fn entry_bytes(&self) -> usize { std::mem::size_of_val(&self.entries[0]) }
+
     /// Hint the first slot a lookup with hash `h` reads into cache.
     #[inline(always)]
     pub fn prefetch_h(&self, h: u64) {
