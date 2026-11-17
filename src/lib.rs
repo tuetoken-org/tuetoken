@@ -3234,6 +3234,10 @@ mod perf {
             let mut i = 0usize; let mut acc = 0u64;
             while i + 64 <= n { let c = blockscan::classify(&a, i); acc = acc.wrapping_add(c.l ^ c.sp ^ c.d ^ c.na); i += 64; }
             println!("classify() only       {:6.0} MB/s ({acc})", mb(t0.elapsed()));
+            let t0 = std::time::Instant::now();
+            let mut i = 0usize; let mut carry = blockscan::Carry::default(); let mut acc = 0u64;
+            while i + 64 <= n { let (st, bad, c) = blockscan::block(t.kind, b, i, carry); carry = c; acc = acc.wrapping_add(st ^ bad); i += 64; }
+            println!("block() only, REAL    {:6.0} MB/s ({acc})", mb(t0.elapsed()));
         }
     }
 
