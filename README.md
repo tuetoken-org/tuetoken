@@ -105,9 +105,11 @@ out  = enc.encode_ordinary_to_buffer(docs)          # or [data] for one big docu
 ids, offsets = out["data"], out["offsets"]           # doc i = ids[offsets[i]:offsets[i+1]]
 ```
 
-Chunks the vocabulary can't answer directly are merged once and remembered in a
-cache shared by all threads (grows on demand, 128 MB cap by default):
-`enc.set_cache_limit_mb(512)`, `enc.cache_limit_mb`, `enc.learned_entries`.
+Every chunk is resolved with one probe into a table shared by all threads: it
+starts with the vocabulary's own chunks, and anything else is merged once and
+added (grows on demand, 128 MB cap by default; longer results go to a side map
+of up to a quarter of that): `enc.set_cache_limit_mb(512)`, `enc.cache_limit_mb`,
+`enc.learned_entries`.
 
 ## Coverage
 

@@ -99,12 +99,9 @@ impl ChunkTable {
         let dense = DENSE.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         let dense = false;
-        // Load factor <= 1/4 while the table stays small (<= 8 MiB, i.e. in L2):
-        // fewer displaced keys -> fewer unpredictable probe-loop branches
-        // (+5-7% single-core encode on GPT-2 vs <= 1/2). Large vocabularies keep
-        // <= 1/2 so the table doesn't outgrow the cache.
-        let fits = |cap: usize| cap * std::mem::size_of::<Entry>() <= 8 << 20;
-        let spread = if fits((pairs.len() * 4).next_power_of_two()) { 4 } else { 2 };
+        // Load factor <= 1/2. (The hot loop now probes the shared table, which
+        // is seeded with these same entries; this table is the exact fallback.)
+        let spread = 2usize;
         while if dense { cap * 3 < pairs.len() * 4 } else { cap < pairs.len() * spread } {
             cap <<= 1;
         }
@@ -141,14 +138,6 @@ impl ChunkTable {
     pub fn slots(&self) -> usize { self.entries.len() }
     #[cfg(test)]
     pub fn entry_bytes(&self) -> usize { std::mem::size_of_val(&self.entries[0]) }
-
-    /// Hint the first slot a lookup with hash `h` reads into cache.
-    #[inline(always)]
-    pub fn prefetch_h(&self, h: u64) {
-        let i = (h >> self.shift) as usize & self.mask;
-        // SAFETY: i <= mask < entries.len().
-        prefetch(unsafe { self.entries.as_ptr().add(i) } as *const u8);
-    }
 
     #[inline(always)]
     pub fn get_h(&self, lo: u64, hi: u64, h: u64) -> Option<u32> {

@@ -908,6 +908,14 @@ impl Tokenizer {
             ids.iter().filter_map(|&id| one(&mut s, id)).collect()
         };
         let table = chunk_table::ChunkTable::build(&pairs);
+        // Seed the shared table with the same verified single-token entries,
+        // so the hot loop resolves EVERY cached chunk with one probe into one
+        // table (vocabulary + learned) instead of vocab-table-then-learned:
+        // +13% single core, +9% all threads (warm, GPT-2, OpenWebText).
+        for &(k, v) in &pairs {
+            let (lo, hi) = chunk_table::pack(k);
+            self.learned.put(lo, hi, chunk_table::hash(lo, hi) | 1, &[v]);
+        }
         drop(pairs);
         self.chunk_table = table;
     }
@@ -1175,9 +1183,8 @@ impl Tokenizer {
         // more than its prefetch lead saves below ~1 KB.
         if pipe && stop - start >= PIPE_MIN_BYTES {
             // Two-phase pipeline: phase 1 buffers ~512 chunks (several blocks)
-            // with their keys built and BOTH table slots (vocabulary table and
-            // shared learned table) prefetched; phase 2 resolves them in order
-            // with a branch-light store. Each lookup gets hundreds of ns of lead
+            // with their keys built and their table slot prefetched; phase 2
+            // resolves them in order with a branch-light store. Each lookup gets hundreds of ns of lead
             // time, enough to hide even a DRAM miss in the learned table.
             // (+18-28% single-core on OpenWebText vs resolving immediately.)
             const CAP: usize = 512;
@@ -1191,17 +1198,14 @@ impl Tokenizer {
                 s.out.reserve(3 * buf.len() + 16);
                 let mut w = s.out.len();
                 let mut dst = s.out.as_mut_ptr();
+                // One probe per chunk into the unified table (vocabulary entries
+                // seeded at load + everything learned); a miss (or an entry
+                // too long for it) takes the exact path.
                 for (k, &(a, e, lo, hi, h)) in buf.iter().enumerate() {
                     if h != 0 {
-                        if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
-                            // SAFETY: capacity >= w + remaining entries.
-                            unsafe { dst.add(w).write(t) };
-                            w += 1;
-                            continue;
-                        }
                         if let Some((ts, c)) = self.learned.get(lo, hi, h) {
                             if c <= 3 {
-                                // SAFETY: capacity >= w + 3 * remaining entries (reserved below).
+                                // SAFETY: capacity >= w + 3 * remaining entries (reserved).
                                 unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
                                 w += c;
                                 continue;
@@ -1226,7 +1230,6 @@ impl Tokenizer {
                         // SAFETY: a + 16 <= n.
                         let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(a), len) };
                         let h = chunk_table::hash(lo, hi) | 1;
-                        self.chunk_table.prefetch_h(h);
                         self.learned.prefetch(h);
                         (a, e, lo, hi, h)
                     } else {
@@ -2211,7 +2214,9 @@ impl Tokenizer {
         self.spill.set_limit((mb << 20) / 4);
     }
 
-    /// Number of chunk encodings learned so far (approximate under concurrency).
+    /// Entries in the shared chunk table: the vocabulary's single-token chunks
+    /// (seeded at load) plus every encoding learned since (approximate under
+    /// concurrency).
     #[getter]
     fn learned_entries(&self) -> usize {
         self.learned.len()
@@ -2843,6 +2848,7 @@ mod perf {
     }
 
     pub static NO_PIPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 
     /// Profiling loop: pipelined chunk engine only, warm, repeated.
     #[test]
