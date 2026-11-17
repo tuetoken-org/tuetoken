@@ -1215,7 +1215,7 @@ impl Tokenizer {
             const CAP: usize = 512;
             // Uninitialized: entries are written before they are read, and
             // zero-filling ~23 KB per call would dominate short inputs.
-            let mut buf = [std::mem::MaybeUninit::<(usize, usize, u64, u64, u64)>::uninit(); CAP + 72];
+            let mut buf = [std::mem::MaybeUninit::<(usize, usize, u64, u64, u64)>::uninit(); CAP + blockscan::SCAN_SLACK];
             let mut cnt = 0usize;
             // Each record holds the home-slot ADDRESS (0 = no key) of the table
             // view the batch was built with, so phase 2 needn't recompute it.
@@ -1249,6 +1249,63 @@ impl Tokenizer {
                 unsafe { s.out.set_len(w) };
             };
             let bp = bytes.as_ptr();
+            #[cfg(test)]
+            let batched = !perf::NO_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            let batched = true;
+            if batched && n <= u32::MAX as usize {
+                // Batch: the scanner writes ~CAP chunk ends into one array; the
+                // fill is then ONE straight-line loop over the batch (bounds
+                // check hoisted per batch, length check as a select), and
+                // phase 2 probes the batch.
+                let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
+                let mut scan = blockscan::Scan::new(start);
+                let mut a = start;
+                loop {
+                    let k = scan.fill(self.kind, bytes, stop, &mut ends, 0, CAP);
+                    if k == 0 {
+                        break;
+                    }
+                    let view = self.learned.view();
+                    let bufp = buf.as_mut_ptr();
+                    let (n, bp) = (n, bp);
+                    let last = ends[k - 1] as usize;
+                    if last + 16 <= n {
+                        for (c, &e) in ends[..k].iter().enumerate() {
+                            let e = e as usize;
+                            let len = e - a;
+                            // SAFETY: a < e <= last, so a + 16 <= n.
+                            let (lo, hi) = unsafe { chunk_table::pack_wide_any(bp.add(a), len) };
+                            let p = view.slot_addr(chunk_table::hash(lo, hi));
+                            chunk_table::prefetch(p as *const u8);
+                            let ok = len.wrapping_sub(1) < chunk_table::MAX_KEY;
+                            let p = std::hint::select_unpredictable(ok, p, 0);
+                            // SAFETY: k <= CAP + SCAN_SLACK <= buf.len().
+                            unsafe { (*bufp.add(c)).write((a, e, lo, hi, p)) };
+                            a = e;
+                        }
+                    } else {
+                        for (c, &e) in ends[..k].iter().enumerate() {
+                            let e = e as usize;
+                            let len = e - a;
+                            let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                                // SAFETY: a + 16 <= n.
+                                let (lo, hi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
+                                let p = view.slot_addr(chunk_table::hash(lo, hi));
+                                chunk_table::prefetch(p as *const u8);
+                                (a, e, lo, hi, p)
+                            } else {
+                                (a, e, 0, 0, 0)
+                            };
+                            // SAFETY: as above.
+                            unsafe { (*bufp.add(c)).write(v) };
+                            a = e;
+                        }
+                    }
+                    flush(&buf[..k], s, view);
+                }
+                return;
+            }
             blockscan::chunks_batched(self.kind, bytes, start, stop, |first, ends| {
                 // Locals, so the loop keeps them in registers: a captured
                 // `cnt` was loaded/stored through memory for every chunk (a
@@ -2968,6 +3025,37 @@ mod perf {
     }
 
     pub static NO_PIPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub static NO_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[test]
+    #[ignore]
+    fn ab_scan() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let b = &data[..300 << 20];
+        for p in path.split(',') {
+            let t = Tokenizer::new(p).unwrap();
+            let mut s = Scratch::default();
+            s.dyn_cache.claim(t.uid);
+            t.encode_range(b, 0, b.len(), &mut s);
+            let mut best = [f64::MAX; 2];
+            let mut outs: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+            for round in 0..12 {
+                let v = round % 2;
+                NO_SCAN.store(v == 1, Relaxed);
+                s.out.clear();
+                let t0 = std::time::Instant::now();
+                t.encode_range(b, 0, b.len(), &mut s);
+                best[v] = best[v].min(t0.elapsed().as_secs_f64());
+                if round < 2 { outs[v] = s.out.clone(); }
+            }
+            NO_SCAN.store(false, Relaxed);
+            assert!(outs[0] == outs[1], "output differs");
+            println!("{:28} batched+straight-line fill {:.0} MB/s | per-block {:.0} MB/s", p.rsplit('/').nth(2).unwrap_or(p).chars().take(28).collect::<String>(),
+                b.len() as f64 / best[0] / 1e6, b.len() as f64 / best[1] / 1e6);
+        }
+    }
 
 
     /// Profiling loop: pipelined chunk engine only, warm, repeated.
