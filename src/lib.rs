@@ -557,6 +557,62 @@ thread_local! {
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
+/// A batch input item: a Python `str`, or `bytes` holding UTF-8 text. Both are
+/// borrowed without a copy (a `str` exposes its cached UTF-8; `bytes` its
+/// buffer), so a multi-GB `bytes` read straight from a file costs nothing to
+/// pass in — whereas a non-ASCII `str` must first be encoded to UTF-8 by Python
+/// on one thread.
+#[derive(FromPyObject)]
+enum TextArg {
+    Str(PyBackedStr),
+    Bytes(pyo3::pybacked::PyBackedBytes),
+}
+
+/// Borrow every item as `&str`. `bytes` items must be valid UTF-8 (the same
+/// requirement a `str` has); large ones are validated in parallel, split at
+/// character boundaries (a byte that is not 10xxxxxx starts a char).
+fn texts_as_str(items: &[TextArg]) -> PyResult<Vec<&str>> {
+    fn validate(b: &[u8]) -> bool {
+        const PIECE: usize = 1 << 20;
+        if b.len() < 4 * PIECE || !parallel_ok() {
+            return std::str::from_utf8(b).is_ok();
+        }
+        let mut cuts = vec![0usize];
+        let mut p = PIECE;
+        while p < b.len() {
+            while p < b.len() && b[p] & 0xC0 == 0x80 {
+                p += 1;
+            }
+            cuts.push(p);
+            p += PIECE;
+        }
+        cuts.push(b.len());
+        cuts.dedup();
+        cuts.par_windows(2).all(|w| std::str::from_utf8(&b[w[0]..w[1]]).is_ok())
+    }
+    fn one((i, t): (usize, &TextArg)) -> PyResult<&str> {
+        match t {
+            TextArg::Str(s) => Ok(&**s),
+            TextArg::Bytes(b) => {
+                let bytes: &[u8] = b;
+                if validate(bytes) {
+                    // SAFETY: validated as UTF-8 just above.
+                    Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
+                } else {
+                    Err(PyValueError::new_err(format!("item {i}: bytes are not valid UTF-8")))
+                }
+            }
+        }
+    }
+    // many items: validate them in parallel too (a 200 MB batch of small docs
+    // would otherwise be checked serially on the calling thread)
+    if items.len() >= 64 && parallel_ok() {
+        items.par_iter().enumerate().with_min_len(32).map(one).collect()
+    } else {
+        items.iter().enumerate().map(one).collect()
+    }
+}
+
 /// Output of `Tokenizer::encode_flat`: task buffers in document order, plus
 /// tokens per document.
 struct Flat {
@@ -1172,9 +1228,13 @@ impl Tokenizer {
             // Static miss: reuse the key for the per-thread cache, then merge.
             if s.dyn_cache.owned_by(self.uid) {
                 if let Some(ts) = s.dyn_cache.get(lo, hi) {
+                    #[cfg(test)]
+                    perf::DYN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     s.out.extend_from_slice(ts); // disjoint field borrows
                     return;
                 }
+                #[cfg(test)]
+                perf::MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let st = s.out.len();
                 self.process_chunk(&bytes[pos..end], s, Merge::Auto);
                 let (out, dc) = (&s.out, &mut s.dyn_cache);
@@ -2097,18 +2157,18 @@ impl Tokenizer {
     fn encode_ordinary_batch<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyBackedStr>,
+        texts: Vec<TextArg>,
         num_threads: usize,
-    ) -> Bound<'py, PyList> {
-        let flat = py.detach(|| self.encode_flat(&texts, num_threads));
-        self.flat_to_pylists(py, &flat)
+    ) -> PyResult<Bound<'py, PyList>> {
+        let flat = py.detach(|| -> PyResult<Flat> { Ok(self.encode_flat(&texts_as_str(&texts)?, num_threads)) })?;
+        Ok(self.flat_to_pylists(py, &flat))
     }
 
 
     /// Token counts for many texts, in parallel (no Python list of ids built).
     #[pyo3(signature = (texts, num_threads = 0))]
-    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<PyBackedStr>, num_threads: usize) -> Vec<usize> {
-        py.detach(|| self.encode_flat(&texts, num_threads).doc_counts)
+    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<TextArg>, num_threads: usize) -> PyResult<Vec<usize>> {
+        py.detach(|| Ok(self.encode_flat(&texts_as_str(&texts)?, num_threads).doc_counts))
     }
 
     /// Training-loader helper: encode `texts` and return a fixed-width, padded
@@ -2183,12 +2243,12 @@ impl Tokenizer {
     fn encode_ordinary_to_buffer<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyBackedStr>,
+        texts: Vec<TextArg>,
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         // Encode in parallel (GIL released) into a few contiguous task buffers,
         // then scatter them in parallel straight into a numpy-owned bytearray.
-        let flat = py.detach(|| self.encode_flat(&texts, num_threads));
+        let flat = py.detach(|| -> PyResult<Flat> { Ok(self.encode_flat(&texts_as_str(&texts)?, num_threads)) })?;
         let mut offsets = Vec::with_capacity(flat.doc_counts.len() + 1);
         offsets.push(0i64);
         let mut total = 0usize;
@@ -2432,6 +2492,57 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod perf {
     use super::*;
+    pub static MERGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static DYN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[test]
+    #[ignore]
+    fn dyn_cache_smoke() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+        let text = " xyzzyplughq".repeat(1000) + "                ";
+        let mut s = Scratch::default();
+        s.dyn_cache.claim(t.uid);
+        MERGES.store(0, Relaxed);
+        DYN_HITS.store(0, Relaxed);
+        t.encode_range(text.as_bytes(), 0, text.len(), &mut s);
+        println!("owned_by={} merges={} dyn_hits={} tokens={}", s.dyn_cache.owned_by(t.uid),
+            MERGES.load(Relaxed), DYN_HITS.load(Relaxed), s.out.len());
+    }
+
+    /// Multi-thread run over a document file (`<|endoftext|>`-separated), like a
+    /// data-prep job: throughput and per-thread cache miss rate, cold pass then
+    /// warm pass. `TUETOKEN_DOCS=owt.txt TUETOKEN_TOKENIZERS=gpt2.json`
+    #[test]
+    #[ignore]
+    fn mt_docs() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let path = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read_to_string(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let docs: Vec<&str> = data.split("<|endoftext|>").filter(|d| !d.is_empty()).collect();
+        let t = Tokenizer::new(path.split(',').next().unwrap()).unwrap();
+        let mut chunks_est = 0usize;
+        let nthreads: usize = std::env::var("TUETOKEN_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        for pass in 0..2 {
+            MERGES.store(0, Relaxed);
+            DYN_HITS.store(0, Relaxed);
+            let t0 = std::time::Instant::now();
+            let flat = t.encode_flat(&docs, nthreads);
+            let dt = t0.elapsed().as_secs_f64();
+            let toks: usize = flat.doc_counts.iter().sum();
+            if pass == 0 {
+                chunks_est = toks; // ~1.09 tokens per chunk; tokens as the denominator
+            }
+            println!(
+                "pass {pass}: {:.2} GB/s ({} docs, {:.2} GB, {toks} tokens) | per-thread cache hits {:.2}% | merges {:.3}% of tokens",
+                data.len() as f64 / dt / 1e9, docs.len(), data.len() as f64 / 1e9,
+                DYN_HITS.load(Relaxed) as f64 / chunks_est as f64 * 100.0,
+                MERGES.load(Relaxed) as f64 / chunks_est as f64 * 100.0
+            );
+        }
+    }
+
     /// Interleaved A/B of the load-time table's load factor (<=50% vs <=75%):
     /// two tokenizers built in one process, encodes alternated so background
     /// load hits both equally.

@@ -195,6 +195,10 @@ pub struct DynCache {
     bits: u32, // log2(sets); 0 = not allocated yet
     evictions: usize,
     arena: Vec<u32>,
+    // Spilled entries record the arena generation they were written in; when
+    // the arena fills it is cleared and the generation bumped, which retires
+    // those entries WITHOUT wiping the rest of the cache.
+    arena_gen: u32,
     epoch: u64,
     tag: u32, // current owner tag (24 bits), 0 = unclaimed
 }
@@ -240,6 +244,9 @@ impl DynCache {
             if x.lo == lo && x.hi == hi && (x.meta & !0xFF) == self.tag && x.meta != 0 {
                 let n = x.meta & 0xFF;
                 if n == SPILL {
+                    if x.toks[2] != self.arena_gen {
+                        return None; // retired with an older arena
+                    }
                     let (off, len) = (x.toks[0] as usize, x.toks[1] as usize);
                     return self.arena.get(off..off + len);
                 }
@@ -269,10 +276,15 @@ impl DynCache {
             toks.len() as u32
         } else {
             if self.arena.len() + toks.len() > ARENA_CAP {
-                self.wipe();
+                self.arena.clear();
+                self.arena_gen = self.arena_gen.wrapping_add(1);
+                if self.arena_gen == 0 {
+                    self.wipe(); // generation wrapped: retire everything to stay exact
+                }
             }
             t[0] = self.arena.len() as u32;
             t[1] = toks.len() as u32;
+            t[2] = self.arena_gen;
             self.arena.extend_from_slice(toks);
             SPILL
         };
