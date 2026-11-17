@@ -1,11 +1,11 @@
 # tuetoken
 
-**The fastest tokenizer for modern LLMs, up to 30x faster.**
+**The fastest tokenizer for modern LLMs: 5.3 GB/s, up to 49x faster than tiktoken and 114x faster than 🤗 tokenizers.**
 
 tuetoken is a BPE tokenizer with a fast, safe Rust core. It is a drop-in replacement
 for 🤗 `transformers.AutoTokenizer`: it loads any model's own `tokenizer.json` and
 reproduces tokenization exactly (special tokens, chat templates, padding/truncation),
-up to 30x faster. It also loads OpenAI/tiktoken encodings natively, and
+up to 13x faster (8.8x on chat templates). It also loads OpenAI/tiktoken encodings natively, and
 its O(n) merger stays fast even on adversarial inputs (hashes, base64, minified code)
 where other tokenizers degrade to O(n²).
 
@@ -37,6 +37,20 @@ maturin develop --release
 
 ![Performances](https://raw.githubusercontent.com/tuetoken-org/tuetoken/main/bench_tokenizers.png)
 
+| tuetoken speedup (o200k_base, Apple M4 Max, 14 cores) | vs tiktoken | vs 🤗 tokenizers / transformers |
+|---|---|---|
+| Corpus encode, 1 GB, all cores (5.3 GB/s) | **49x** | **114x** |
+| Corpus encode, 1 thread (567 MB/s) | 18x | 85x |
+| Single prompt, 128 B to 128 KB (p50) | 4-7x | 29-61x |
+| Batch of documents to `list[list[int]]` | 5x | 11x |
+| Decode (p50) | 2x | 7x |
+| `AutoTokenizer`: `tok(texts)` / chat template | | 13x / 8.8x |
+
+Token ids are identical across all three libraries. Every number uses text the
+tokenizer has not seen before, and corpus runs start a fresh process (no warm
+caches). Reproduce with `python tools/bench/bench.py corpus.txt && python tools/bench/plot.py`
+(raw numbers in `tools/bench/results.json`).
+
 ## Drop-in `AutoTokenizer`
 
 The full 🤗 API, byte-exact with `transformers.AutoTokenizer`:
@@ -61,7 +75,7 @@ This matches `transformers.AutoTokenizer` token-for-token across byte-level mode
 ## OpenAI / tiktoken encodings
 
 tuetoken loads OpenAI's encodings natively, with no `tiktoken` dependency, and is
-faster than tiktoken itself, by up to an order of magnitude on long inputs:
+faster than tiktoken itself: 4-7x on a single prompt and up to 49x on a whole corpus:
 
 ```python
 from tuetoken import Tokenizer
