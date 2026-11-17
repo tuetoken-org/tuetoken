@@ -1484,18 +1484,18 @@ impl Tokenizer {
         let ic_ptr = SendPtr(item_counts.as_mut_ptr());
         let counts: Vec<AtomicU64> = (0..ntask).map(|_| AtomicU64::new(UNK)).collect();
         let incl: Vec<AtomicU64> = (0..ntask).map(|_| AtomicU64::new(UNK)).collect();
-        let written: Vec<AtomicBool> = (0..ntask).map(|_| AtomicBool::new(false)).collect();
+        // placed[k]: task k's tokens are (being) copied into the final buffer;
+        // claimed with a swap so exactly one thread places each task
+        let placed: Vec<AtomicBool> = (0..ntask).map(|_| AtomicBool::new(false)).collect();
         // per-task stash slots (no shared lock): output of tasks whose offset
         // wasn't known yet when they finished
         let stash: Vec<OnceLock<Vec<u32>>> = (0..ntask).map(|_| OnceLock::new()).collect();
         let next = AtomicUsize::new(0);
 
-        // offset of task k, or None if a predecessor is still running (after a spin)
+        // offset of task k, or None if a predecessor is still running
         let look_back = |k: usize| -> Option<u64> {
             let mut sum = 0u64;
             let mut j = k;
-            let mut spins = 0u32;
-            let mut started: Option<std::time::Instant> = None;
             while j > 0 {
                 let i = j - 1;
                 let p = incl[i].load(Acquire);
@@ -1504,17 +1504,9 @@ impl Tokenizer {
                 }
                 let c = counts[i].load(Acquire);
                 if c == UNK {
-                    // the predecessor is still running: it started before us and
-                    // a task is ~64 KB of work, so wait briefly (~50 us)
-                    spins += 1;
-                    if spins % 256 == 0 {
-                        let t0 = *started.get_or_insert_with(std::time::Instant::now);
-                        if t0.elapsed() > std::time::Duration::from_micros(50) {
-                            return None;
-                        }
-                    }
-                    std::hint::spin_loop();
-                    continue;
+                    // a predecessor is still running: never wait for it (a spin
+                    // here cost ~20% at 14 threads); park instead
+                    return None;
                 }
                 sum += c;
                 j = i;
@@ -1522,6 +1514,22 @@ impl Tokenizer {
             Some(sum)
         };
 
+        // Copy parked task k (claimed by the caller) to its final offset, which
+        // must be known: incl[k-1] set (or k == 0). Returns false if it isn't
+        // placeable (offset unknown or over the cap); then the final pass does it.
+        let place = |k: usize| -> bool {
+            let base = if k == 0 { 0 } else { incl[k - 1].load(Acquire) };
+            let v = stash[k].get().expect("parked");
+            if base == UNK || base as usize + v.len() > cap {
+                placed[k].store(false, Release);
+                return false;
+            }
+            incl[k].store(base + v.len() as u64, Release);
+            // SAFETY: [base, base+len) is task k's exclusive range within cap;
+            // the claim on placed[k] makes this the only writer.
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out_ptr.get().add(base as usize), v.len()) };
+            true
+        };
         let worker = || {
             self.with_scratch(|s| {
                 let saved = std::mem::take(&mut s.out);
@@ -1543,23 +1551,41 @@ impl Tokenizer {
                     if !want_output {
                         continue;
                     }
-                    match look_back(k) {
-                        Some(base) => {
+                    // Place this task's tokens if its offset is already known
+                    // (every predecessor finished); never wait for a predecessor.
+                    let mut ready = false;
+                    if let Some(base) = look_back(k) {
+                        if (base + cnt) as usize <= cap {
                             incl[k].store(base + cnt, Release);
-                            if (base + cnt) as usize <= cap {
-                                // SAFETY: [base, base+cnt) is this task's exclusive
-                                // range of the final buffer and lies within `cap`.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(s.out.as_ptr(), out_ptr.get().add(base as usize), s.out.len())
-                                };
-                                written[k].store(true, Relaxed);
-                            } else {
-                                let _ = stash[k].set(s.out.clone());
-                            }
+                            // SAFETY: [base, base+cnt) is this task's exclusive range
+                            // of the final buffer and lies within `cap`.
+                            unsafe { std::ptr::copy_nonoverlapping(s.out.as_ptr(), out_ptr.get().add(base as usize), s.out.len()) };
+                            placed[k].store(true, Release);
+                            ready = true;
                         }
-                        None => {
-                            let _ = stash[k].set(s.out.clone());
+                    }
+                    if !ready {
+                        // park the tokens (by move, no copy) for a successor-helper
+                        // or the final pass
+                        let c = s.out.capacity();
+                        let _ = stash[k].set(std::mem::replace(&mut s.out, Vec::with_capacity(c)));
+                        // a predecessor may have finished meanwhile without seeing our stash
+                        if look_back(k).is_some() && !placed[k].swap(true, AcqRel) {
+                            place(k);
+                        } else {
+                            continue;
                         }
+                    }
+                    // help forward: place parked successors whose offset is now known
+                    let mut j = k + 1;
+                    while j < ntask && stash[j].get().is_some() && !placed[j].load(Acquire) {
+                        if placed[j].swap(true, AcqRel) {
+                            break;
+                        }
+                        if !place(j) {
+                            break;
+                        }
+                        j += 1;
                     }
                 }
                 s.out = saved;
@@ -1594,9 +1620,9 @@ impl Tokenizer {
         let stashed: Vec<(usize, Vec<u32>)> =
             stash.into_iter().enumerate().filter_map(|(k, v)| v.into_inner().map(|v| (k, v))).collect();
         if total <= cap {
-            // place stashed outputs in parallel (disjoint ranges)
+            // place the still-parked outputs in parallel (disjoint ranges)
             let dst = SendPtr(out.as_mut_ptr());
-            stashed.par_iter().for_each(|(k, v)| {
+            stashed.par_iter().filter(|(k, _)| !placed[*k].load(Relaxed)).for_each(|(k, v)| {
                 // SAFETY: task k's range [pref[k], pref[k]+len) is within cap and
                 // was not written by anyone else.
                 unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), dst.get().add(pref[*k]), v.len()) };
@@ -1616,7 +1642,7 @@ impl Tokenizer {
             match by_task[k] {
                 Some(v) => exact.extend_from_slice(v),
                 None => {
-                    debug_assert!(written[k].load(Relaxed));
+                    debug_assert!(placed[k].load(Relaxed));
                     // SAFETY: task k was copied into out[pref[k]..pref[k+1]] (< cap).
                     let src = unsafe { std::slice::from_raw_parts(out.as_ptr().add(pref[k]), pref[k + 1] - pref[k]) };
                     exact.extend_from_slice(src);
