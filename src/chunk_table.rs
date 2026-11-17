@@ -62,9 +62,21 @@ pub unsafe fn pack_wide(p: *const u8, len: usize) -> (u64, u64) {
     // one 16-byte load, keep the first `len` bytes (branch-free; len <= 15 so the
     // shift is < 128)
     let raw = u128::from_le((p as *const u128).read_unaligned());
-    let k = raw & ((1u128 << (8 * len)) - 1);
+    // mask from a 16-entry table: one load instead of a variable 128-bit shift
+    // (which compiles to ~9 instructions with selects on AArch64)
+    let k = raw & *KEY_MASK.get_unchecked(len);
     (k as u64, ((k >> 64) as u64) | ((len as u64) << 56))
 }
+
+static KEY_MASK: [u128; 16] = {
+    let mut m = [0u128; 16];
+    let mut i = 1;
+    while i < 16 {
+        m[i] = (1u128 << (8 * i)) - 1;
+        i += 1;
+    }
+    m
+};
 
 /// Portable read-prefetch hint (no-op where unsupported).
 #[inline(always)]
@@ -522,6 +534,50 @@ const PROBE_MAX: usize = 32;
 pub const SPILLED: usize = 63;
 const SHARED_MIN_BITS: u32 = 14;
 
+/// See [`SharedTable::view`].
+#[derive(Clone, Copy)]
+pub struct View<'a, const W: usize> {
+    base: *const SSlot<W>,
+    mask: usize,
+    shift: u32,
+    _t: std::marker::PhantomData<&'a ()>,
+}
+
+impl View<'_, 3> {
+    /// Hot-loop lookup: Some((tokens, count)) only for a published entry of
+    /// 1..=3 inline tokens; anything else (miss, spilled marker) is None.
+    /// All fields of the home slot are loaded unconditionally and checked with
+    /// ONE combined test — key equal, and meta == 2 | n << 2 with n in 1..=3
+    /// (i.e. `meta & !0b1100 == 2`) — instead of a branch per field.
+    #[inline(always)]
+    pub fn get_inline(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; 3], usize)> {
+        let mut i = (h >> self.shift) as usize;
+        for _ in 0..PROBE_MAX {
+            // SAFETY: i <= mask < table length; the table outlives the view.
+            let s = unsafe { &*self.base.add(i) };
+            let m = s.meta.load(Ordering::Acquire);
+            let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+            let t = [s.toks[0].load(Ordering::Relaxed), s.toks[1].load(Ordering::Relaxed), s.toks[2].load(Ordering::Relaxed)];
+            if (l ^ lo) | (g ^ hi) | ((m & !0b1100) ^ 2) as u64 == 0 && m >= 4 {
+                return Some((t, (m >> 2) as usize));
+            }
+            if m == 0 || (l == lo && g == hi) {
+                return None; // empty slot, or our key with a non-inline entry
+            }
+            i = (i + 1) & self.mask;
+        }
+        None
+    }
+}
+
+impl<const W: usize> View<'_, W> {
+    #[inline(always)]
+    pub fn prefetch(&self, h: u64) {
+        // SAFETY: (h >> shift) < 2^bits == table length.
+        prefetch(unsafe { self.base.add((h >> self.shift) as usize) } as *const u8);
+    }
+}
+
 /// Grow-only, lock-free table of LEARNED chunk encodings (multi-token results
 /// the load-time table can't hold), shared by every thread using a tokenizer.
 /// `W` = tokens stored inline per entry.
@@ -590,11 +646,16 @@ impl<const W: usize> SharedTable<W> {
         self.table().count.0.load(Ordering::Relaxed)
     }
 
-    /// Hint the slot a lookup with hash `h` reads first into cache.
+    /// A view of the current table for a batch of lookups: ONE acquire load of
+    /// the table pointer instead of one per lookup, and base/mask/shift held in
+    /// registers. Using a view that a concurrent growth has since replaced is
+    /// safe and exact: old tables stay allocated until the tokenizer drops,
+    /// slots are write-once, so a stale view can only MISS an entry (and the
+    /// caller then takes the exact path).
     #[inline(always)]
-    pub fn prefetch(&self, h: u64) {
+    pub fn view(&self) -> View<'_, W> {
         let t = self.table();
-        prefetch(t.slot((h >> t.shift) as usize) as *const SSlot<W> as *const u8);
+        View { base: t.ptr as *const SSlot<W>, mask: t.mask, shift: t.shift, _t: std::marker::PhantomData }
     }
 
     #[inline(always)]

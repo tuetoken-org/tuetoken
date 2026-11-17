@@ -1190,7 +1190,7 @@ impl Tokenizer {
             const CAP: usize = 512;
             // Uninitialized: entries are written before they are read, and
             // zero-filling ~23 KB per call would dominate short inputs.
-            let mut buf = [std::mem::MaybeUninit::<(usize, usize, u64, u64, u64)>::uninit(); CAP + 64];
+            let mut buf = [std::mem::MaybeUninit::<(usize, usize, u64, u64, u64)>::uninit(); CAP + 72];
             let mut cnt = 0usize;
             let flush = |buf: &[std::mem::MaybeUninit<(usize, usize, u64, u64, u64)>], s: &mut Scratch| {
                 // SAFETY: callers pass only the first `cnt` entries, all written.
@@ -1198,23 +1198,22 @@ impl Tokenizer {
                 s.out.reserve(3 * buf.len() + 16);
                 let mut w = s.out.len();
                 let mut dst = s.out.as_mut_ptr();
+                let view = self.learned.view();
                 // One probe per chunk into the unified table (vocabulary entries
                 // seeded at load + everything learned); a miss (or an entry
                 // too long for it) takes the exact path.
                 for (k, &(a, e, lo, hi, h)) in buf.iter().enumerate() {
                     if h != 0 {
-                        if let Some((ts, c)) = self.learned.get(lo, hi, h) {
-                            if c <= 3 {
-                                // SAFETY: capacity >= w + 3 * remaining entries (reserved).
-                                unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
-                                w += c;
-                                continue;
-                            }
+                        if let Some((ts, c)) = view.get_inline(lo, hi, h) {
+                            // SAFETY: capacity >= w + 3 * remaining entries (reserved).
+                            unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
+                            w += c;
+                            continue;
                         }
                     }
                     // SAFETY: [0, w) initialized.
                     unsafe { s.out.set_len(w) };
-                    self.emit_chunk(bytes, a, e, n, s);
+                    self.emit_chunk_cold(bytes, a, e, n, s);
                     s.out.reserve(3 * (buf.len() - k) + 16);
                     w = s.out.len();
                     dst = s.out.as_mut_ptr();
@@ -1222,22 +1221,34 @@ impl Tokenizer {
                 // SAFETY: [0, w) initialized.
                 unsafe { s.out.set_len(w) };
             };
+            let bp = bytes.as_ptr();
             blockscan::chunks_batched(self.kind, bytes, start, stop, |first, ends| {
+                // Locals, so the loop keeps them in registers: a captured
+                // `cnt` was loaded/stored through memory for every chunk (a
+                // store-to-load forwarding chain), and the table header was
+                // re-read (one acquire load + 2 dependent loads) per chunk.
+                let view = self.learned.view();
+                let mut c = cnt;
                 let mut a = first;
+                let bufp = buf.as_mut_ptr();
                 for &e in ends {
                     let len = e - a;
-                    buf[cnt] = std::mem::MaybeUninit::new(if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                    let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
                         // SAFETY: a + 16 <= n.
-                        let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(a), len) };
+                        let (lo, hi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
                         let h = chunk_table::hash(lo, hi) | 1;
-                        self.learned.prefetch(h);
+                        view.prefetch(h);
                         (a, e, lo, hi, h)
                     } else {
                         (a, e, 0, 0, 0)
-                    });
-                    cnt += 1;
+                    };
+                    // SAFETY: c < CAP when a block starts and a block yields at
+                    // most 65 ends, so c < CAP + 65 <= buf.len() (CAP + 72).
+                    unsafe { (*bufp.add(c)).write(v) };
+                    c += 1;
                     a = e;
                 }
+                cnt = c;
                 if cnt >= CAP {
                     flush(&buf[..cnt], s);
                     cnt = 0;
@@ -1253,6 +1264,14 @@ impl Tokenizer {
                 a = e;
             }
         });
+    }
+
+    /// Out-of-line `emit_chunk` for the hot loop's miss path, so the hot loop
+    /// doesn't carry the merge/cache code (and its register pressure) inline.
+    #[cold]
+    #[inline(never)]
+    fn emit_chunk_cold(&self, bytes: &[u8], pos: usize, end: usize, n: usize, s: &mut Scratch) {
+        self.emit_chunk(bytes, pos, end, n, s);
     }
 
     /// Encode one pre-token chunk [pos, end) (Merge::Auto): load-time table,
