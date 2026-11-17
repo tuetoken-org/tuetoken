@@ -654,7 +654,7 @@ pub fn block(kind: Pretok, b: &[u8], base: usize, c: Carry) -> Block {
 /// boundaries of repeated `next_chunk_end`.
 #[inline(always)]
 pub fn chunks_batched(kind: Pretok, b: &[u8], start: usize, stop: usize, mut fb: impl FnMut(usize, &[usize])) {
-    let mut ends = [0usize; 65];
+    let mut ends = [0usize; 72]; // 64 ends + 8 slots of flattening slack
     let mut pos = start;
     let mut base = start;
     // the scan start is a known boundary: no context, forced start at bit 0
@@ -673,15 +673,26 @@ pub fn chunks_batched(kind: Pretok, b: &[u8], start: usize, stop: usize, mut fb:
         let mut trusted = starts & !bad & lim_mask & above0;
         let bad = bad & lim_mask;
         if bad & above0 == 0 {
-            // common case: every boundary in this block is trusted
+            // common case: every boundary in this block is trusted. Flatten the
+            // bitmask simdjson-style: 8 positions per round written
+            // unconditionally (slots past the count are garbage, overwritten
+            // or ignored), so the only branches are on the count, not per bit.
             let first = pos;
+            let cnt = trusted.count_ones() as usize;
             let mut k = 0usize;
-            while trusted != 0 {
-                let end = base + trusted.trailing_zeros() as usize;
-                trusted &= trusted - 1;
-                ends[k] = end;
-                k += 1;
-                pos = end;
+            loop {
+                for j in 0..8 {
+                    ends[k + j] = base + trusted.trailing_zeros() as usize;
+                    trusted &= trusted.wrapping_sub(1);
+                }
+                k += 8;
+                if k >= cnt {
+                    break;
+                }
+            }
+            k = cnt;
+            if k > 0 {
+                pos = ends[k - 1];
             }
             if lim == stop && pos < stop {
                 ends[k] = stop;
