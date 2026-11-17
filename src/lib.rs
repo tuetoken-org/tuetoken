@@ -1148,11 +1148,75 @@ impl Tokenizer {
     #[inline]
     fn encode_range(&self, bytes: &[u8], start: usize, stop: usize, s: &mut Scratch) {
         let n = bytes.len();
-        // 64-byte block scanner (identical boundaries, see blockscan.rs); each
-        // chunk is resolved immediately. (Batching a block's lookups and
-        // prefetching them one block ahead measured ~30% SLOWER on Apple M4:
-        // the out-of-order core already overlaps the probes, and the batch
-        // bookkeeping only adds work.)
+        // 64-byte block scanner (identical boundaries, see blockscan.rs).
+        #[cfg(test)]
+        let pipe = !perf::NO_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let pipe = true;
+        if pipe {
+            // Two-phase pipeline: phase 1 buffers ~512 chunks (several blocks)
+            // with their keys built and BOTH table slots (vocabulary table and
+            // shared learned table) prefetched; phase 2 resolves them in order
+            // with a branch-light store. Each lookup gets hundreds of ns of lead
+            // time, enough to hide even a DRAM miss in the learned table.
+            // (+18-28% single-core on OpenWebText vs resolving immediately.)
+            const CAP: usize = 512;
+            let mut buf = [(0usize, 0usize, 0u64, 0u64, 0u64); CAP + 64];
+            let mut cnt = 0usize;
+            let flush = |buf: &[(usize, usize, u64, u64, u64)], s: &mut Scratch| {
+                s.out.reserve(3 * buf.len() + 16);
+                let mut w = s.out.len();
+                let mut dst = s.out.as_mut_ptr();
+                for (k, &(a, e, lo, hi, h)) in buf.iter().enumerate() {
+                    if h != 0 {
+                        if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
+                            // SAFETY: capacity >= w + remaining entries.
+                            unsafe { dst.add(w).write(t) };
+                            w += 1;
+                            continue;
+                        }
+                        if let Some((ts, c)) = self.learned.get(lo, hi, h) {
+                            // SAFETY: capacity >= w + 3 * remaining entries (reserved below).
+                            unsafe { (dst.add(w) as *mut [u32; 3]).write_unaligned(ts) };
+                            w += c;
+                            continue;
+                        }
+                    }
+                    // SAFETY: [0, w) initialized.
+                    unsafe { s.out.set_len(w) };
+                    self.emit_chunk(bytes, a, e, n, s);
+                    s.out.reserve(3 * (buf.len() - k) + 16);
+                    w = s.out.len();
+                    dst = s.out.as_mut_ptr();
+                }
+                // SAFETY: [0, w) initialized.
+                unsafe { s.out.set_len(w) };
+            };
+            blockscan::chunks_batched(self.kind, bytes, start, stop, |first, ends| {
+                let mut a = first;
+                for &e in ends {
+                    let len = e - a;
+                    buf[cnt] = if len.wrapping_sub(1) < chunk_table::MAX_KEY && a + 16 <= n {
+                        // SAFETY: a + 16 <= n.
+                        let (lo, hi) = unsafe { chunk_table::pack_wide(bytes.as_ptr().add(a), len) };
+                        let h = chunk_table::hash(lo, hi) | 1;
+                        self.chunk_table.prefetch_h(h);
+                        self.learned.prefetch(h);
+                        (a, e, lo, hi, h)
+                    } else {
+                        (a, e, 0, 0, 0)
+                    };
+                    cnt += 1;
+                    a = e;
+                }
+                if cnt >= CAP {
+                    flush(&buf[..cnt], s);
+                    cnt = 0;
+                }
+            });
+            flush(&buf[..cnt], s);
+            return;
+        }
         blockscan::chunks_batched(self.kind, bytes, start, stop, |first, ends| {
             let mut a = first;
             for &e in ends {
@@ -2651,6 +2715,57 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod perf {
     use super::*;
+    pub static NO_PIPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Profiling loop: pipelined chunk engine only, warm, repeated.
+    #[test]
+    #[ignore]
+    fn pipe_loop() {
+        let toks = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let mut end = (300usize << 20).min(data.len());
+        while end < data.len() && data[end] & 0xC0 == 0x80 { end += 1; }
+        let b = &data[..end];
+        let t = Tokenizer::new(toks.split(',').next().unwrap()).unwrap();
+        let mut s = Scratch::default();
+        s.dyn_cache.claim(t.uid);
+        for _ in 0..6 {
+            s.out.clear();
+            t.encode_range(b, 0, b.len(), &mut s);
+        }
+    }
+
+    /// Interleaved A/B: pipelined chunk resolution vs immediate.
+    #[test]
+    #[ignore]
+    fn ab_pipe() {
+        let toks = std::env::var("TUETOKEN_TOKENIZERS").expect("set TUETOKEN_TOKENIZERS");
+        let data = std::fs::read(std::env::var("TUETOKEN_DOCS").expect("set TUETOKEN_DOCS")).unwrap();
+        let mut end = (300usize << 20).min(data.len());
+        while end < data.len() && data[end] & 0xC0 == 0x80 { end += 1; }
+        let b = &data[..end];
+        for path in toks.split(',') {
+            let t = Tokenizer::new(path).unwrap();
+            let mut s = Scratch::default();
+            s.dyn_cache.claim(t.uid);
+            let mut best = [f64::MAX; 2];
+            let mut outs: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+            for round in 0..8 {
+                let v = round % 2;
+                NO_PIPE.store(v == 1, std::sync::atomic::Ordering::Relaxed);
+                s.out.clear();
+                let t0 = std::time::Instant::now();
+                t.encode_range(b, 0, b.len(), &mut s);
+                best[v] = best[v].min(t0.elapsed().as_secs_f64());
+                if round < 2 { outs[v] = s.out.clone(); }
+            }
+            NO_PIPE.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(outs[0] == outs[1], "pipelined output differs");
+            println!("{:45} pipelined {:6.1} MB/s | immediate {:6.1} MB/s",
+                path.rsplit('/').nth(1).unwrap_or(path), b.len() as f64 / best[0] / 1e6, b.len() as f64 / best[1] / 1e6);
+        }
+    }
+
     pub static MERGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub static DYN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2678,12 +2793,15 @@ mod perf {
     #[test]
     #[ignore]
     fn unit_proto() {
+        // 32-byte slot: 16-byte key + count + 3 inline tokens (96.6% of unit hits);
+        // longer results spill to an arena (count = SPILL, toks = [offset, len, _])
+        const SPILL: u32 = u32::MAX;
         #[derive(Clone, Copy, Default)]
-        #[repr(C, align(64))]
-        struct Slot { lo: u64, hi: u64, n: u32, toks: [u32; 11] }
-        struct UTable { e: Vec<Slot>, mask: usize, shift: u32, len: usize }
+        #[repr(C, align(32))]
+        struct Slot { lo: u64, hi: u64, n: u32, toks: [u32; 3] }
+        struct UTable { e: Vec<Slot>, mask: usize, shift: u32, len: usize, arena: Vec<u32> }
         impl UTable {
-            fn new(bits: u32) -> Self { UTable { e: vec![Slot::default(); 1 << bits], mask: (1 << bits) - 1, shift: 64 - bits, len: 0 } }
+            fn new(bits: u32) -> Self { UTable { e: vec![Slot::default(); 1 << bits], mask: (1 << bits) - 1, shift: 64 - bits, len: 0, arena: Vec::new() } }
             #[inline(always)]
             fn get(&self, lo: u64, hi: u64, h: u64) -> Option<&Slot> {
                 let mut i = (h >> self.shift) as usize;
@@ -2695,12 +2813,19 @@ mod perf {
                 }
             }
             fn put(&mut self, lo: u64, hi: u64, h: u64, t: &[u32]) {
-                if t.len() > 11 || self.len * 2 > self.e.len() { return; }
+                if t.is_empty() || t.len() > 64 || self.len * 2 > self.e.len() { return; }
                 let mut i = (h >> self.shift) as usize;
                 while self.e[i].hi != 0 { i = (i + 1) & self.mask; }
-                let mut toks = [0u32; 11];
-                toks[..t.len()].copy_from_slice(t);
-                self.e[i] = Slot { lo, hi, n: t.len() as u32, toks };
+                let (n, toks) = if t.len() <= 3 {
+                    let mut toks = [0u32; 3];
+                    toks[..t.len()].copy_from_slice(t);
+                    (t.len() as u32, toks)
+                } else {
+                    let off = self.arena.len() as u32;
+                    self.arena.extend_from_slice(t);
+                    (SPILL, [off, t.len() as u32, 0])
+                };
+                self.e[i] = Slot { lo, hi, n, toks };
                 self.len += 1;
             }
             #[inline(always)]
@@ -2743,7 +2868,10 @@ mod perf {
         sref.dyn_cache.claim(t.uid);
         t.encode_range(b, 0, n, &mut sref);
         let want = std::mem::take(&mut sref.out);
-        let mut table = UTable::new(22); // 16M slots x 64 B = 1 GiB virtual, lazily touched
+        let mut table = UTable::new(23);
+        let mut hist = [0usize; 12];
+        let admit = std::env::var("ADMIT").is_ok();
+        let mut seen = vec![0u64; 1 << 20]; // 2^26-bit "seen once" filter (8 MiB) // 16M slots x 64 B = 1 GiB virtual, lazily touched
         for pass in 0..3 {
             let mut s = Scratch::default();
             s.dyn_cache.claim(t.uid);
@@ -2788,14 +2916,17 @@ mod perf {
                     let (lo, hi, h) = keys[j];
                     if h != 0 {
                         if let Some(x) = table.get(lo, hi, h) {
-                            if x.n <= 4 {
-                                unsafe { (dst.add(w) as *mut [u32; 4]).write_unaligned([x.toks[0], x.toks[1], x.toks[2], x.toks[3]]) };
+                            if x.n <= 3 {
+                                hist[x.n as usize] += 1;
+                                unsafe { (dst.add(w) as *mut [u32; 4]).write_unaligned([x.toks[0], x.toks[1], x.toks[2], 0]) };
                                 w += x.n as usize;
                                 pos = q;
                                 continue;
                             }
+                            let (off, len) = (x.toks[0] as usize, x.toks[1] as usize);
+                            hist[len.min(11)] += 1;
                             unsafe { s.out.set_len(w) };
-                            s.out.extend_from_slice(&x.toks[..x.n as usize]);
+                            s.out.extend_from_slice(&table.arena[off..off + len]);
                             s.out.reserve(4 * (k - j) + 16);
                             w = s.out.len();
                             dst = s.out.as_mut_ptr();
@@ -2812,7 +2943,16 @@ mod perf {
                         t.emit_chunk(b, p, e, n, &mut s);
                         p = e;
                     }
-                    if h != 0 { let r = s.out[st..].to_vec(); table.put(lo, hi, h, &r); }
+                    if h != 0 {
+                        // admission: store a unit only on its second sighting
+                        let bit = (h >> 38) as usize;
+                        let (wi, bi) = (bit >> 6, bit & 63);
+                        if !admit || seen[wi] >> bi & 1 == 1 {
+                            table.put(lo, hi, h, &s.out[st..]);
+                        } else {
+                            seen[wi] |= 1 << bi;
+                        }
+                    }
                     pos = q;
                     s.out.reserve(4 * (k - j) + 16);
                     w = s.out.len();
@@ -2833,6 +2973,39 @@ mod perf {
                 if pass == 0 { "cold" } else { "warm" }, n as f64 / dt / 1e6, units,
                 misses as f64 / units as f64 * 100.0, table.len);
         }
+        {
+            // ablation on the warm table: 0 = boundaries only, 1 = + keys/hash/prefetch, 2 = + probe
+            for stage in 0..3 {
+                let t0 = std::time::Instant::now();
+                let (mut acc, mut pos, mut i) = (0u64, 0usize, 1usize);
+                while i + 64 <= n {
+                    let mut m = unit_mask(b, i);
+                    let mut a = pos;
+                    while m != 0 {
+                        let q = i + m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let len = q - a;
+                        if stage >= 1 && len <= chunk_table::MAX_KEY && a + 16 <= n {
+                            let (lo, hi) = unsafe { chunk_table::pack_wide(b.as_ptr().add(a), len) };
+                            let h = chunk_table::hash(lo, hi) | 1;
+                            table.prefetch(h);
+                            acc = acc.wrapping_add(h);
+                            if stage >= 2 {
+                                if let Some(x) = table.get(lo, hi, h) { acc = acc.wrapping_add(x.toks[0] as u64); }
+                            }
+                        }
+                        acc = acc.wrapping_add(q as u64);
+                        a = q;
+                    }
+                    pos = a;
+                    i += 64;
+                }
+                println!("  ablation stage {stage} ({}): {:.0} MB/s ({acc})",
+                    ["boundaries", "+key/hash/prefetch", "+probe (no emit)"][stage], n as f64 / t0.elapsed().as_secs_f64() / 1e6);
+            }
+        }
+        let tot: usize = hist.iter().sum();
+        println!("unit hits by token count: {}", (1..12).map(|k| format!("{k}:{:.1}%", hist[k] as f64 / tot as f64 * 100.0)).collect::<Vec<_>>().join(" "));
         let mut s = Scratch::default();
         s.dyn_cache.claim(t.uid);
         t.encode_range(b, 0, n, &mut s);

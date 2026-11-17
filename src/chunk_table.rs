@@ -131,6 +131,14 @@ impl ChunkTable {
         self.get_h(lo, hi, hash(lo, hi))
     }
 
+    /// Hint the first slot a lookup with hash `h` reads into cache.
+    #[inline(always)]
+    pub fn prefetch_h(&self, h: u64) {
+        let i = (h >> self.shift) as usize & self.mask;
+        // SAFETY: i <= mask < entries.len().
+        prefetch(unsafe { self.entries.as_ptr().add(i) } as *const u8);
+    }
+
     #[inline(always)]
     pub fn get_h(&self, lo: u64, hi: u64, h: u64) -> Option<u32> {
         let mut i = (h >> self.shift) as usize;
