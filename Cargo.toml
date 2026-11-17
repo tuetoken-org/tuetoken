@@ -16,6 +16,8 @@ pyo3 = { version = "0.28" }
 serde_json = "1"
 rayon = "1"
 rustc-hash = "2"
+# SIMD UTF-8 validation of bytes inputs (NEON / AVX2 / SSE4.2, scalar fallback).
+simdutf8 = "0.1"
 # Universal pre-tokenizer fallback for ByteLevel Split patterns the hand-written
 # machines don't recognize (supports the lookarounds the std `regex` crate can't).
 # Same engine family HF tokenizers / tiktoken use. Only on the slow path.

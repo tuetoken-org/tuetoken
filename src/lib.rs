@@ -595,11 +595,36 @@ impl<'a, 'py> FromPyObject<'a, 'py> for TextArg {
 /// Borrow every item as `&str`. `bytes` items must be valid UTF-8 (the same
 /// requirement a `str` has); large ones are validated in parallel, split at
 /// character boundaries (a byte that is not 10xxxxxx starts a char).
+/// A batch input: text already known to be UTF-8, or `bytes` whose validation
+/// is deferred to the worker that encodes them (see `Tokenizer::encode_src`).
+#[derive(Clone, Copy)]
+enum Src<'a> {
+    Str(&'a str),
+    Raw(&'a [u8]),
+}
+
+/// Inputs for the batch engine. With `lazy` (models without a normalizer),
+/// `bytes` items are NOT validated here: each worker validates the slice it
+/// is about to encode, so the input is read once instead of twice (an
+/// up-front pass over a 2 GB `bytes` was ~10% of a one-call encode).
+fn texts_as_src(items: &[TextArg], lazy: bool) -> PyResult<Vec<Src<'_>>> {
+    if lazy {
+        return Ok(items
+            .iter()
+            .map(|t| match t {
+                TextArg::Str(s) => Src::Str(&**s),
+                TextArg::Bytes(b) => Src::Raw(&**b),
+            })
+            .collect());
+    }
+    Ok(texts_as_str(items)?.into_iter().map(Src::Str).collect())
+}
+
 fn texts_as_str(items: &[TextArg]) -> PyResult<Vec<&str>> {
     fn validate(b: &[u8]) -> bool {
         const PIECE: usize = 1 << 20;
         if b.len() < 4 * PIECE || !parallel_ok() {
-            return std::str::from_utf8(b).is_ok();
+            return simdutf8::basic::from_utf8(b).is_ok();
         }
         let mut cuts = vec![0usize];
         let mut p = PIECE;
@@ -612,7 +637,7 @@ fn texts_as_str(items: &[TextArg]) -> PyResult<Vec<&str>> {
         }
         cuts.push(b.len());
         cuts.dedup();
-        cuts.par_windows(2).all(|w| std::str::from_utf8(&b[w[0]..w[1]]).is_ok())
+        cuts.par_windows(2).all(|w| simdutf8::basic::from_utf8(&b[w[0]..w[1]]).is_ok())
     }
     fn one((i, t): (usize, &TextArg)) -> PyResult<&str> {
         match t {
@@ -1453,27 +1478,41 @@ impl Tokenizer {
     /// Returns (normalized docs, items (doc, start, end, is_segment), tasks
     /// (first item, end item, bytes)).
     #[allow(clippy::type_complexity)]
-    fn plan<'t, T: AsRef<str> + Sync>(
+    #[allow(clippy::type_complexity)]
+    fn plan<'t>(
         &self,
-        texts: &'t [T],
+        texts: &[Src<'t>],
         num_threads: usize,
-    ) -> (Vec<std::borrow::Cow<'t, str>>, Vec<(u32, usize, usize, bool)>, Vec<(usize, usize, usize)>) {
+    ) -> (Vec<std::borrow::Cow<'t, [u8]>>, Vec<(u32, usize, usize, bool)>, Vec<(usize, usize, usize)>) {
+        use std::borrow::Cow;
         const SEG: usize = 1 << 16;
         const TASK_BYTES: usize = 1 << 16;
         let splittable = self.splittable();
-        let norm: Vec<std::borrow::Cow<'t, str>> = if self.norm_form == 0 {
-            texts.iter().map(|t| std::borrow::Cow::Borrowed(t.as_ref())).collect()
+        let to_bytes = |c: Cow<'t, str>| -> Cow<'t, [u8]> {
+            match c {
+                Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+                Cow::Owned(s) => Cow::Owned(s.into_bytes()),
+            }
+        };
+        let as_str = |t: &Src<'t>| -> &'t str {
+            match *t {
+                Src::Str(s) => s,
+                Src::Raw(_) => unreachable!("unvalidated bytes reach plan() only without a normalizer"),
+            }
+        };
+        let norm: Vec<Cow<'t, [u8]>> = if self.norm_form == 0 {
+            texts.iter().map(|t| Cow::Borrowed(match *t { Src::Str(s) => s.as_bytes(), Src::Raw(b) => b })).collect()
         } else {
             // quick-check is ~free on ASCII; only rare runs allocate
             if num_threads == 1 || !parallel_ok() {
-                texts.iter().map(|t| self.normalize(t.as_ref())).collect()
+                texts.iter().map(|t| to_bytes(self.normalize(as_str(t)))).collect()
             } else {
-                texts.par_iter().with_min_len(64).map(|t| self.normalize(t.as_ref())).collect()
+                texts.par_iter().with_min_len(64).map(|t| to_bytes(self.normalize(as_str(t)))).collect()
             }
         };
         let mut items: Vec<(u32, usize, usize, bool)> = Vec::with_capacity(texts.len());
         for (i, d) in norm.iter().enumerate() {
-            let b = d.as_bytes();
+            let b: &[u8] = d;
             if splittable && b.len() >= SPLIT_MIN {
                 let pts = Self::split_points(b, SEG);
                 for w in pts.windows(2) {
@@ -1499,16 +1538,24 @@ impl Tokenizer {
         (norm, items, tasks)
     }
 
-    /// Encode one item into `s.out` (appends).
+    /// Encode one item into `s.out` (appends). An item of an unvalidated
+    /// document is validated first (it is about to be read anyway); false if it
+    /// is not valid UTF-8. Items split a document only before an ASCII byte, so
+    /// the document is valid iff every item is.
     #[inline]
-    fn encode_item(&self, norm: &[std::borrow::Cow<'_, str>], item: (u32, usize, usize, bool), s: &mut Scratch) {
+    fn encode_item(&self, norm: &[std::borrow::Cow<'_, [u8]>], trusted: &[bool], item: (u32, usize, usize, bool), s: &mut Scratch) -> bool {
         let (doc, a, b, seg) = item;
-        let d: &str = &norm[doc as usize];
-        if seg {
-            self.encode_range(d.as_bytes(), a, b, s);
-        } else {
-            self.encode_into_norm(d, Merge::Auto, true, s);
+        let d: &[u8] = &norm[doc as usize];
+        if !trusted[doc as usize] && simdutf8::basic::from_utf8(&d[a..b]).is_err() {
+            return false;
         }
+        if seg {
+            self.encode_range(d, a, b, s);
+        } else {
+            // SAFETY: trusted (from a str) or validated just above (whole doc).
+            self.encode_into_norm(unsafe { std::str::from_utf8_unchecked(d) }, Merge::Auto, true, s);
+        }
+        true
     }
 
     /// The batch engine: one flat output in document order, plus tokens per
@@ -1529,9 +1576,26 @@ impl Tokenizer {
     /// final buffer is sized by an estimate (tokens <= bytes / 2 + slack); if a
     /// pathological input exceeds it, the output is assembled exactly anyway.
     /// `want_output = false` only counts (no output buffer at all).
+    /// Batch entry for Python inputs: `bytes` are validated lazily (per item, by
+    /// the worker) when the model has no normalizer, up front otherwise.
+    fn encode_batch_src(&self, texts: &[TextArg], num_threads: usize, want_output: bool) -> PyResult<(Vec<u32>, Vec<usize>)> {
+        let src = texts_as_src(texts, self.norm_form == 0)?;
+        self.encode_src(&src, num_threads, want_output)
+            .map_err(|i| PyValueError::new_err(format!("item {i}: bytes are not valid UTF-8")))
+    }
+
     fn encode_direct<T: AsRef<str> + Sync>(&self, texts: &[T], num_threads: usize, want_output: bool) -> (Vec<u32>, Vec<usize>) {
+        let src: Vec<Src<'_>> = texts.iter().map(|t| Src::Str(t.as_ref())).collect();
+        self.encode_src(&src, num_threads, want_output).expect("str inputs are valid UTF-8")
+    }
+
+    /// The batch engine over `Src` inputs. Err(i): item i is `bytes` that are
+    /// not valid UTF-8 (validated lazily, per item, by the encoding worker).
+    fn encode_src(&self, texts: &[Src<'_>], num_threads: usize, want_output: bool) -> Result<(Vec<u32>, Vec<usize>), usize> {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
         let (norm, items, tasks) = self.plan(texts, num_threads);
+        let trusted: Vec<bool> = texts.iter().map(|t| matches!(t, Src::Str(_)) || self.norm_form != 0).collect();
+        let bad_doc = AtomicUsize::new(usize::MAX);
         let ntask = tasks.len();
         let mut doc_counts = vec![0usize; texts.len()];
         let nt = if num_threads == 0 { rayon::current_num_threads() } else { num_threads.min(1024) };
@@ -1546,7 +1610,9 @@ impl Tokenizer {
                 }
                 for &it in &items {
                     let before = s.out.len();
-                    self.encode_item(&norm, it, s);
+                    if !self.encode_item(&norm, &trusted, it, s) {
+                        bad_doc.fetch_min(it.0 as usize, Relaxed);
+                    }
                     doc_counts[it.0 as usize] += s.out.len() - before;
                     if !want_output {
                         s.out.clear();
@@ -1554,7 +1620,11 @@ impl Tokenizer {
                 }
                 std::mem::replace(&mut s.out, saved)
             });
-            return (if want_output { out } else { Vec::new() }, doc_counts);
+            let bad = bad_doc.load(Relaxed);
+            if bad != usize::MAX {
+                return Err(bad);
+            }
+            return Ok((if want_output { out } else { Vec::new() }, doc_counts));
         }
 
         const UNK: u64 = u64::MAX;
@@ -1646,7 +1716,9 @@ impl Tokenizer {
                     s.out.clear();
                     for (ii, &it) in items[x..y].iter().enumerate() {
                         let before = s.out.len();
-                        self.encode_item(&norm, it, s);
+                        if !self.encode_item(&norm, &trusted, it, s) {
+                            bad_doc.fetch_min(it.0 as usize, Relaxed);
+                        }
                         // SAFETY: item x+ii belongs to task k only.
                         unsafe { *ic_ptr.get().add(x + ii) = (s.out.len() - before) as u32 };
                     }
@@ -1713,8 +1785,12 @@ impl Tokenizer {
         for (k, it) in items.iter().enumerate() {
             doc_counts[it.0 as usize] += item_counts[k] as usize;
         }
+        let bad = bad_doc.load(Relaxed);
+        if bad != usize::MAX {
+            return Err(bad);
+        }
         if !want_output {
-            return (Vec::new(), doc_counts);
+            return Ok((Vec::new(), doc_counts));
         }
         // final offsets of every task
         let mut pref = Vec::with_capacity(ntask + 1);
@@ -1742,7 +1818,7 @@ impl Tokenizer {
             // SAFETY: every task's range was written (directly or from the stash),
             // and the ranges tile [0, total).
             unsafe { out.set_len(total) };
-            return (out, doc_counts);
+            return Ok((out, doc_counts));
         }
         // estimate exceeded (pathological input): assemble an exact buffer
         let mut exact: Vec<u32> = Vec::with_capacity(total);
@@ -1761,7 +1837,7 @@ impl Tokenizer {
                 }
             }
         }
-        (exact, doc_counts)
+        Ok((exact, doc_counts))
     }
 
 
@@ -2532,7 +2608,7 @@ impl Tokenizer {
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyList>> {
         let (data, counts) =
-            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { Ok(self.encode_direct(&texts_as_str(&texts)?, num_threads, true)) })?;
+            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { self.encode_batch_src(&texts, num_threads, true) })?;
         Ok(self.data_to_pylists(py, &data, &counts))
     }
 
@@ -2540,7 +2616,7 @@ impl Tokenizer {
     /// Token counts for many texts, in parallel (no Python list of ids built).
     #[pyo3(signature = (texts, num_threads = 0))]
     fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<TextArg>, num_threads: usize) -> PyResult<Vec<usize>> {
-        py.detach(|| Ok(self.encode_direct(&texts_as_str(&texts)?, num_threads, false).1))
+        py.detach(|| self.encode_batch_src(&texts, num_threads, false).map(|r| r.1))
     }
 
     /// Training-loader helper: encode `texts` and return a fixed-width, padded
@@ -2621,7 +2697,7 @@ impl Tokenizer {
         // Encode in parallel (GIL released) into a few contiguous task buffers,
         // then scatter them in parallel straight into a numpy-owned bytearray.
         let (data, counts) =
-            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { Ok(self.encode_direct(&texts_as_str(&texts)?, num_threads, true)) })?;
+            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { self.encode_batch_src(&texts, num_threads, true) })?;
         let mut offsets = Vec::with_capacity(counts.len() + 1);
         offsets.push(0i64);
         let mut total = 0usize;

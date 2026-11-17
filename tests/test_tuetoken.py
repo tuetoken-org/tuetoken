@@ -531,12 +531,49 @@ def test_kimi_tiktoken_model():
     return ok, tot
 
 
+def test_bytes_inputs():
+    """bytes batch inputs: identical to str inputs when valid; ValueError naming
+    the (first) offending item when not — including invalid bytes deep inside a
+    large document that is split across threads."""
+    print("=== bytes inputs (lazy UTF-8 validation) ===")
+    import numpy as np
+    ok = tot = 0
+    for enc in ["gpt2", "cl100k_base"]:
+        R = tuetoken.Tokenizer.from_tiktoken(enc)
+        text = make_corpus()
+        big = (text + "\n") * max(1, (3 << 20) // max(1, len(text.encode())))  # > split threshold
+        for src in [[text], [big], [t for t in text.split("\n") if t]]:
+            bs = [s.encode() for s in src]
+            tot += 1; ok += R.count_tokens_batch(bs) == R.count_tokens_batch(src)
+            a = np.asarray(R.encode_ordinary_to_buffer(bs)["data"])
+            b = np.asarray(R.encode_ordinary_to_buffer(src)["data"])
+            tot += 1; ok += bool(np.array_equal(a, b))
+        bb = big.encode()
+        mid = len(bb) // 2
+        while bb[mid] & 0xC0 == 0x80:
+            mid += 1
+        bad_cases = [
+            ([bb[:mid] + b"\xff" + bb[mid + 1:]], 0),          # inside a split document
+            ([bb + b"\xe2\x80"], 0),                          # truncated at the very end
+            ([b"ok", b"fine", b"x\xc0\xafy", b"\x80"], 2),     # overlong; lowest index reported
+        ]
+        for inputs, idx in bad_cases:
+            for f in (R.count_tokens_batch, R.encode_ordinary_to_buffer, R.encode_ordinary_batch):
+                tot += 1
+                try:
+                    f(inputs)
+                except ValueError as e:
+                    ok += f"item {idx}:" in str(e)
+    _line("bytes inputs", ok, tot)
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
         test_hf_models(), test_failclosed(), test_normalization(),
         test_new_features(), test_rank_inversion(), test_auto(),
-        test_kimi_tiktoken_model(),
+        test_kimi_tiktoken_model(), test_bytes_inputs(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)
