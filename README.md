@@ -94,6 +94,21 @@ batch = enc.encode_batch(texts, max_length=512, pad_id=0)           # input_ids 
 ids, offsets = enc.encode_with_offsets("Hello café")                # byte spans, ByteLevel only
 ```
 
+Tokenizing a whole corpus: pass `bytes` straight from disk (no UTF-8 conversion in
+Python) and get one flat array back, built in parallel and handed to numpy without
+a copy:
+
+```python
+data = open("corpus.txt", "rb").read()
+docs = data.split(b"<|endoftext|>")
+out  = enc.encode_ordinary_to_buffer(docs)          # or [data] for one big document
+ids, offsets = out["data"], out["offsets"]           # doc i = ids[offsets[i]:offsets[i+1]]
+```
+
+Chunks the vocabulary can't answer directly are merged once and remembered in a
+cache shared by all threads (grows on demand, 128 MB cap by default):
+`enc.set_cache_limit_mb(512)`, `enc.cache_limit_mb`, `enc.learned_entries`.
+
 ## Coverage
 
 tuetoken works with essentially every modern LLM tokenizer: ByteLevel BPE (Llama,
