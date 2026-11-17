@@ -278,7 +278,7 @@ struct Ctx {
 fn resolve_na<const CONT: bool>(b: &[u8], base: usize, m: &mut Classes) -> u64 {
     let lim = (b.len() - base).min(64);
     let mut r = m.na;
-    let (mut ul, mut up, mut cont) = (0u64, 0u64, 0u64);
+    let (mut ul, mut up, mut cont, mut upper) = (0u64, 0u64, 0u64, 0u64);
     while r != 0 {
         let i = r.trailing_zeros() as usize;
         let c = b[base + i];
@@ -286,6 +286,10 @@ fn resolve_na<const CONT: bool>(b: &[u8], base: usize, m: &mut Classes) -> u64 {
             let d = b[base + i + 1];
             let w = 3u64 << i;
             if d == 0x97 || d == 0xB7 { up |= w } else { ul |= w }
+            // U+00C0..U+00DE (but not U+00D7) are uppercase (Lu)
+            if d <= 0x9E && d != 0x97 {
+                upper |= w;
+            }
             if CONT {
                 cont |= 2u64 << i;
             }
@@ -307,11 +311,13 @@ fn resolve_na<const CONT: bool>(b: &[u8], base: usize, m: &mut Classes) -> u64 {
         r &= r - 1;
     }
     m.l |= ul;
+    m.up |= upper;
     m.na &= !(ul | up);
     cont
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 fn ctx(b: &[u8], base: usize) -> Ctx {
     ctx_r(b, base, false)
 }
@@ -509,7 +515,11 @@ fn generic_block(b: &[u8], base: usize, max_digits: u32, c: Carry) -> Block {
 #[inline(always)]
 fn camel_block(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Carry) -> Block {
     let n = b.len();
-    let x = ctx(b, base);
+    // Common non-ASCII (Latin-1 letters with their case, general punctuation)
+    // is classified in-block, as for the Generic grammar: "did the previous
+    // symbol start a chunk / is it uncertain" are per-CHARACTER questions, so
+    // those bits are smeared over each resolved character's continuation bytes.
+    let x = ctx_m::<true, true>(b, base, classify(b, base));
     let (m, o) = (&x.m, x.o);
     let lw = m.l & !m.up;
     let (wsstart, wsbad, abs_nl) = ws_starts_nl(&x, &c, base, n);
@@ -577,12 +587,17 @@ fn camel_block(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Ca
         }
     }
     ostart &= !suppress;
-    let ostart_p1 = p1(ostart, c.ostart);
+    let ostart_c = ostart | ((ostart << 1) & x.cont);
+    let ostart_c = ostart_c | ((ostart_c << 1) & x.cont);
+    let ostart_p1 = p1(ostart_c, c.ostart);
     let lstart = m.l
         & (p1(m.d, c.d) | p1(m.nl, c.nl) | (p1(o, c.o) & !ostart_p1) | (m.up & p1(lw, c.lw)));
     let starts = ((ostart | lstart | dstart | wsstart) & !suppress) | c.forced | forced_in;
-    bad |= m.l & p1(o, c.o) & p1(bad, c.bad3 >> 2 & 1 == 1); // reads the O's start status
-    let mut out = carry_out(&x, ostart, abs_nl, contr_end >> 63 & 1 == 1, forced, sup_next);
+    let bad_c = bad | ((bad << 1) & x.cont);
+    let bad_c = bad_c | ((bad_c << 1) & x.cont);
+    bad |= m.l & p1(o, c.o) & p1(bad_c, c.bad3 >> 2 & 1 == 1); // reads the O's start status
+    let bad = bad | ((bad << 1) & x.cont) | ((bad << 2) & x.cont & (x.cont << 1));
+    let mut out = carry_out(&x, ostart_c, abs_nl, contr_end >> 63 & 1 == 1, forced, sup_next);
     out.contr_mask = contr_next;
     out.abs_sl = abs_sl >> 63 & 1 == 1;
     out.bad_in = bad_next;
@@ -661,6 +676,19 @@ fn word_block(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
 #[inline(never)]
 fn word_slow(b: &[u8], base: usize, indiv: bool, c: Carry, m: Classes) -> Block {
     let n = b.len();
+    // A block with non-ASCII (~20% on web text) usually has only characters
+    // the in-block resolver classifies (quotes, dashes, Latin-1 letters): then,
+    // under a clean carry, the fast rules apply to the resolved classes. This
+    // lives here, off the hot pure-ASCII path.
+    if m.na != 0 && base + 64 < n && !c.na && (c.na4 | c.bad_in | c.suppress | c.forced) == 0 {
+        let mut r = m;
+        resolve_na::<false>(b, base, &mut r);
+        if r.na == 0 {
+            if let Some(out) = word_fast(b, base, indiv, &c, &r) {
+                return out;
+            }
+        }
+    }
     let x = ctx_m::<true, false>(b, base, m);
     let (m, o) = (&x.m, x.o);
     let sp_before = p1(m.sp, c.sp);
@@ -1209,6 +1237,21 @@ mod tests {
         const C: &[char] = &['’', '“', '—', '…', 'é', 'Ö', '×', '÷', ' ', ' ', 'a', 's', 't', 'Z', '1', '9',
             '.', '\'', '\n', '\r', '\t', '/', '\u{a0}', '\u{2028}', '\u{202f}', '\u{200b}', '\u{2000}', '漢'];
         let mut seed = 4242u64;
+        for _ in 0..iters() {
+            let n = (lcg(&mut seed) % 300) as usize;
+            let t: String = (0..n).map(|_| C[(lcg(&mut seed) as usize) % C.len()]).collect();
+            check(&t);
+        }
+    }
+
+    /// Case-transition soup for the CamelCase (o200k) rules: ASCII and Latin-1
+    /// upper/lowercase letters (incl. ß, ÿ, × ÷ which are not letters) next to
+    /// apostrophes, contraction letters, '/', NLs and resolved punctuation.
+    #[test]
+    fn block_scan_equals_serial_casesoup() {
+        const C: &[char] = &['a', 'Z', 's', 'T', 'é', 'É', 'Ö', 'ø', 'ß', 'ÿ', 'À', 'Þ', '×', '÷', '\'', '’',
+            '—', ' ', ' ', '/', '\n', '1', '.', 'l', 'L', 'v', 'e', 'R', 'd', 'M'];
+        let mut seed = 31337u64;
         for _ in 0..iters() {
             let n = (lcg(&mut seed) % 300) as usize;
             let t: String = (0..n).map(|_| C[(lcg(&mut seed) as usize) % C.len()]).collect();
