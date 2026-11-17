@@ -101,10 +101,21 @@ unsafe fn classify64(p: *const u8) -> Classes {
     // shift-right-and-insert ops + one narrowing shift (5 instructions per
     // class instead of 4 AND + 4 pairwise-add + move).
     let tomask = |a: [uint8x16_t; 4]| -> u64 {
-        let t0 = vsriq_n_u8::<1>(a[1], a[0]); // bit7 = byte 4i+1, bit6 = 4i
-        let t1 = vsriq_n_u8::<1>(a[3], a[2]); // bit7 = 4i+3, bit6 = 4i+2
-        let t2 = vsriq_n_u8::<2>(t1, t0); // bits 7..4 = 4i+3 .. 4i
-        let t3 = vsriq_n_u8::<4>(t2, t2); // low nibble = high nibble
+        // Pinned with asm: LLVM rewrites the vsriq_n_u8 chain into AND/ORR with
+        // per-lane constants (8 instructions per mask instead of 4).
+        let (mut t1, mut t3) = (a[1], a[3]);
+        std::arch::asm!(
+            "sri {t1:v}.16b, {a0:v}.16b, #1",
+            "sri {t3:v}.16b, {a2:v}.16b, #1",
+            "sri {t3:v}.16b, {t1:v}.16b, #2",
+            "sri {t3:v}.16b, {t3:v}.16b, #4",
+            t1 = inout(vreg) t1,
+            t3 = inout(vreg) t3,
+            a0 = in(vreg) a[0],
+            a2 = in(vreg) a[2],
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        let _ = t1;
         let t4 = vshrn_n_u16::<4>(vreinterpretq_u16_u8(t3)); // nibble per lane, packed
         vget_lane_u64::<0>(vreinterpret_u64_u8(t4))
     };
