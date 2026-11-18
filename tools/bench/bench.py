@@ -82,6 +82,15 @@ def worker(lib, threads, path, nbytes):
         out = enc.encode_ordinary_to_buffer([raw], num_threads=threads, separator=SEP)
         dt = time.perf_counter() - t
         ntok = len(out["data"])
+    elif lib == "tuetoken_str":
+        # the same documents as a list of str (decoded before timing, like the others)
+        import tuetoken
+        enc = tuetoken.Tokenizer.from_tiktoken("o200k_base")
+        docs = [d.decode("utf-8") for d in raw.split(SEP)]
+        t = time.perf_counter()
+        out = enc.encode_ordinary_to_buffer(docs, num_threads=threads)
+        dt = time.perf_counter() - t
+        ntok = len(out["data"])
     else:
         # The others take a list of str; splitting and decoding are not timed.
         docs = [d.decode("utf-8") for d in raw.split(SEP)]
@@ -105,11 +114,11 @@ def worker(lib, threads, path, nbytes):
 
 def corpus_scaling(path, nbytes, thread_list, repeats):
     res = {}
-    for lib in ("tuetoken", "tiktoken", "hf"):
+    for lib in ("tuetoken", "tiktoken", "hf", "tuetoken_str"):
         res[lib] = []
-        for n in thread_list:
+        for n in (thread_list if lib != "tuetoken_str" else thread_list[-1:]):
             runs = []
-            for _ in range(repeats if lib == "tuetoken" else 1):
+            for _ in range(repeats if lib.startswith("tuetoken") else 1):
                 p = subprocess.run([sys.executable, __file__, "--worker", lib, str(n), path, str(nbytes)],
                                    capture_output=True, text=True, check=True)
                 runs.append(json.loads(p.stdout.strip().splitlines()[-1]))

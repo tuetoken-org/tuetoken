@@ -6,7 +6,7 @@
   "python": "3.12.9",
   "encoding": "o200k_base",
   "versions": {
-   "tuetoken": "0.1.7",
+   "tuetoken": "0.1.8",
    "tiktoken": "0.14.0",
    "tokenizers": "0.23.3",
    "transformers": "5.23.0"
@@ -18,97 +18,104 @@
    "tuetoken": [
     {
      "threads": 1,
-     "mbps": 566.9,
-     "tokens": null
+     "mbps": 571.7406021484124,
+     "tokens": 228133615
     },
     {
      "threads": 2,
-     "mbps": 1176.9,
-     "tokens": null
+     "mbps": 1204.242488202149,
+     "tokens": 228133615
     },
     {
      "threads": 4,
-     "mbps": 2214.5,
-     "tokens": null
+     "mbps": 2298.81986611952,
+     "tokens": 228133615
     },
     {
      "threads": 8,
-     "mbps": 4048.8,
-     "tokens": null
+     "mbps": 4157.472898954154,
+     "tokens": 228133615
     },
     {
      "threads": 10,
-     "mbps": 4880.2,
-     "tokens": null
+     "mbps": 5007.249695899025,
+     "tokens": 228133615
     },
     {
      "threads": 14,
-     "mbps": 5293.3,
-     "tokens": null
+     "mbps": 5443.320512519578,
+     "tokens": 228133615
     }
    ],
    "tiktoken": [
     {
      "threads": 1,
-     "mbps": 32.3,
-     "tokens": null
+     "mbps": 34.18026235047697,
+     "tokens": 228133615
     },
     {
      "threads": 2,
-     "mbps": 61.8,
-     "tokens": null
+     "mbps": 63.54792190443077,
+     "tokens": 228133615
     },
     {
      "threads": 4,
-     "mbps": 104.9,
-     "tokens": null
+     "mbps": 103.96497057785292,
+     "tokens": 228133615
     },
     {
      "threads": 8,
-     "mbps": 117.7,
-     "tokens": null
+     "mbps": 113.24733093284507,
+     "tokens": 228133615
     },
     {
      "threads": 10,
-     "mbps": 114.9,
-     "tokens": null
+     "mbps": 119.41829255461442,
+     "tokens": 228133615
     },
     {
      "threads": 14,
-     "mbps": 108.8,
-     "tokens": null
+     "mbps": 103.72720944484847,
+     "tokens": 228133615
     }
    ],
    "hf": [
     {
      "threads": 1,
-     "mbps": 6.7,
-     "tokens": null
+     "mbps": 6.888704080038791,
+     "tokens": 228133615
     },
     {
      "threads": 2,
-     "mbps": 12.7,
-     "tokens": null
+     "mbps": 12.910734141679997,
+     "tokens": 228133615
     },
     {
      "threads": 4,
-     "mbps": 23.6,
-     "tokens": null
+     "mbps": 23.348246407267066,
+     "tokens": 228133615
     },
     {
      "threads": 8,
-     "mbps": 37.9,
-     "tokens": null
+     "mbps": 36.78948222107661,
+     "tokens": 228133615
     },
     {
      "threads": 10,
-     "mbps": 43.5,
-     "tokens": null
+     "mbps": 42.28335324038243,
+     "tokens": 228133615
     },
     {
      "threads": 14,
-     "mbps": 46.3,
-     "tokens": null
+     "mbps": 44.54515204147506,
+     "tokens": 228133615
+    }
+   ],
+   "tuetoken_str": [
+    {
+     "threads": 14,
+     "mbps": 3447.6,
+     "tokens": 228133615
     }
    ]
   }
@@ -116,80 +123,80 @@
  "encode_latency": [
   {
    "size": 128,
-   "tuetoken": 0.000834,
-   "tiktoken": 0.003333,
-   "hf": 0.024
+   "tuetoken": 0.000917,
+   "tiktoken": 0.003375,
+   "hf": 0.024167
   },
   {
    "size": 4096,
-   "tuetoken": 0.0131045,
-   "tiktoken": 0.0865,
-   "hf": 0.6772085
+   "tuetoken": 0.013875,
+   "tiktoken": 0.088125,
+   "hf": 0.68725
   },
   {
    "size": 32768,
-   "tuetoken": 0.096646,
-   "tiktoken": 0.6830205,
-   "hf": 5.556146
+   "tuetoken": 0.1135,
+   "tiktoken": 0.713333,
+   "hf": 5.833521
   },
   {
    "size": 131072,
-   "tuetoken": 0.384417,
-   "tiktoken": 2.717771,
-   "hf": 23.5142505
+   "tuetoken": 0.3895005,
+   "tiktoken": 2.738937,
+   "hf": 24.4788955
   }
  ],
  "batch": [
   {
    "batch": 100,
-   "tuetoken": 456.14208213669303,
-   "tiktoken": 92.16957354495088,
-   "hf": 44.31136827098771
+   "tuetoken": 408.2012108309688,
+   "tiktoken": 91.54470490440309,
+   "hf": 39.94696836367024
   },
   {
    "batch": 1000,
-   "tuetoken": 589.8325691586523,
-   "tiktoken": 111.62084733553827,
-   "hf": 49.674213171270765
+   "tuetoken": 583.8008047483185,
+   "tiktoken": 114.00897121426564,
+   "hf": 49.480148635325946
   },
   {
    "batch": 10000,
-   "tuetoken": 575.7751850616314,
-   "tiktoken": 108.53857270818821,
-   "hf": 53.79485844830162
+   "tuetoken": 682.3683309959484,
+   "tiktoken": 111.48050661928687,
+   "hf": 52.34496533035691
   }
  ],
  "decode_latency": [
   {
    "tokens": 50,
-   "tuetoken": 0.000792,
-   "tiktoken": 0.001667,
-   "hf": 0.005625
+   "tuetoken": 0.000875,
+   "tiktoken": 0.001833,
+   "hf": 0.005583
   },
   {
    "tokens": 1000,
-   "tuetoken": 0.01175,
-   "tiktoken": 0.024208,
-   "hf": 0.08875
+   "tuetoken": 0.011958,
+   "tiktoken": 0.025875,
+   "hf": 0.096042
   },
   {
    "tokens": 12000,
-   "tuetoken": 0.1453335,
-   "tiktoken": 0.2793545,
-   "hf": 1.0670205
+   "tuetoken": 0.144062,
+   "tiktoken": 0.279479,
+   "hf": 1.067771
   },
   {
    "tokens": 64000,
-   "tuetoken": 0.764083,
-   "tiktoken": 1.612604,
-   "hf": 5.771354
+   "tuetoken": 0.7775005,
+   "tiktoken": 1.567917,
+   "hf": 5.6521875
   }
  ],
  "chat": {
   "model": "Qwen/Qwen2.5-0.5B-Instruct",
-  "tuetoken": 0.017459,
-  "transformers": 0.1541665,
-  "tuetoken_batch_mbps": 431.2996290983131,
-  "transformers_batch_mbps": 34.26101791640347
+  "tuetoken": 0.0183125,
+  "transformers": 0.15825,
+  "tuetoken_batch_mbps": 357.2156960496962,
+  "transformers_batch_mbps": 29.327106029525563
  }
 }
