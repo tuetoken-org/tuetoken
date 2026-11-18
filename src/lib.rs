@@ -567,13 +567,13 @@ thread_local! {
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
-/// A batch input item: a Python `str`, or `bytes` holding UTF-8 text. Both are
-/// borrowed without a copy (a `str` exposes its cached UTF-8; `bytes` its
-/// buffer), so a multi-GB `bytes` read straight from a file costs nothing to
-/// pass in — whereas a non-ASCII `str` must first be encoded to UTF-8 by Python
-/// on one thread.
+/// A batch input item: a Python `str`, or `bytes` holding UTF-8 text. `bytes`
+/// and ASCII `str` are borrowed without a copy, so a multi-GB `bytes` read
+/// straight from a file costs nothing to pass in. A non-ASCII `str` is kept as
+/// its raw code units (`Wide`) and converted to UTF-8 by `transcode_wide`, in
+/// parallel with the GIL released.
 enum TextArg {
-    Str(PyBackedStr),
+    Str(PyText),
     Bytes(pyo3::pybacked::PyBackedBytes),
 }
 
@@ -587,9 +587,353 @@ impl<'a, 'py> FromPyObject<'a, 'py> for TextArg {
         if obj.is_instance_of::<pyo3::types::PyBytes>() || obj.is_instance_of::<pyo3::types::PyByteArray>() {
             Ok(TextArg::Bytes(obj.extract().map_err(Into::<PyErr>::into)?))
         } else {
-            Ok(TextArg::Str(obj.extract().map_err(Into::<PyErr>::into)?))
+            Ok(TextArg::Str(obj.extract()?))
         }
     }
+}
+
+/// A `str` batch item. CPython stores a non-ASCII `str` as fixed-width code
+/// units (1, 2 or 4 bytes each) and builds its UTF-8 form only on request —
+/// on the calling thread, under the GIL, caching a copy on the object. For a
+/// batch of non-ASCII documents that serial conversion cost more than the
+/// whole parallel encode (1 GB of OpenWebText: 1.9 GB/s on the first call vs
+/// 7 GB/s once Python had cached the UTF-8). So such strings are kept as their
+/// code units and converted by `transcode_wide` on all cores instead.
+/// ASCII strings, and strings whose UTF-8 Python already cached, are
+/// borrowed as UTF-8 directly.
+enum PyText {
+    Utf8(PyBackedStr),
+    Wide(WideStr),
+}
+
+/// The code units of a non-ASCII `str`; `_obj` keeps the (immutable) string
+/// and therefore `data` alive.
+struct WideStr {
+    _obj: Py<PyAny>,
+    kind: u8,
+    data: *const u8,
+    len: usize,
+}
+// SAFETY: `data` points into an immutable Python str owned by `_obj`; CPython
+// never modifies the code units of a str that has other references, so it is
+// read-only memory for as long as this value lives.
+unsafe impl Send for WideStr {}
+unsafe impl Sync for WideStr {}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for PyText {
+    type Error = PyErr;
+    fn extract(obj: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        #[cfg(not(any(PyPy, GraalPy, Py_3_14, Py_LIMITED_API, Py_GIL_DISABLED)))]
+        // SAFETY: CPython-layout accessors on an object checked to be a str.
+        unsafe {
+            use pyo3::ffi;
+            let p = obj.as_ptr();
+            if ffi::PyUnicode_Check(p) != 0
+                && ffi::PyUnicode_READY(p) == 0
+                && ffi::PyUnicode_IS_COMPACT(p) != 0
+                && ffi::PyUnicode_IS_ASCII(p) == 0
+                && (*(p as *mut ffi::PyCompactUnicodeObject)).utf8.is_null()
+            {
+                return Ok(PyText::Wide(WideStr {
+                    _obj: obj.to_owned().unbind(),
+                    kind: ffi::PyUnicode_KIND(p) as u8,
+                    data: ffi::PyUnicode_DATA(p) as *const u8,
+                    len: ffi::PyUnicode_GET_LENGTH(p) as usize,
+                }));
+            }
+        }
+        Ok(PyText::Utf8(obj.extract().map_err(Into::<PyErr>::into)?))
+    }
+}
+
+impl PyText {
+    fn wide(&self) -> Option<&WideStr> {
+        match self {
+            PyText::Wide(w) => Some(w),
+            PyText::Utf8(_) => None,
+        }
+    }
+}
+
+/// Exact UTF-8 length of `units` (a surrogate counts 3, like the 3 bytes it
+/// would take; `units_to_utf8` rejects it). Branch-free, vectorizes.
+fn utf8_len<T: Copy + Into<u32>>(units: &[T]) -> usize {
+    units
+        .iter()
+        .map(|&u| {
+            let c: u32 = u.into();
+            1 + (c >= 0x80) as usize + (c >= 0x800) as usize + (c >= 0x10000) as usize
+        })
+        .sum()
+}
+
+/// Write the UTF-8 of `units` to `dst`; Ok(bytes written) — exactly
+/// `utf8_len(units)` — or Err(i) at the first surrogate (which UTF-8 cannot
+/// encode, exactly as CPython's `str.encode` refuses). Runs of ASCII are
+/// copied a word at a time.
+/// SAFETY: `dst` must be valid for `utf8_len(units)` writes.
+unsafe fn units_to_utf8<T: Copy + Into<u32>>(units: &[T], dst: *mut u8) -> Result<usize, usize> {
+    let w = std::mem::size_of::<T>();
+    let n = units.len();
+    let mut i = 0usize;
+    let mut o = dst;
+    let src = units.as_ptr() as *const u8;
+    // ASCII fast path: 8 bytes of input per step
+    let per = 8 / w;
+    let hi: u64 = match w {
+        1 => 0x8080_8080_8080_8080,
+        2 => 0xFF80_FF80_FF80_FF80,
+        _ => 0xFFFF_FF80_FFFF_FF80,
+    };
+    while i < n {
+        if i + per <= n {
+            let x = std::ptr::read_unaligned(src.add(i * w) as *const u64);
+            if x & hi == 0 {
+                for k in 0..per {
+                    *o.add(k) = (x >> (8 * w * k)) as u8;
+                }
+                o = o.add(per);
+                i += per;
+                continue;
+            }
+        }
+        let c: u32 = units[i].into();
+        if c < 0x80 {
+            *o = c as u8;
+            o = o.add(1);
+        } else if c < 0x800 {
+            *o = 0xC0 | (c >> 6) as u8;
+            *o.add(1) = 0x80 | (c & 0x3F) as u8;
+            o = o.add(2);
+        } else if c < 0x10000 {
+            if (0xD800..0xE000).contains(&c) {
+                return Err(i);
+            }
+            *o = 0xE0 | (c >> 12) as u8;
+            *o.add(1) = 0x80 | ((c >> 6) & 0x3F) as u8;
+            *o.add(2) = 0x80 | (c & 0x3F) as u8;
+            o = o.add(3);
+        } else {
+            *o = 0xF0 | (c >> 18) as u8;
+            *o.add(1) = 0x80 | ((c >> 12) & 0x3F) as u8;
+            *o.add(2) = 0x80 | ((c >> 6) & 0x3F) as u8;
+            *o.add(3) = 0x80 | (c & 0x3F) as u8;
+            o = o.add(4);
+        }
+        i += 1;
+    }
+    Ok(o.offset_from(dst) as usize)
+}
+
+impl WideStr {
+    /// Exact UTF-8 length of code units [lo, hi).
+    fn utf8_len(&self, lo: usize, hi: usize) -> usize {
+        // SAFETY: `data` holds `len` units of `kind` bytes each (see WideStr).
+        unsafe {
+            match self.kind {
+                1 => utf8_len(&std::slice::from_raw_parts(self.data, self.len)[lo..hi]),
+                2 => utf8_len(&std::slice::from_raw_parts(self.data as *const u16, self.len)[lo..hi]),
+                _ => utf8_len(&std::slice::from_raw_parts(self.data as *const u32, self.len)[lo..hi]),
+            }
+        }
+    }
+
+    /// Write the UTF-8 of code units [lo, hi) to `dst`; Err(position) on a surrogate.
+    /// SAFETY: `dst` valid for `self.utf8_len(lo, hi)` writes.
+    unsafe fn write_utf8(&self, lo: usize, hi: usize, dst: *mut u8) -> Result<usize, usize> {
+        match self.kind {
+            1 => units_to_utf8(&std::slice::from_raw_parts(self.data, self.len)[lo..hi], dst),
+            2 => units_to_utf8(&std::slice::from_raw_parts(self.data as *const u16, self.len)[lo..hi], dst),
+            _ => units_to_utf8(&std::slice::from_raw_parts(self.data as *const u32, self.len)[lo..hi], dst),
+        }
+        .map_err(|i| lo + i)
+    }
+}
+
+/// UTF-8 views of the wide strs of a batch (in order). They point into each
+/// str's own UTF-8 cache, so they live as long as the batch's items.
+#[derive(Default)]
+struct WideCopies {
+    spans: Vec<(usize, usize)>,
+}
+// SAFETY: read-only views of immutable UTF-8 kept alive by the batch items.
+unsafe impl Send for WideCopies {}
+unsafe impl Sync for WideCopies {}
+
+impl WideCopies {
+    fn get(&self, k: usize) -> &str {
+        let (p, n) = self.spans[k];
+        // SAFETY: (p, n) is a str's cached UTF-8 (written by units_to_utf8 or
+        // by CPython), alive while the batch items are.
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p as *const u8, n)) }
+    }
+    /// `&str` of each wide item in order.
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        (0..self.spans.len()).map(move |k| self.get(k))
+    }
+}
+
+/// Give every wide str among `items` its UTF-8 form, exactly as CPython's
+/// `PyUnicode_AsUTF8AndSize` would — the bytes go into the str's own UTF-8
+/// cache, allocated with Python's allocator on this (GIL-holding) thread — but
+/// with the conversion itself done on all cores. Afterwards the strings are
+/// in the same state as after the serial CPython conversion (so a later call
+/// borrows them for free). Small batches use CPython's conversion directly.
+/// A string with a lone surrogate raises Python's own UnicodeEncodeError.
+fn transcode_wide<'a>(py: Python<'_>, items: impl Iterator<Item = Option<&'a WideStr>>, num_threads: usize) -> PyResult<WideCopies> {
+    use pyo3::ffi;
+    const BIG: usize = 4 << 20;
+    const PIECE: usize = 1 << 20;
+    let all: Vec<&WideStr> = items.flatten().collect();
+    if all.is_empty() {
+        return Ok(WideCopies::default());
+    }
+    let total: usize = all.iter().map(|w| w.len).sum();
+    let par = num_threads != 1 && total >= 1 << 16 && parallel_ok();
+    let cpython = |w: &WideStr| -> PyResult<(usize, usize)> {
+        let mut n: ffi::Py_ssize_t = 0;
+        // SAFETY: a live str object; GIL held.
+        let p = unsafe { ffi::PyUnicode_AsUTF8AndSize(w._obj.as_ptr(), &mut n) };
+        if p.is_null() {
+            Err(PyErr::fetch(py))
+        } else {
+            Ok((p as usize, n as usize))
+        }
+    };
+    if !par {
+        return Ok(WideCopies { spans: all.iter().map(|w| cpython(w)).collect::<PyResult<_>>()? });
+    }
+    // the same str object may appear many times: convert each object once
+    let mut wides: Vec<&WideStr> = Vec::with_capacity(all.len());
+    let mut uniq_of: Vec<u32> = Vec::with_capacity(all.len());
+    {
+        let mut idx: rustc_hash::FxHashMap<usize, u32> =
+            rustc_hash::FxHashMap::with_capacity_and_hasher(all.len(), Default::default());
+        for w in &all {
+            let u = *idx.entry(w._obj.as_ptr() as usize).or_insert_with(|| {
+                wides.push(w);
+                (wides.len() - 1) as u32
+            });
+            uniq_of.push(u);
+        }
+    }
+    // 1. exact UTF-8 length of each string (per 1M-unit piece for big ones)
+    let lens: Vec<Vec<usize>> = in_pool(num_threads, || {
+        wides
+            .par_iter()
+            .with_min_len(8)
+            .map(|w| {
+                if w.len >= BIG {
+                    (0..w.len.div_ceil(PIECE)).into_par_iter().map(|p| w.utf8_len(p * PIECE, ((p + 1) * PIECE).min(w.len))).collect()
+                } else {
+                    vec![w.utf8_len(0, w.len)]
+                }
+            })
+            .collect()
+    });
+    // 2. allocate each cache buffer with Python's allocator (CPython frees it
+    //    with PyObject_Free when the str dies), on this thread
+    let mut bufs: Vec<usize> = Vec::with_capacity(wides.len());
+    for l in &lens {
+        let n: usize = l.iter().sum();
+        // SAFETY: GIL held.
+        let p = unsafe { ffi::PyObject_Malloc(n + 1) } as usize;
+        if p == 0 {
+            for &q in &bufs {
+                // SAFETY: allocated above, not published.
+                unsafe { ffi::PyObject_Free(q as *mut std::ffi::c_void) };
+            }
+            return Err(pyo3::exceptions::PyMemoryError::new_err("out of memory converting str to UTF-8"));
+        }
+        bufs.push(p);
+    }
+    // 3. convert in parallel (workers only write the fresh buffers)
+    let res = in_pool(num_threads, || -> Result<(), usize> {
+        (0..wides.len()).into_par_iter().with_min_len(8).try_for_each(|k| {
+            let w = wides[k];
+            let dst = bufs[k] as *mut u8;
+            let l = &lens[k];
+            // SAFETY: piece p writes exactly l[p] bytes at its offset; the
+            // buffer holds sum(l) + 1 bytes.
+            unsafe {
+                if l.len() == 1 {
+                    w.write_utf8(0, w.len, dst).map_err(|_| k)?;
+                } else {
+                    let offs: Vec<usize> = l.iter().scan(0usize, |a, &x| { let o = *a; *a += x; Some(o) }).collect();
+                    let d = dst as usize;
+                    (0..l.len()).into_par_iter().try_for_each(|p| {
+                        w.write_utf8(p * PIECE, ((p + 1) * PIECE).min(w.len), (d as *mut u8).add(offs[p])).map(|_| ())
+                    }).map_err(|_| k)?;
+                }
+                *dst.add(l.iter().sum::<usize>()) = 0;
+            }
+            Ok(())
+        })
+    });
+    if let Err(k) = res {
+        for &q in &bufs {
+            // SAFETY: allocated above, not published.
+            unsafe { ffi::PyObject_Free(q as *mut std::ffi::c_void) };
+        }
+        // Python's own conversion raises the canonical error for this string
+        return Err(match wides[k]._obj.bind(py).extract::<PyBackedStr>() {
+            Err(e) => e,
+            Ok(_) => PyValueError::new_err("str is not encodable as UTF-8"),
+        });
+    }
+    // 4. publish into each str's UTF-8 cache, as PyUnicode_AsUTF8AndSize does
+    let mut spans_u: Vec<(usize, usize)> = Vec::with_capacity(wides.len());
+    for (k, w) in wides.iter().enumerate() {
+        let n: usize = lens[k].iter().sum();
+        // SAFETY: GIL held; a compact non-ASCII str whose cache was empty at
+        // extraction (checked in PyText::extract) and still is: nothing ran
+        // Python code since. If it was filled meanwhile, keep that one.
+        unsafe {
+            let c = w._obj.as_ptr() as *mut ffi::PyCompactUnicodeObject;
+            if (*c).utf8.is_null() {
+                (*c).utf8 = bufs[k] as *mut std::ffi::c_char;
+                (*c).utf8_length = n as ffi::Py_ssize_t;
+            } else {
+                ffi::PyObject_Free(bufs[k] as *mut std::ffi::c_void);
+            }
+            spans_u.push(((*c).utf8 as usize, (*c).utf8_length as usize));
+        }
+    }
+    Ok(WideCopies { spans: uniq_of.iter().map(|&u| spans_u[u as usize]).collect() })
+}
+
+/// Run `f` on the pool for `num_threads` (0 = the global pool).
+fn in_pool<R: Send>(num_threads: usize, f: impl FnOnce() -> R + Send) -> R {
+    match num_threads {
+        n if n > 1 => match fixed_pool(n.min(1024)) {
+            Some(pool) => pool.install(f),
+            None => f(),
+        },
+        _ => f(),
+    }
+}
+
+/// `transcode_wide` for `str` items (GIL held).
+fn wide_texts(py: Python<'_>, texts: &[PyText], num_threads: usize) -> PyResult<WideCopies> {
+    transcode_wide(py, texts.iter().map(PyText::wide), num_threads)
+}
+
+/// As `wide_texts`, for `str`-or-`bytes` items.
+fn wide_args(py: Python<'_>, texts: &[TextArg], num_threads: usize) -> PyResult<WideCopies> {
+    transcode_wide(py, texts.iter().map(TextArg::wide), num_threads)
+}
+
+/// `&str` views of `PyText` items: borrowed, or from `wide` (the
+/// `transcode_wide` output for the same items, in order).
+fn text_views<'a>(items: &'a [PyText], wide: &'a WideCopies) -> Vec<&'a str> {
+    let mut w = wide.iter();
+    items
+        .iter()
+        .map(|t| match t {
+            PyText::Utf8(s) => &**s,
+            PyText::Wide(_) => w.next().expect("one transcoded copy per wide item"),
+        })
+        .collect()
 }
 
 /// Borrow every item as `&str`. `bytes` items must be valid UTF-8 (the same
@@ -677,20 +1021,32 @@ fn split_on(b: &[u8], sep: &[u8], num_threads: usize) -> Vec<(usize, usize)> {
 /// `bytes` items are NOT validated here: each worker validates the slice it
 /// is about to encode, so the input is read once instead of twice (an
 /// up-front pass over a 2 GB `bytes` was ~10% of a one-call encode).
-fn texts_as_src(items: &[TextArg], lazy: bool) -> PyResult<Vec<Src<'_>>> {
+/// `wide`: `transcode_wide` of the items' wide strs (see `TextArg::wide`).
+fn texts_as_src<'a>(items: &'a [TextArg], wide: &'a WideCopies, lazy: bool) -> PyResult<Vec<Src<'a>>> {
     if lazy {
+        let mut w = wide.iter();
         return Ok(items
             .iter()
             .map(|t| match t {
-                TextArg::Str(s) => Src::Str(&**s),
+                TextArg::Str(PyText::Utf8(s)) => Src::Str(&**s),
+                TextArg::Str(PyText::Wide(_)) => Src::Str(w.next().expect("one copy per wide item")),
                 TextArg::Bytes(b) => Src::Raw(&**b),
             })
             .collect());
     }
-    Ok(texts_as_str(items)?.into_iter().map(Src::Str).collect())
+    Ok(texts_as_str(items, wide)?.into_iter().map(Src::Str).collect())
 }
 
-fn texts_as_str(items: &[TextArg]) -> PyResult<Vec<&str>> {
+impl TextArg {
+    fn wide(&self) -> Option<&WideStr> {
+        match self {
+            TextArg::Str(t) => t.wide(),
+            TextArg::Bytes(_) => None,
+        }
+    }
+}
+
+fn texts_as_str<'a>(items: &'a [TextArg], wide: &'a WideCopies) -> PyResult<Vec<&'a str>> {
     fn validate(b: &[u8]) -> bool {
         const PIECE: usize = 1 << 20;
         if b.len() < 4 * PIECE || !parallel_ok() {
@@ -709,9 +1065,11 @@ fn texts_as_str(items: &[TextArg]) -> PyResult<Vec<&str>> {
         cuts.dedup();
         cuts.par_windows(2).all(|w| simdutf8::basic::from_utf8(&b[w[0]..w[1]]).is_ok())
     }
+    // wide strs are already UTF-8 (in `wide`): mark their slots, fill after
     fn one((i, t): (usize, &TextArg)) -> PyResult<&str> {
         match t {
-            TextArg::Str(s) => Ok(&**s),
+            TextArg::Str(PyText::Utf8(s)) => Ok(&**s),
+            TextArg::Str(PyText::Wide(_)) => Ok(""),
             TextArg::Bytes(b) => {
                 let bytes: &[u8] = b;
                 if validate(bytes) {
@@ -725,11 +1083,18 @@ fn texts_as_str(items: &[TextArg]) -> PyResult<Vec<&str>> {
     }
     // many items: validate them in parallel too (a 200 MB batch of small docs
     // would otherwise be checked serially on the calling thread)
-    if items.len() >= 64 && parallel_ok() {
-        items.par_iter().enumerate().with_min_len(32).map(one).collect()
+    let mut out: Vec<&str> = if items.len() >= 64 && parallel_ok() {
+        items.par_iter().enumerate().with_min_len(32).map(one).collect::<PyResult<_>>()?
     } else {
-        items.iter().enumerate().map(one).collect()
+        items.iter().enumerate().map(one).collect::<PyResult<_>>()?
+    };
+    let mut w = wide.iter();
+    for (o, t) in out.iter_mut().zip(items) {
+        if t.wide().is_some() {
+            *o = w.next().expect("one copy per wide item");
+        }
     }
+    Ok(out)
 }
 
 /// A token buffer handed to numpy WITHOUT a copy: it owns the `Vec<u32>` the
@@ -883,6 +1248,12 @@ impl Tokenizer {
                 None => run(),
             }
         }
+    }
+
+    /// `par_over` for `str` batch items; `wide` = `wide_texts(texts)`.
+    fn par_texts<R: Send>(&self, num_threads: usize, texts: &[PyText], wide: &WideCopies, f: impl Fn(&str) -> R + Sync) -> Vec<R> {
+        let views = text_views(texts, wide);
+        self.par_over(num_threads, &views, |t| t.len(), |t| f(t))
     }
 
     /// Inputs shorter than this are encoded without releasing the GIL: for a
@@ -1856,19 +2227,20 @@ impl Tokenizer {
     /// `want_output = false` only counts (no output buffer at all).
     /// Batch entry for Python inputs: `bytes` are validated lazily (per item, by
     /// the worker) when the model has no normalizer, up front otherwise.
-    fn encode_batch_src(&self, texts: &[TextArg], num_threads: usize, want_output: bool) -> PyResult<(Vec<u32>, Vec<usize>)> {
-        self.encode_batch_sep(texts, num_threads, want_output, None)
+    fn encode_batch_src(&self, texts: &[TextArg], wide: &WideCopies, num_threads: usize, want_output: bool) -> PyResult<(Vec<u32>, Vec<usize>)> {
+        self.encode_batch_sep(texts, wide, num_threads, want_output, None)
     }
 
     /// As `encode_batch_src`; with `sep`, every input is first split into
     /// documents on that byte string (exactly like Python's `bytes.split`,
     /// separators dropped), in parallel inside Rust.
-    fn encode_batch_sep(&self, texts: &[TextArg], num_threads: usize, want_output: bool, sep: Option<&[u8]>) -> PyResult<(Vec<u32>, Vec<usize>)> {
-        self.encode_batch_sep_t::<u32>(texts, num_threads, want_output, sep)
+    fn encode_batch_sep(&self, texts: &[TextArg], wide: &WideCopies, num_threads: usize, want_output: bool, sep: Option<&[u8]>) -> PyResult<(Vec<u32>, Vec<usize>)> {
+        self.encode_batch_sep_t::<u32>(texts, wide, num_threads, want_output, sep)
     }
 
-    fn encode_batch_sep_t<O: OutTok>(&self, texts: &[TextArg], num_threads: usize, want_output: bool, sep: Option<&[u8]>) -> PyResult<(Vec<O>, Vec<usize>)> {
-        let src = texts_as_src(texts, self.norm_form == 0)?;
+    /// `wide`: `wide_args(texts)` (UTF-8 copies of the non-ASCII `str` items).
+    fn encode_batch_sep_t<O: OutTok>(&self, texts: &[TextArg], wide: &WideCopies, num_threads: usize, want_output: bool, sep: Option<&[u8]>) -> PyResult<(Vec<O>, Vec<usize>)> {
+        let src = texts_as_src(texts, wide, self.norm_form == 0)?;
         let src = match sep {
             Some(sep) if !sep.is_empty() => {
                 let mut docs = Vec::new();
@@ -2804,9 +3176,9 @@ impl Tokenizer {
     /// AutoTokenizer's `__call__` on a list is one Rust pass instead of a Python
     /// loop. `num_threads` 0 = all cores.
     #[pyo3(signature = (texts, num_threads = 0))]
-    fn encode_special_batch<'py>(&self, py: Python<'py>, texts: Vec<PyBackedStr>, num_threads: usize) -> Bound<'py, PyList> {
-        let seqs = py.detach(|| self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_special_one(t)));
-        self.to_pylists(py, &seqs)
+    fn encode_special_batch<'py>(&self, py: Python<'py>, texts: Vec<PyText>, num_threads: usize) -> PyResult<Bound<'py, PyList>> {
+        let seqs = { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_special_one(t))) };
+        Ok(self.to_pylists(py, &seqs))
     }
 
     /// AutoTokenizer `__call__` fast path (single sequences, no tensors): special
@@ -2818,14 +3190,14 @@ impl Tokenizer {
     fn encode_special_post<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyBackedStr>,
+        texts: Vec<PyText>,
         prefix: Vec<u32>,
         suffix: Vec<u32>,
         budget: Option<usize>,
         trunc_left: bool,
         num_threads: usize,
-    ) -> Bound<'py, PyList> {
-        let seqs = py.detach(|| self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_special_one(t)));
+    ) -> PyResult<Bound<'py, PyList>> {
+        let seqs = { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_special_one(t))) };
         let table = self.ints(py);
         let obj = |t: u32| unsafe {
             match table.get(t as usize) {
@@ -2852,7 +3224,7 @@ impl Tokenizer {
                 }
                 pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, inner);
             }
-            Bound::from_owned_ptr(py, outer).cast_into_unchecked()
+            Ok(Bound::from_owned_ptr(py, outer).cast_into_unchecked())
         }
     }
 
@@ -2969,7 +3341,7 @@ impl Tokenizer {
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyList>> {
         let (data, counts) =
-            py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { self.encode_batch_src(&texts, num_threads, true) })?;
+            { let wide = wide_args(py, &texts, num_threads)?; py.detach(|| -> PyResult<(Vec<u32>, Vec<usize>)> { self.encode_batch_src(&texts, &wide, num_threads, true) })? };
         Ok(self.data_to_pylists(py, &data, &counts))
     }
 
@@ -2977,7 +3349,8 @@ impl Tokenizer {
     /// Token counts for many texts, in parallel (no Python list of ids built).
     #[pyo3(signature = (texts, num_threads = 0, separator = None))]
     fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<TextArg>, num_threads: usize, separator: Option<Vec<u8>>) -> PyResult<Vec<usize>> {
-        py.detach(|| self.encode_batch_sep(&texts, num_threads, false, separator.as_deref()).map(|r| r.1))
+        let wide = wide_args(py, &texts, num_threads)?;
+        py.detach(|| self.encode_batch_sep(&texts, &wide, num_threads, false, separator.as_deref()).map(|r| r.1))
     }
 
     /// Training-loader helper: encode `texts` and return a fixed-width, padded
@@ -2993,13 +3366,13 @@ impl Tokenizer {
     fn encode_batch<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyBackedStr>,
+        texts: Vec<PyText>,
         max_length: Option<usize>,
         pad_id: u32,
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         let seqs: Vec<Vec<u32>> =
-            py.detach(|| self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_one(t, Merge::Auto)));
+            { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_one(t, Merge::Auto))) };
         let rows = seqs.len();
         let width = max_length.unwrap_or_else(|| seqs.iter().map(|s| s.len()).max().unwrap_or(0));
 
@@ -3082,11 +3455,12 @@ impl Tokenizer {
         };
         // Encode in parallel (GIL released) into a few contiguous task buffers,
         // then scatter them in parallel straight into a numpy-owned bytearray.
+        let wide = wide_args(py, &texts, num_threads)?;
         let (data_ba, counts) = if narrow {
-            let (d, c) = py.detach(|| self.encode_batch_sep_t::<u16>(&texts, num_threads, true, separator.as_deref()))?;
+            let (d, c) = py.detach(|| self.encode_batch_sep_t::<u16>(&texts, &wide, num_threads, true, separator.as_deref()))?;
             (Bound::new(py, TokenBuffer::new_u16(d))?, c)
         } else {
-            let (d, c) = py.detach(|| self.encode_batch_sep_t::<u32>(&texts, num_threads, true, separator.as_deref()))?;
+            let (d, c) = py.detach(|| self.encode_batch_sep_t::<u32>(&texts, &wide, num_threads, true, separator.as_deref()))?;
             (Bound::new(py, TokenBuffer::new(d))?, c)
         };
         let mut offsets = Vec::with_capacity(counts.len() + 1);
@@ -3127,7 +3501,7 @@ impl Tokenizer {
     fn encode_special_padded<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyBackedStr>,
+        texts: Vec<PyText>,
         prefix: Vec<i64>,
         suffix: Vec<i64>,
         max_length: Option<usize>,
@@ -3139,9 +3513,8 @@ impl Tokenizer {
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         let n_special = prefix.len() + suffix.len();
-        let contents: Vec<Vec<u32>> = py.detach(|| {
-            self.par_over(num_threads, &texts, |t| t.len(), |t| self.encode_special_one(t))
-        });
+        let contents: Vec<Vec<u32>> =
+            { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_special_one(t))) };
         let rows = contents.len();
         // content length per row after truncation (reserving the specials).
         let trunc_cap = if truncation {
