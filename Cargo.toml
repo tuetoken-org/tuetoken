@@ -30,6 +30,9 @@ unicode-normalization = "0.1"
 # AutoTokenizer path (so a whole chat string is tokenized in one Rust pass).
 aho-corasick = "1"
 
+[build-dependencies]
+pyo3-build-config = "0.28"
+
 [features]
 extension-module = ["pyo3/extension-module"]
 

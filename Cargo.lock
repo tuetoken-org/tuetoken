@@ -311,6 +311,7 @@ dependencies = [
  "fancy-regex",
  "memchr",
  "pyo3",
+ "pyo3-build-config",
  "rayon",
  "rustc-hash",
  "serde_json",
