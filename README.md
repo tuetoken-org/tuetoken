@@ -1,11 +1,11 @@
 # tuetoken
 
-**The fastest tokenizer for modern LLMs: 5.3 GB/s, up to 49x faster than tiktoken and 114x faster than 🤗 tokenizers.**
+**The fastest tokenizer for modern LLMs: 5.4 GB/s, up to 52x faster than tiktoken and 122x faster than 🤗 tokenizers.**
 
 tuetoken is a BPE tokenizer with a fast, safe Rust core. It is a drop-in replacement
 for 🤗 `transformers.AutoTokenizer`: it loads any model's own `tokenizer.json` and
 reproduces tokenization exactly (special tokens, chat templates, padding/truncation),
-up to 13x faster (8.8x on chat templates). It also loads OpenAI/tiktoken encodings natively, and
+up to 12x faster (8.6x on chat templates). It also loads OpenAI/tiktoken encodings natively, and
 its O(n) merger stays fast even on adversarial inputs (hashes, base64, minified code)
 where other tokenizers degrade to O(n²).
 
@@ -39,17 +39,22 @@ maturin develop --release
 
 | tuetoken speedup (o200k_base, Apple M4 Max, 14 cores) | vs tiktoken | vs 🤗 tokenizers / transformers |
 |---|---|---|
-| Corpus encode, 1 GB, all cores (5.3 GB/s) | **49x** | **114x** |
-| Corpus encode, 1 thread (567 MB/s) | 18x | 85x |
-| Single prompt, 128 B to 128 KB (p50) | 4-7x | 29-61x |
-| Batch of documents to `list[list[int]]` | 5x | 11x |
+| Corpus encode, 1 GB `bytes`, all cores (5.4 GB/s) | **52x** | **122x** |
+| Corpus as a `list[str]` of documents, all cores (3.4 GB/s) | **33x** | **77x** |
+| Corpus encode, 1 thread (572 MB/s) | 17x | 83x |
+| Single prompt, 128 B to 128 KB (p50) | 4-7x | 26-63x |
+| Batch of documents to `list[list[int]]` | 5-6x | 10-13x |
 | Decode (p50) | 2x | 7x |
-| `AutoTokenizer`: `tok(texts)` / chat template | | 13x / 8.8x |
+| `AutoTokenizer`: `tok(texts)` / chat template | | 12x / 8.6x |
 
 Token ids are identical across all three libraries. Every number uses text the
 tokenizer has not seen before, and corpus runs start a fresh process (no warm
 caches). Reproduce with `python tools/bench/bench.py corpus.txt && python tools/bench/plot.py`
 (raw numbers in `tools/bench/results.json`).
+
+New in 0.1.8: a batch of non-ASCII `str` (most real text) is converted to UTF-8 on all
+cores instead of by Python on one thread, so lists of strings are 2-2.5x faster than in
+0.1.7 (1 GB of OpenWebText documents in one call: 1.7 -> 4.1 GB/s), with identical output.
 
 ## Drop-in `AutoTokenizer`
 
@@ -75,7 +80,7 @@ This matches `transformers.AutoTokenizer` token-for-token across byte-level mode
 ## OpenAI / tiktoken encodings
 
 tuetoken loads OpenAI's encodings natively, with no `tiktoken` dependency, and is
-faster than tiktoken itself: 4-7x on a single prompt and up to 49x on a whole corpus:
+faster than tiktoken itself: 4-7x on a single prompt and up to 52x on a whole corpus:
 
 ```python
 from tuetoken import Tokenizer
