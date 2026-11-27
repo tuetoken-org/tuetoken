@@ -89,39 +89,41 @@ pub struct MergeMap {
 
 impl MergeMap {
     pub fn new(merges: &[(u32, u32, u32)]) -> Self {
-        let max_tok = merges
-            .iter()
-            .fold(255usize, |acc, &(t1, t2, tg)| acc.max(t1 as usize).max(t2 as usize).max(tg as usize));
+        Self::new_with_parallel(merges, false)
+    }
+
+    pub fn new_with_parallel(merges: &[(u32, u32, u32)], allow_par: bool) -> Self {
+        let mut max_tok = 255usize;
+        let tg0 = merges.first().map_or(0, |&(_, _, tg)| tg);
+        let mut linear_ok = !merges.is_empty();
+        // Single-pass histogram of `bit_width(t1 | t2)` for table entries replaces
+        // 5-6 full re-scans of `merges` when selecting `hot_t`.
+        let mut hist = [0usize; 33];
+        let mut n_table = 0usize;
+        for (i, &(t1, t2, tg)) in merges.iter().enumerate() {
+            max_tok = max_tok.max(t1 as usize).max(t2 as usize).max(tg as usize);
+            if linear_ok && tg != (i as u32).wrapping_add(tg0) {
+                linear_ok = false;
+            }
+            let or = t1 | t2;
+            if or >= DENSE_N || i >= DENSE_OVERFLOW as usize {
+                n_table += 1;
+                let bw = 32 - or.leading_zeros();
+                hist[bw as usize] += 1;
+            }
+        }
         let vocab_n = max_tok + 1;
         let use_packed = vocab_n <= PACK_MAX_TOK && merges.len() <= PACK_MAX_RANK;
-
-        // Count merges that actually need the hash table (pairs with
-        // `(t1 | t2) < DENSE_N` and `rank < DENSE_OVERFLOW` live solely in `dense`).
-        let n_table = if use_packed {
-            merges
-                .iter()
-                .enumerate()
-                .filter(|&(i, &(t1, t2, _))| (t1 | t2) >= DENSE_N || i >= DENSE_OVERFLOW as usize)
-                .count()
-        } else {
-            merges.len()
-        };
+        if !use_packed {
+            n_table = merges.len();
+        }
         let mut cap = 16usize;
         while cap.saturating_mul(4) < n_table.saturating_mul(5).max(1) {
             cap <<= 1;
         }
         let bits = cap.trailing_zeros();
 
-        // Detect linear `target == rank + off` mapping (100% of OpenAI BPEs).
-        let linear_off = if let Some(&(_, _, tg0)) = merges.first() {
-            if merges.iter().enumerate().all(|(i, &(_, _, tg))| tg == (i as u32).wrapping_add(tg0)) {
-                tg0
-            } else {
-                u32::MAX
-            }
-        } else {
-            u32::MAX
-        };
+        let linear_off = if linear_ok { tg0 } else { u32::MAX };
         let targets = if linear_off == u32::MAX {
             merges.iter().map(|&(_, _, tg)| tg).collect()
         } else {
@@ -135,30 +137,25 @@ impl MergeMap {
         let mask = cap - 1;
         let shift = 64 - bits;
 
-        // Disjoint `(t1 | t2) < hot_t` cache stratification: pack the ~20–45%
-        // of merges involving low-ID (high-frequency) tokens into a dense
-        // 256–512 KiB hot prefix (`<= 80%` load) so remaining hot BPE hits and
-        // their 32–64 KiB Bloom words stay resident in L1/L2 without pollution
-        // from long-tail merges. Zero extra lookups: `(t1 | t2) < hot_t` is an
-        // exact partition of the lookup key space.
+        // Disjoint `(t1 | t2) < hot_t` cache stratification using the O(1) histogram.
         let (hot_t, hot_nb, cold_nb) = if use_packed && total_nb >= 8192 {
             let hnb = (total_nb >> 2).max(4096).min(total_nb >> 1);
             let hmax_entries = (hnb * 8 * 4) / 5; // <= 80% load factor
             let mut best_t = 0u32;
             let mut best_nhot = 0usize;
+            let mut cum = 0usize;
+            for &c in hist.iter().take(DENSE_BITS as usize + 1) {
+                cum += c;
+            }
+            let mut b = (DENSE_BITS + 1) as usize;
             let mut t = DENSE_N << 1;
-            while (t as usize) < vocab_n {
-                let nh = merges
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, &(t1, t2, _))| {
-                        ((t1 | t2) >= DENSE_N || i >= DENSE_OVERFLOW as usize) && (t1 | t2) < t
-                    })
-                    .count();
-                if nh <= hmax_entries {
+            while (t as usize) < vocab_n && b <= 32 {
+                cum += hist[b];
+                if cum <= hmax_entries {
                     best_t = t;
-                    best_nhot = nh;
+                    best_nhot = cum;
                     t <<= 1;
+                    b += 1;
                 } else {
                     break;
                 }
@@ -179,27 +176,8 @@ impl MergeMap {
         let hot_shift = 64 - hot_nb.trailing_zeros();
         let cold_shift = if cold_nb != 0 { 64 - cold_nb.trailing_zeros() } else { hot_shift };
 
-        let mut hot_vec = if use_packed {
-            vec![MergeBucket([0u64; 8]); hot_nb + 1]
-        } else {
-            Vec::new()
-        };
-        let mut cold_vec = if use_packed && cold_nb != 0 {
-            vec![MergeBucket([0u64; 8]); cold_nb + 1]
-        } else {
-            Vec::new()
-        };
-        let mut hot_bloom = if use_packed { vec![0u64; hot_nb] } else { vec![0u64; total_nb] };
-        let mut cold_bloom = if use_packed && cold_nb != 0 { vec![0u64; cold_nb] } else { Vec::new() };
-        let mut entries = if use_packed {
-            Vec::new()
-        } else {
-            vec![Entry { key: 0, rank: 0 }; cap]
-        };
-
         let insert_no_wrap = |vec: &mut Vec<MergeBucket>, mut b: usize, kh: u64, r: u32| {
             'ins: loop {
-                // Keep the final bucket strictly all-zero as an exact probe sentinel.
                 if b + 1 >= vec.len() {
                     vec.push(MergeBucket([0u64; 8]));
                 }
@@ -218,42 +196,138 @@ impl MergeMap {
             }
         };
 
-        for (i, &(t1, t2, _tg)) in merges.iter().enumerate() {
-            let r = i as u32;
-            // Record left/right participation in the 2-bit-per-token L1 filter.
-            can_lr[(t1 as usize) >> 2] |= 1u8 << (((t1 as usize) & 3) * 2);
-            can_lr[(t2 as usize) >> 2] |= 2u8 << (((t2 as usize) & 3) * 2);
+        // Pass 1: populate L1 `can_lr` and 2 MiB `dense` (fast sequential/L2 pass).
+        let mut entries = if use_packed {
+            Vec::new()
+        } else {
+            vec![Entry { key: 0, rank: 0 }; cap]
+        };
+        let mut hot_vec = Vec::new();
+        let mut cold_vec = Vec::new();
+        let mut hot_bloom;
+        let mut cold_bloom = Vec::new();
 
-            if (t1 | t2) < DENSE_N {
-                let d = &mut dense[((t1 as usize) << DENSE_BITS) | (t2 as usize)];
-                if *d == DENSE_NONE {
-                    if r < DENSE_OVERFLOW as u32 {
-                        *d = r as u16;
-                        if use_packed {
-                            continue;
+        if use_packed {
+            // Collect overflow dense-range entries (rare: rank >= 65534 with (t1|t2) < DENSE_N)
+            // so Pass 2 never needs to touch `dense` again and can run hot/cold in parallel!
+            let mut dense_ov: Vec<(u32, u32, u32)> = Vec::new();
+            for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                let r = i as u32;
+                unsafe {
+                    *can_lr.get_unchecked_mut((t1 as usize) >> 2) |= 1u8 << (((t1 as usize) & 3) * 2);
+                    *can_lr.get_unchecked_mut((t2 as usize) >> 2) |= 2u8 << (((t2 as usize) & 3) * 2);
+                }
+                if (t1 | t2) < DENSE_N {
+                    let d = unsafe { dense.get_unchecked_mut(((t1 as usize) << DENSE_BITS) | (t2 as usize)) };
+                    if *d == DENSE_NONE {
+                        if r < DENSE_OVERFLOW as u32 {
+                            *d = r as u16;
+                        } else {
+                            *d = DENSE_OVERFLOW;
+                            has_dense_overflow = true;
+                            dense_ov.push((t1, t2, r));
                         }
-                    } else {
-                        *d = DENSE_OVERFLOW;
-                        has_dense_overflow = true;
                     }
-                } else if use_packed {
-                    // Already recorded a lower-rank duplicate for this pair.
-                    continue;
                 }
             }
-            if use_packed {
-                let kh = Self::pack_key(t1, t2);
-                let h = Self::hash_packed(kh);
-                if (t1 | t2) < hot_t {
-                    let b = (h >> hot_shift) as usize;
-                    hot_bloom[b] |= Self::bloom_mask(h);
-                    insert_no_wrap(&mut hot_vec, b, kh, r);
+
+            let build_part = |want_hot: bool, nb: usize, bshift: u32| -> (Vec<MergeBucket>, Vec<u64>) {
+                let mut vec = vec![MergeBucket([0u64; 8]); nb + 1];
+                let mut bl = vec![0u64; nb];
+                const RING: usize = 32;
+                let mut ring = [(0usize, 0u64, 0u64, 0u32); RING];
+                let mut rlen = 0usize;
+                let flush_one = |vec: &mut Vec<MergeBucket>, bl: &mut Vec<u64>, (b, kh, h, r): (usize, u64, u64, u32)| {
+                    bl[b] |= Self::bloom_mask(h);
+                    insert_no_wrap(vec, b, kh, r);
+                };
+                let mut push_item = |vec: &mut Vec<MergeBucket>, bl: &mut Vec<u64>, t1: u32, t2: u32, r: u32| {
+                    let kh = Self::pack_key(t1, t2);
+                    let h = Self::hash_packed(kh);
+                    let b = (h >> bshift) as usize;
+                    unsafe {
+                        crate::chunk_table::prefetch(bl.as_ptr().add(b) as *const u8);
+                        crate::chunk_table::prefetch(vec.as_ptr().add(b) as *const u8);
+                    }
+                    let slot = rlen & (RING - 1);
+                    if rlen >= RING {
+                        flush_one(vec, bl, ring[slot]);
+                    }
+                    ring[slot] = (b, kh, h, r);
+                    rlen += 1;
+                };
+                if want_hot {
+                    for &(t1, t2, r) in &dense_ov {
+                        if (t1 | t2) < hot_t {
+                            push_item(&mut vec, &mut bl, t1, t2, r);
+                        }
+                    }
+                    for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                        let or = t1 | t2;
+                        if or >= DENSE_N && or < hot_t {
+                            push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                        }
+                    }
                 } else {
-                    let b = (h >> cold_shift) as usize;
-                    cold_bloom[b] |= Self::bloom_mask(h);
-                    insert_no_wrap(&mut cold_vec, b, kh, r);
+                    for &(t1, t2, r) in &dense_ov {
+                        if (t1 | t2) >= hot_t {
+                            push_item(&mut vec, &mut bl, t1, t2, r);
+                        }
+                    }
+                    for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                        let or = t1 | t2;
+                        if or >= DENSE_N && or >= hot_t {
+                            push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                        }
+                    }
+                }
+                let start = rlen.saturating_sub(RING);
+                for k in start..rlen {
+                    flush_one(&mut vec, &mut bl, ring[k & (RING - 1)]);
+                }
+                (vec, bl)
+            };
+
+            if cold_nb != 0 {
+                if allow_par {
+                    let ((hv, hb), (cv, cb)) = rayon::join(
+                        || build_part(true, hot_nb, hot_shift),
+                        || build_part(false, cold_nb, cold_shift),
+                    );
+                    hot_vec = hv;
+                    hot_bloom = hb;
+                    cold_vec = cv;
+                    cold_bloom = cb;
+                } else {
+                    let (hv, hb) = build_part(true, hot_nb, hot_shift);
+                    let (cv, cb) = build_part(false, cold_nb, cold_shift);
+                    hot_vec = hv;
+                    hot_bloom = hb;
+                    cold_vec = cv;
+                    cold_bloom = cb;
                 }
             } else {
+                let (hv, hb) = build_part(true, hot_nb, hot_shift);
+                hot_vec = hv;
+                hot_bloom = hb;
+            }
+        } else {
+            hot_bloom = vec![0u64; total_nb];
+            for (i, &(t1, t2, _tg)) in merges.iter().enumerate() {
+                let r = i as u32;
+                can_lr[(t1 as usize) >> 2] |= 1u8 << (((t1 as usize) & 3) * 2);
+                can_lr[(t2 as usize) >> 2] |= 2u8 << (((t2 as usize) & 3) * 2);
+                if (t1 | t2) < DENSE_N {
+                    let d = &mut dense[((t1 as usize) << DENSE_BITS) | (t2 as usize)];
+                    if *d == DENSE_NONE {
+                        if r < DENSE_OVERFLOW as u32 {
+                            *d = r as u16;
+                        } else {
+                            *d = DENSE_OVERFLOW;
+                            has_dense_overflow = true;
+                        }
+                    }
+                }
                 let key = Self::key(t1, t2);
                 let h = Self::hash_key(key);
                 hot_bloom[(h >> hot_shift) as usize] |= Self::bloom_mask(h);
@@ -272,9 +346,17 @@ impl MergeMap {
         let cold_off = if use_packed && cold_nb != 0 { hot_vec.len() } else { 0 };
         let buckets = if use_packed {
             let mut bv = crate::chunk_table::HugeVec::<MergeBucket>::zeroed(hot_vec.len() + cold_vec.len());
-            bv[..hot_vec.len()].copy_from_slice(&hot_vec);
-            if !cold_vec.is_empty() {
-                bv[cold_off..].copy_from_slice(&cold_vec);
+            if allow_par && !cold_vec.is_empty() {
+                let (dst_h, dst_c) = bv.split_at_mut(cold_off);
+                rayon::join(
+                    || dst_h.copy_from_slice(&hot_vec),
+                    || dst_c.copy_from_slice(&cold_vec),
+                );
+            } else {
+                bv[..hot_vec.len()].copy_from_slice(&hot_vec);
+                if !cold_vec.is_empty() {
+                    bv[cold_off..].copy_from_slice(&cold_vec);
+                }
             }
             bv
         } else {
@@ -354,75 +436,106 @@ impl MergeMap {
         if monotonic {
             // Require 256 distinct singleton IDs so every token has a unique
             // exact `first_byte` and `last_byte` (true for all real ByteLevel models).
-            let mut sing_byte = vec![u16::MAX; self.vocab_n];
+            // Pack `(create_rank: u32, first_b: u8, last_b: u8, flags: u8)` into one `u64`
+            // per token (1 cache line instead of 4 scattered arrays) and fuse the two
+            // passes over `merges` into ONE single monotonic pass!
+            // Layout:
+            //   bits  0..32: create_rank (u32::MAX if not created by a merge)
+            //   bits 32..40: first_b
+            //   bits 40..48: last_b
+            //   bit  48:     has_bounds (first_b/last_b valid)
+            //   bit  49:     is_singleton
+            const FLAG_BOUNDS: u64 = 1u64 << 48;
+            const FLAG_SING: u64 = 1u64 << 49;
+            const INIT_META: u64 = u32::MAX as u64;
+            let mut meta = vec![INIT_META; self.vocab_n];
             let mut distinct = true;
             for (b, &t) in singleton.iter().enumerate() {
                 let tu = t as usize;
-                if sing_byte[tu] != u16::MAX {
+                if (meta[tu] & FLAG_SING) != 0 {
                     distinct = false;
                     break;
                 }
-                sing_byte[tu] = b as u16;
+                let bv = b as u64;
+                meta[tu] = INIT_META | (bv << 32) | (bv << 40) | FLAG_BOUNDS | FLAG_SING;
             }
             if distinct {
-                let mut create_rank = vec![u32::MAX; self.vocab_n];
-                let mut first_b = vec![u16::MAX; self.vocab_n];
-                let mut last_b = vec![u16::MAX; self.vocab_n];
-                for (b, &t) in singleton.iter().enumerate() {
-                    first_b[t as usize] = b as u16;
-                    last_b[t as usize] = b as u16;
-                }
                 let mut ok = true;
+                let vn = self.vocab_n;
                 for (i, &(t1, t2, tg)) in merges.iter().enumerate() {
                     let u1 = t1 as usize;
                     let u2 = t2 as usize;
                     let tu = tg as usize;
-                    if tu >= self.vocab_n || sing_byte[tu] != u16::MAX {
+                    if tu >= vn {
                         ok = false;
                         break;
                     }
-                    if create_rank[tu] == u32::MAX {
-                        create_rank[tu] = i as u32;
+                    let mtg = unsafe { *meta.get_unchecked(tu) };
+                    if (mtg & FLAG_SING) != 0 {
+                        ok = false;
+                        break;
                     }
-                    if u1 < self.vocab_n && u2 < self.vocab_n && first_b[u1] != u16::MAX && last_b[u2] != u16::MAX {
-                        if first_b[tu] == u16::MAX {
-                            first_b[tu] = first_b[u1];
-                            last_b[tu] = last_b[u2];
-                        } else if first_b[tu] != first_b[u1] || last_b[tu] != last_b[u2] {
-                            ok = false;
-                            break;
+                    let r = i as u32;
+                    let mut new_mtg = if (mtg as u32) == u32::MAX {
+                        (mtg & !0xFFFF_FFFFu64) | (r as u64)
+                    } else {
+                        mtg
+                    };
+                    if u1 < vn && u2 < vn {
+                        let m1 = unsafe { *meta.get_unchecked(u1) };
+                        let m2 = unsafe { *meta.get_unchecked(u2) };
+                        if (m1 & FLAG_BOUNDS) != 0 && (m2 & FLAG_BOUNDS) != 0 {
+                            let fb1 = (m1 >> 32) & 0xFF;
+                            let lb2 = (m2 >> 40) & 0xFF;
+                            if (new_mtg & FLAG_BOUNDS) == 0 {
+                                new_mtg |= (fb1 << 32) | (lb2 << 40) | FLAG_BOUNDS;
+                            } else if ((new_mtg >> 32) & 0xFF) != fb1 || ((new_mtg >> 40) & 0xFF) != lb2 {
+                                ok = false;
+                                break;
+                            }
+                            let s1 = (m1 & FLAG_SING) != 0;
+                            let s2 = (m2 & FLAG_SING) != 0;
+                            // Because `monotonic == true`, `m1` and `m2` are finalized before `i`.
+                            if !s1 && s2 {
+                                let cr1 = m1 as u32;
+                                if cr1 != u32::MAX {
+                                    let lb1 = ((m1 >> 40) & 0xFF) as usize;
+                                    let b2 = ((m2 >> 32) & 0xFF) as usize;
+                                    let idx = (lb1 << 8) | b2;
+                                    let v = cr1.max(r).min(DENSE_OVERFLOW as u32) as u16;
+                                    let slot = unsafe { sl_tbl.get_unchecked_mut(idx) };
+                                    if v < *slot {
+                                        *slot = v;
+                                    }
+                                }
+                            } else if s1 && !s2 {
+                                let cr2 = m2 as u32;
+                                if cr2 != u32::MAX {
+                                    let b1 = ((m1 >> 32) & 0xFF) as usize;
+                                    let fb2 = ((m2 >> 32) & 0xFF) as usize;
+                                    let idx = (b1 << 8) | fb2;
+                                    let v = cr2.max(r).min(DENSE_OVERFLOW as u32) as u16;
+                                    let slot = unsafe { sr_tbl.get_unchecked_mut(idx) };
+                                    if v < *slot {
+                                        *slot = v;
+                                    }
+                                }
+                            }
                         }
+                    }
+                    unsafe {
+                        *meta.get_unchecked_mut(tu) = new_mtg;
                     }
                 }
                 if ok {
-                    for (i, &(t1, t2, _)) in merges.iter().enumerate() {
-                        let u1 = t1 as usize;
-                        let u2 = t2 as usize;
-                        let r = i as u32;
-                        if u1 < self.vocab_n && u2 < self.vocab_n {
-                            if sing_byte[u1] == u16::MAX && create_rank[u1] != u32::MAX && sing_byte[u2] != u16::MAX {
-                                let lb = last_b[u1];
-                                if lb != u16::MAX {
-                                    let idx = ((lb as usize) << 8) | (sing_byte[u2] as usize);
-                                    let v = create_rank[u1].max(r).min(DENSE_OVERFLOW as u32) as u16;
-                                    if v < sl_tbl[idx] {
-                                        sl_tbl[idx] = v;
-                                    }
-                                }
-                            }
-                            if sing_byte[u2] == u16::MAX && create_rank[u2] != u32::MAX && sing_byte[u1] != u16::MAX {
-                                let fb = first_b[u2];
-                                if fb != u16::MAX {
-                                    let idx = ((sing_byte[u1] as usize) << 8) | (fb as usize);
-                                    let v = create_rank[u2].max(r).min(DENSE_OVERFLOW as u32) as u16;
-                                    if v < sr_tbl[idx] {
-                                        sr_tbl[idx] = v;
-                                    }
-                                }
-                            }
-                        }
-                    }
                     self.has_byte_shield = true;
+                } else {
+                    for i in 0..(1 << 16) {
+                        let r = rank_tbl[i];
+                        let v = if r < DENSE_OVERFLOW { r } else { DENSE_OVERFLOW };
+                        sl_tbl[i] = v;
+                        sr_tbl[i] = v;
+                    }
                 }
             }
         }

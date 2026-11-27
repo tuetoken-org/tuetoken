@@ -191,7 +191,21 @@ impl ChunkTable {
     /// Also builds an L2-resident k=4 pure-GPR Blocked Bloom filter (~10.5 bits/entry,
     /// ~1% FPR: 256 KiB for o200k, 128 KiB for cl100k, 64 KiB for gpt2) so ~99% of
     /// non-vocab cold misses never touch the 12.6 MiB `entries` table in L3/DRAM.
+    #[cfg(test)]
     pub fn build(pairs: &[(&[u8], u32)]) -> Self {
+        Self::build_with_parallel(pairs, false)
+    }
+
+    /// Parallel 16-partition L2-resident `ChunkTable` builder (falls back to serial
+    /// when `allow_par == false` or `pairs.len() < 16_384`).
+    ///
+    /// Partitioning the `2^b` slot array and `2^(b-4)` Bloom array into 16 contiguous
+    /// ranges indexed by the top 4 hash bits (`h >> 60`) lets all CPU cores build
+    /// disjoint ~780 KiB L2-resident slices concurrently with zero atomics. Any rare
+    /// linear-probe wrap across a partition boundary (~0-2 entries out of 200K) is
+    /// collected and inserted serially at the end, preserving exact first-writer-wins
+    /// semantics on duplicates (all copies of a duplicate share `h >> 60`).
+    pub fn build_with_parallel(pairs: &[(&[u8], u32)], allow_par: bool) -> Self {
         let mut cap = 16usize;
         #[cfg(test)]
         let dense = DENSE.load(std::sync::atomic::Ordering::Relaxed);
@@ -211,26 +225,165 @@ impl ChunkTable {
             shift: 64 - bits,
             mask: cap - 1,
         };
-        for (k, v) in pairs {
+
+        const P: usize = 16;
+        let par_thresh = if cfg!(test) {
+            16_384
+        } else if rayon::current_num_threads() >= 8 {
+            32_768
+        } else {
+            120_000
+        };
+        if allow_par && pairs.len() >= par_thresh && cap >= 4096 && bloom_words >= P {
+            use rayon::prelude::*;
+            let nt = rayon::current_num_threads().clamp(2, 32);
+            let chunk_sz = pairs.len().div_ceil(nt);
+            let est_per = (chunk_sz / P).max(16);
+
+            type PackedItem = (u64, u64, u64, u32);
+            // Stage 1: pack & hash in parallel into 16 order-preserving partition buckets per thread.
+            let per_thread: Vec<[Vec<PackedItem>; P]> = pairs
+                .par_chunks(chunk_sz)
+                .map(|chunk| {
+                    let mut buckets: [Vec<PackedItem>; P] =
+                        std::array::from_fn(|_| Vec::with_capacity(est_per));
+                    for &(k, v) in chunk {
+                        let (lo, hi) = pack(k);
+                        let h = hash(lo, hi);
+                        buckets[(h >> 60) as usize].push((lo, hi, h, v));
+                    }
+                    buckets
+                })
+                .collect();
+
+            // Stage 2: scatter each 1/16 slice of `entries` & `bloom` in parallel (L2-resident!).
+            let part_len = cap / P;
+            let bloom_part = bloom_words / P;
+            let eshift = t.shift;
+            let bshift = t.bloom_shift;
+            let overflows: Vec<Vec<(u64, u64, u64, u32)>> = t
+                .entries
+                .par_chunks_mut(part_len)
+                .zip(t.bloom.par_chunks_mut(bloom_part))
+                .enumerate()
+                .map(|(p, (e_slice, bl_slice))| {
+                    let e_base = p * part_len;
+                    let bl_base = p * bloom_part;
+                    let mut ov = Vec::new();
+                    for tb in &per_thread {
+                        let items = &tb[p];
+                        let ilen = items.len();
+                        for j in 0..ilen {
+                            if j + 16 < ilen {
+                                let ph = unsafe { items.get_unchecked(j + 16).2 };
+                                let pbw = ((ph >> bshift) as usize) - bl_base;
+                                let pidx = ((ph >> eshift) as usize) - e_base;
+                                unsafe {
+                                    prefetch(bl_slice.as_ptr().add(pbw) as *const u8);
+                                    prefetch(e_slice.as_ptr().add(pidx) as *const u8);
+                                }
+                            }
+                            let (lo, hi, h, v) = unsafe { *items.get_unchecked(j) };
+                            let bw = ((h >> bshift) as usize) - bl_base;
+                            unsafe {
+                                *bl_slice.get_unchecked_mut(bw) |= (1u64 << ((h >> 24) & 63))
+                                    | (1u64 << ((h >> 30) & 63))
+                                    | (1u64 << ((h >> 36) & 63))
+                                    | (1u64 << ((h >> 42) & 63));
+                            }
+                            let mut idx = ((h >> eshift) as usize) - e_base;
+                            while idx < part_len {
+                                let e = unsafe { e_slice.get_unchecked_mut(idx) };
+                                if e.hi == 0 {
+                                    *e = Entry { lo, hi, val: v };
+                                    break;
+                                }
+                                if e.lo == lo && e.hi == hi {
+                                    break;
+                                }
+                                idx += 1;
+                            }
+                            if idx == part_len {
+                                ov.push((lo, hi, h, v));
+                            }
+                        }
+                    }
+                    ov
+                })
+                .collect();
+
+            // Stage 3: insert the ~0-2 items that probed past their partition tail.
+            for ov in overflows {
+                for (lo, hi, h, v) in ov {
+                    let mut idx = (h >> t.shift) as usize;
+                    loop {
+                        let e = unsafe { t.entries.get_unchecked_mut(idx) };
+                        if e.hi == 0 {
+                            *e = Entry { lo, hi, val: v };
+                            break;
+                        }
+                        if e.lo == lo && e.hi == hi {
+                            break;
+                        }
+                        idx = (idx + 1) & t.mask;
+                    }
+                }
+            }
+            return t;
+        }
+
+        // Serial fallback with 32-slot sliding-window prefetch pipeline.
+        const RING: usize = 32;
+        let mut ring = [(0u64, 0u64, 0u64, 0u32); RING];
+        let bptr = t.bloom.as_ptr();
+        let eptr = t.entries.as_ptr();
+        let bshift = t.bloom_shift;
+        let eshift = t.shift;
+        let prime = pairs.len().min(RING);
+        for i in 0..prime {
+            let (k, v) = pairs[i];
             let (lo, hi) = pack(k);
             let h = hash(lo, hi);
+            unsafe {
+                prefetch(bptr.add((h >> bshift) as usize) as *const u8);
+                prefetch(eptr.add((h >> eshift) as usize) as *const u8);
+            }
+            ring[i] = (lo, hi, h, v);
+        }
+        let insert_one = |t: &mut ChunkTable, lo: u64, hi: u64, h: u64, v: u32| {
             let bw = (h >> t.bloom_shift) as usize;
             t.bloom[bw] |= (1u64 << ((h >> 24) & 63))
                 | (1u64 << ((h >> 30) & 63))
                 | (1u64 << ((h >> 36) & 63))
                 | (1u64 << ((h >> 42) & 63));
-            let mut i = (h >> t.shift) as usize;
+            let mut idx = (h >> t.shift) as usize;
             loop {
-                let e = &mut t.entries[i];
+                let e = unsafe { t.entries.get_unchecked_mut(idx) };
                 if e.hi == 0 {
-                    *e = Entry { lo, hi, val: *v };
+                    *e = Entry { lo, hi, val: v };
                     break;
                 }
                 if e.lo == lo && e.hi == hi {
                     break;
                 }
-                i = (i + 1) & t.mask;
+                idx = (idx + 1) & t.mask;
             }
+        };
+        for (i, &(nk, nv)) in pairs.iter().enumerate().skip(prime) {
+            let slot = i & (RING - 1);
+            let (lo, hi, h, v) = ring[slot];
+            insert_one(&mut t, lo, hi, h, v);
+            let (nlo, nhi) = pack(nk);
+            let nh = hash(nlo, nhi);
+            unsafe {
+                prefetch(t.bloom.as_ptr().add((nh >> bshift) as usize) as *const u8);
+                prefetch(t.entries.as_ptr().add((nh >> eshift) as usize) as *const u8);
+            }
+            ring[slot] = (nlo, nhi, nh, nv);
+        }
+        for i in (pairs.len() - prime)..pairs.len() {
+            let (lo, hi, h, v) = ring[i & (RING - 1)];
+            insert_one(&mut t, lo, hi, h, v);
         }
         t
     }
@@ -2481,5 +2634,31 @@ mod long_table_tests {
         b.put(999, 1u64 << 56, hash(999, 1u64 << 56), &[42]);
         assert_eq!(b.len(), 1);
         assert!(a.len() >= 256 && a.len() <= 300);
+    }
+
+    #[test]
+    fn chunk_table_parallel_matches_serial() {
+        let keys: Vec<String> = (0..25_000u32).map(|i| format!("tok_{i}")).collect();
+        let mut pairs: Vec<(&[u8], u32)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_bytes(), i as u32))
+            .collect();
+        // Inject duplicates with different values to verify first-writer-wins
+        for i in (0..25_000usize).step_by(37) {
+            pairs.push((keys[i].as_bytes(), 999_999));
+        }
+        let ser = ChunkTable::build_with_parallel(&pairs, false);
+        let par = ChunkTable::build_with_parallel(&pairs, true);
+        for (i, s) in keys.iter().enumerate() {
+            let (lo, hi) = pack(s.as_bytes());
+            assert_eq!(par.get(lo, hi), Some(i as u32), "key {s}");
+            assert_eq!(par.get(lo, hi), ser.get(lo, hi));
+        }
+        for i in 25_000..26_000u32 {
+            let s = format!("miss_{i}");
+            let (lo, hi) = pack(s.as_bytes());
+            assert_eq!(par.get(lo, hi), None);
+        }
     }
 }

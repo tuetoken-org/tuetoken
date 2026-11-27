@@ -12,6 +12,7 @@ mod blockscan;
 mod bpe;
 mod chunk_table;
 mod cjk;
+mod fast_load;
 mod norm;
 mod pretok;
 mod pretok_pipe;
@@ -2926,7 +2927,7 @@ impl Tokenizer {
                 ids.iter().filter_map(|&id| emit_one(&mut s, id)).collect()
             }
         };
-        let table = chunk_table::ChunkTable::build(&pairs);
+        let table = chunk_table::ChunkTable::build_with_parallel(&pairs, parallel_ok());
         // Demand-paged active working-set SharedTable: keep `self.learned`
         // initially empty (512 KiB) so it projects a 200K multilingual vocab
         // down to the exact L2-resident active working set of the user's text
@@ -6187,6 +6188,255 @@ impl Tokenizer {
         };
         Ok((Bound::new(py, wrap(d))?, c))
     }
+    /// Construct `Tokenizer` from the parallel zero-malloc fast JSON loader.
+    fn from_fast_loaded(
+        path: &str,
+        c2b: [u16; 324],
+        allow_par: bool,
+        fl: fast_load::FastLoadedTokenizer,
+    ) -> PyResult<Self> {
+        let norm_val = &fl.normalizer;
+        let pre = &fl.pre_tokenizer;
+        let dec_val = &fl.decoder;
+
+        if let Some(ref mt) = fl.model_type {
+            if mt != "BPE" {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported model type {mt:?}: tuetoken only supports BPE models"
+                )));
+            }
+        } else if !fl.has_merges {
+            return Err(PyValueError::new_err(
+                "unsupported non-BPE model (missing merges): tuetoken only supports BPE models",
+            ));
+        }
+        if let Some(ref pfx) = fl.continuing_subword_prefix {
+            if !pfx.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported BPE continuing_subword_prefix {pfx:?}"
+                )));
+            }
+        }
+        let eow_suffix = fl.end_of_word_suffix.filter(|s| !s.is_empty());
+
+        let normalizer = norm::Normalizer::from_json(norm_val).map_err(|t| {
+            PyValueError::new_err(format!(
+                "unsupported normalizer stage {t:?}: this model rewrites text in a \
+                 way tuetoken does not reproduce"
+            ))
+        })?;
+
+        let byte_fallback = fl.byte_fallback;
+        let decode_strip_space = detect_decode_strip(dec_val);
+        let prepend_scheme_str = detect_prepend_scheme_str(pre, norm_val);
+        let post_processor_json = fl
+            .post_processor
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::to_string(v).ok());
+
+        let (kind, fast_pretok, pretok_pipe) = if !byte_fallback && is_cjk_pretok(pre) {
+            (Pretok::Word(false), FastPretok::Cjk, None)
+        } else if let Some(k) = (!byte_fallback).then(|| detect_pretok(pre)).flatten() {
+            (k, FastPretok::BlockScan, None)
+        } else {
+            if !byte_fallback
+                && !contains_bytelevel(pre, "pretokenizers")
+                && !contains_bytelevel(dec_val, "decoders")
+            {
+                return Err(PyValueError::new_err(
+                    "unsupported pre_tokenizer (expected ByteLevel or byte_fallback)",
+                ));
+            }
+            match pretok_pipe::PretokPipe::from_json(pre)
+                .map_err(|e| PyValueError::new_err(format!("{e} (refusing to mistokenize)")))?
+            {
+                Some(pipe) => (Pretok::Word(false), FastPretok::Pipe, Some(pipe)),
+                None => (Pretok::Word(false), FastPretok::WholeText, None),
+            }
+        };
+        let ignore_merges = fl.ignore_merges;
+
+        let meta_split_cand: Option<char> = if byte_fallback && !ignore_merges && eow_suffix.is_none()
+        {
+            if let Some(ref pipe) = pretok_pipe {
+                if let Some(rep) = pipe.single_unsplit_metaspace() {
+                    Some(rep)
+                } else if normalizer.replaces_space_with('\u{2581}')
+                    && pre.get("type").and_then(|v| v.as_str()) == Some("Split")
+                    && pre.get("pattern").and_then(|p| p.get("String")).and_then(|v| v.as_str())
+                        == Some(" ")
+                    && pre.get("behavior").and_then(|v| v.as_str()) == Some("MergedWithPrevious")
+                    && !pre.get("invert").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    Some('\u{2581}')
+                } else {
+                    None
+                }
+            } else if normalizer.replaces_space_with('\u{2581}') {
+                Some('\u{2581}')
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let vocab_size = fl.vocab_size;
+        let mut added_meta: Vec<(String, u32, bool, bool, bool)> = Vec::with_capacity(fl.added_tokens.len());
+        for at in fl.added_tokens {
+            if let Some(id) = at.id {
+                if let Some(content) = at.content {
+                    added_meta.push((content, id as u32, at.special, at.lstrip, at.rstrip));
+                }
+            }
+        }
+
+        let mut byte_arena = fl.byte_arena;
+        let mut byte_span = fl.byte_span;
+        let canonical = fl.canonical;
+        let has_internal_ms = fl.has_internal_ms;
+        let mut special_skip_mask = vec![false; vocab_size];
+        for (content, id, sp, _, _) in &added_meta {
+            let id = *id as usize;
+            if id < vocab_size {
+                if *sp {
+                    special_skip_mask[id] = true;
+                }
+                if byte_span[id].1 == 0 {
+                    let start = byte_arena.len() as u32;
+                    byte_arena.extend_from_slice(content.as_bytes());
+                    byte_span[id] = (start, content.len() as u32);
+                }
+            }
+        }
+
+        let mut singleton = [-1i32; 256];
+        let mut singleton_canon = [false; 256];
+        for id in 0..vocab_size {
+            let (off, len) = byte_span[id];
+            if len == 1 {
+                let bv = byte_arena[off as usize] as usize;
+                let canon = canonical[id];
+                if singleton[bv] < 0
+                    || (canon && !singleton_canon[bv])
+                    || (canon == singleton_canon[bv] && (id as i32) < singleton[bv])
+                {
+                    singleton[bv] = id as i32;
+                    singleton_canon[bv] = canon;
+                }
+            }
+        }
+
+        let merges = fl.merges;
+        let safe_meta_split = meta_split_cand.filter(|_| {
+            merges
+                .iter()
+                .all(|&(_, _, tg)| (tg as usize) >= vocab_size || !has_internal_ms[tg as usize])
+        });
+
+        let check_monotonic = || {
+            let mut produce_max: Vec<i64> = vec![-1; vocab_size];
+            let mut consume_min: Vec<i64> = vec![i64::MAX; vocab_size];
+            for (i, &(a, b, t)) in merges.iter().enumerate() {
+                let i = i as i64;
+                if (t as usize) < vocab_size {
+                    produce_max[t as usize] = produce_max[t as usize].max(i);
+                }
+                if (a as usize) < vocab_size {
+                    consume_min[a as usize] = consume_min[a as usize].min(i);
+                }
+                if (b as usize) < vocab_size {
+                    consume_min[b as usize] = consume_min[b as usize].min(i);
+                }
+            }
+            (0..vocab_size).all(|t| produce_max[t] < 0 || consume_min[t] > produce_max[t])
+        };
+        let (mut map, monotonic) = if allow_par {
+            rayon::join(
+                || bpe::MergeMap::new_with_parallel(&merges, true),
+                check_monotonic,
+            )
+        } else {
+            (bpe::MergeMap::new(&merges), check_monotonic())
+        };
+
+        let ignore_lookup = if ignore_merges {
+            let mut m: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
+            for (id, &(off, len)) in byte_span.iter().enumerate() {
+                if len > 0 {
+                    let b = &byte_arena[off as usize..(off + len) as usize];
+                    m.entry(b.to_vec().into_boxed_slice()).or_insert(id as u32);
+                }
+            }
+            Some(m)
+        } else {
+            None
+        };
+
+        let mut singleton_u32 = [0u32; 256];
+        for b in 0..256 {
+            if singleton[b] >= 0 {
+                singleton_u32[b] = singleton[b] as u32;
+            }
+        }
+        let byte_fast = !byte_fallback
+            && ignore_lookup.is_none()
+            && fl.singleton_eow.is_none()
+            && map.init_byte_tables(&singleton, &merges, monotonic);
+
+        let mut tk = Tokenizer {
+            kind,
+            fast_pretok,
+            singleton,
+            singleton_u32,
+            singleton_eow: fl.singleton_eow,
+            byte_fast,
+            map,
+            raw_merges: merges,
+            stream: OnceLock::new(),
+            byte_arena,
+            byte_span,
+            c2b,
+            ignore_lookup,
+            vocab_size,
+            normalizer,
+            pretok_pipe,
+            byte_fallback,
+            safe_meta_split,
+            char_ascii: fl.char_ascii,
+            char_map: fl.char_map,
+            decode_strip_space,
+            source_path: path.to_string(),
+            is_byte_level: !byte_fallback,
+            monotonic,
+            special_ac: None,
+            special_prefilter: SpecialPrefilter::None,
+            special_ids: Vec::new(),
+            special_lstrip: Vec::new(),
+            special_rstrip: Vec::new(),
+            special_skip_mask,
+            whisper_ts_begin: u32::MAX,
+            whisper_sop_id: u32::MAX,
+            whisper_sot_id: u32::MAX,
+            prepend_scheme: 0,
+            chunk_table: chunk_table::ChunkTable::empty(),
+            uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            learned: chunk_table::SharedTable::new(DEFAULT_CACHE_MIB),
+            long_table: chunk_table::SharedLongTable::new(DEFAULT_CACHE_MIB / 4),
+            spill: chunk_table::SpillMap::new((DEFAULT_CACHE_MIB << 20) / 4),
+            int_table: OnceLock::new(),
+            decode_table: OnceLock::new(),
+            auto_meta: AutoMeta {
+                added_tokens: added_meta,
+                post_processor_json,
+                prepend_scheme: prepend_scheme_str,
+                known_token_ids: fl.known_token_ids,
+            },
+        };
+        tk.build_chunk_table();
+        Ok(tk)
+    }
 }
 
 type AutoMetaTuple = (Vec<(String, u32, bool, bool, bool)>, Option<String>, String, Vec<(String, u32)>);
@@ -6197,9 +6447,51 @@ type FillRowItem<'a> = (usize, (&'a mut [std::mem::MaybeUninit<i64>], &'a mut [s
 impl Tokenizer {
     #[new]
     fn new(path: &str) -> PyResult<Self> {
-        let data = std::fs::read_to_string(path)
+        let raw_bytes = std::fs::read(path)
             .map_err(|e| PyValueError::new_err(format!("cannot read {path}: {e}")))?;
-        let raw: RawTokenizerJson<'_> = serde_json::from_str(&data)
+        let data = simdutf8::basic::from_utf8(&raw_bytes)
+            .map_err(|e| PyValueError::new_err(format!("cannot read {path}: invalid UTF-8: {e}")))?;
+
+        let c2b = bytes_to_unicode_table();
+        let allow_par = parallel_ok();
+        let detect_meta_cand = |pre: &Value, norm_val: &Value, byte_fallback: bool, ignore_merges: bool, has_eow: bool| -> Option<char> {
+            if !byte_fallback || ignore_merges || has_eow {
+                return None;
+            }
+            let normalizer = norm::Normalizer::from_json(norm_val).ok()?;
+            let pipe = pretok_pipe::PretokPipe::from_json(pre).ok()?;
+            if let Some(ref p) = pipe {
+                if let Some(rep) = p.single_unsplit_metaspace() {
+                    return Some(rep);
+                }
+                if normalizer.replaces_space_with('\u{2581}')
+                    && pre.get("type").and_then(|v| v.as_str()) == Some("Split")
+                    && pre.get("pattern").and_then(|p| p.get("String")).and_then(|v| v.as_str()) == Some(" ")
+                    && pre.get("behavior").and_then(|v| v.as_str()) == Some("MergedWithPrevious")
+                    && !pre.get("invert").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    return Some('\u{2581}');
+                }
+                None
+            } else if normalizer.replaces_space_with('\u{2581}') {
+                Some('\u{2581}')
+            } else {
+                None
+            }
+        };
+
+        if let Some(fl) = fast_load::try_load_fast(
+            raw_bytes.as_slice(),
+            &c2b,
+            allow_par,
+            decode_bytelevel_into,
+            decode_byte_fallback_into,
+            detect_meta_cand,
+        ) {
+            return Self::from_fast_loaded(path, c2b, allow_par, fl);
+        }
+
+        let raw: RawTokenizerJson<'_> = serde_json::from_str(data)
             .map_err(|e| PyValueError::new_err(format!("bad JSON: {e}")))?;
         let model = raw.model.ok_or_else(|| PyValueError::new_err("no model"))?;
         let norm_val = raw.normalizer.as_ref().unwrap_or(&Value::Null);
@@ -6444,16 +6736,8 @@ impl Tokenizer {
                 .iter()
                 .all(|&(_, _, tg)| (tg as usize) >= vocab_size || !has_internal_ms[tg as usize])
         });
-        let mut map = bpe::MergeMap::new(&merges);
-
-        // Monotonicity: a vocab is "monotonic" when every token is fully produced
-        // (its highest-rank producing merge) before it is first consumed (its
-        // lowest-rank consuming merge). That guarantees the fast batch/streaming
-        // mergers equal canonical BPE. Every normal trained BPE satisfies it; a few
-        // models hand-assign inverted ranks (gemma's whitespace-run tokens give
-        // `(30-run)+(1-run)->31-run` a near-top rank) and route to the canonical
-        // merger instead. See bpe::merge / finish_chunk.
-        let monotonic = {
+        let allow_par = parallel_ok();
+        let check_monotonic = || {
             let mut produce_max: Vec<i64> = vec![-1; vocab_size];
             let mut consume_min: Vec<i64> = vec![i64::MAX; vocab_size];
             for (i, &(a, b, t)) in merges.iter().enumerate() {
@@ -6469,6 +6753,14 @@ impl Tokenizer {
                 }
             }
             (0..vocab_size).all(|t| produce_max[t] < 0 || consume_min[t] > produce_max[t])
+        };
+        let (mut map, monotonic) = if allow_par {
+            rayon::join(
+                || bpe::MergeMap::new_with_parallel(&merges, true),
+                check_monotonic,
+            )
+        } else {
+            (bpe::MergeMap::new(&merges), check_monotonic())
         };
 
         let ignore_lookup = if ignore_merges {
