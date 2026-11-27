@@ -159,11 +159,10 @@ trait Simd: Copy {
 
     /// Extract set-bit positions of `trusted` (adding `base`) into `out[k..]`,
     /// returning the updated `k`.
-    unsafe fn extract_ends(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize {
-        extract_ends_pos32(trusted, base, op, k)
-    }
+    unsafe fn extract_ends(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize;
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 unsafe fn extract_ends_pos32(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize {
     let x = trusted - ((trusted >> 1) & 0x5555_5555_5555_5555);
@@ -234,17 +233,53 @@ impl Simd for Neon {
         use std::arch::aarch64::*;
         let x = [v.0, v.1, v.2, v.3];
         let k = |v: u8| vdupq_n_u8(v);
+        let l = Self::tomask(x.map(|v| vcltq_u8(vsubq_u8(vorrq_u8(v, k(0x20)), k(b'a')), k(26))));
+        // `tomask` reads only bit 7 of each byte: shift bit 5 (`0x20`) to bit 7
+        // for `up`, reuse `sp` for `ws`, and pass `x` directly for `na` (-16 ops/64B).
+        let sp = Self::tomask(x.map(|v| vceqq_u8(v, k(b' '))));
         Classes {
-            l: Self::tomask(x.map(|v| vcltq_u8(vsubq_u8(vorrq_u8(v, k(0x20)), k(b'a')), k(26)))),
-            up: Self::tomask(x.map(|v| vcltq_u8(vsubq_u8(v, k(b'A')), k(26)))),
+            l,
+            up: !Self::tomask(x.map(|v| vshlq_n_u8::<2>(v))) & l,
             d: Self::tomask(x.map(|v| vcltq_u8(vsubq_u8(v, k(b'0')), k(10)))),
-            sp: Self::tomask(x.map(|v| vceqq_u8(v, k(b' ')))),
+            sp,
             nl: Self::tomask(x.map(|v| vorrq_u8(vceqq_u8(v, k(b'\n')), vceqq_u8(v, k(b'\r'))))),
-            ws: Self::tomask(x.map(|v| vorrq_u8(vceqq_u8(v, k(b' ')), vcltq_u8(vsubq_u8(v, k(0x09)), k(5))))),
+            ws: sp | Self::tomask(x.map(|v| vcltq_u8(vsubq_u8(v, k(0x09)), k(5)))),
             q: Self::tomask(x.map(|v| vceqq_u8(v, k(b'\'')))),
             sl: Self::tomask(x.map(|v| vceqq_u8(v, k(b'/')))),
-            na: Self::tomask(x.map(|v| vcgeq_u8(v, k(0x80)))),
+            na: Self::tomask(x),
         }
+    }
+
+    #[inline(always)]
+    unsafe fn extract_ends(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize {
+        use std::arch::aarch64::*;
+        // Hardware per-byte `cnt` + 2 KiB `POS8` table (4x smaller in L1d than 8 KiB POS32).
+        let cnt_v = vcnt_u8(vreinterpret_u8_u64(vdup_n_u64(trusted)));
+        let cnts = vget_lane_u64::<0>(vreinterpret_u64_u8(cnt_v));
+        let incl = cnts.wrapping_mul(0x0101_0101_0101_0101);
+        let excl = incl << 8;
+        let mut add0 = vdupq_n_u32(base as u32);
+        let mut add1 = vdupq_n_u32((base + 8) as u32);
+        let c16 = vdupq_n_u32(16);
+        let p8 = POS8.as_ptr() as *const u8;
+        for pair in 0..4usize {
+            let j0 = pair * 2;
+            let b0 = (trusted >> (8 * j0)) as u8 as usize;
+            let r16_0 = vmovl_u8(vld1_u8(p8.add(b0 * 8)));
+            let at0 = k + ((excl >> (8 * j0)) as u8 as usize);
+            vst1q_u32(op.add(at0), vaddq_u32(vmovl_u16(vget_low_u16(r16_0)), add0));
+            vst1q_u32(op.add(at0 + 4), vaddq_u32(vmovl_high_u16(r16_0), add0));
+            add0 = vaddq_u32(add0, c16);
+
+            let j1 = j0 + 1;
+            let b1 = (trusted >> (8 * j1)) as u8 as usize;
+            let r16_1 = vmovl_u8(vld1_u8(p8.add(b1 * 8)));
+            let at1 = k + ((excl >> (8 * j1)) as u8 as usize);
+            vst1q_u32(op.add(at1), vaddq_u32(vmovl_u16(vget_low_u16(r16_1)), add1));
+            vst1q_u32(op.add(at1 + 4), vaddq_u32(vmovl_high_u16(r16_1), add1));
+            add1 = vaddq_u32(add1, c16);
+        }
+        k + (incl >> 56) as usize
     }
 
     #[inline(always)]
@@ -357,6 +392,11 @@ impl Simd for Sse2 {
         m.na = 0;
         (foll, punct, true)
     }
+
+    #[inline(always)]
+    unsafe fn extract_ends(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize {
+        extract_ends_pos32(trusted, base, op, k)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -449,6 +489,11 @@ impl Simd for Avx2 {
         m.up |= upper;
         m.na = 0;
         (foll, punct, true)
+    }
+
+    #[inline(always)]
+    unsafe fn extract_ends(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize {
+        extract_ends_pos32(trusted, base, op, k)
     }
 }
 
@@ -570,6 +615,11 @@ impl Simd for Scalar {
     #[inline(always)]
     unsafe fn resolve_latin1_vec(_v: Self::Vec64, _valid: u64, _m: &mut Classes) -> (u64, u64, bool) {
         (0, 0, false)
+    }
+
+    #[inline(always)]
+    unsafe fn extract_ends(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize {
+        extract_ends_pos32(trusted, base, op, k)
     }
 }
 
@@ -1843,11 +1893,32 @@ pub fn chunks_batched(kind: Pretok, b: &[u8], start: usize, stop: usize, fb: imp
 }
 
 /// Set-bit positions of every byte value as 8 u32 lanes (unused lanes 0).
+#[cfg(not(target_arch = "aarch64"))]
 static POS32: [[u32; 8]; 256] = {
     let mut t = [[0u32; 8]; 256];
     let mut v = 0;
     while v < 256 {
         let (mut x, mut j, mut bit) = (v, 0usize, 0u32);
+        while x != 0 {
+            if x & 1 == 1 {
+                t[v][j] = bit;
+                j += 1;
+            }
+            x >>= 1;
+            bit += 1;
+        }
+        v += 1;
+    }
+    t
+};
+
+/// Compact 2 KiB set-bit positions table for NEON widening extraction.
+#[cfg(target_arch = "aarch64")]
+static POS8: [[u8; 8]; 256] = {
+    let mut t = [[0u8; 8]; 256];
+    let mut v = 0;
+    while v < 256 {
+        let (mut x, mut j, mut bit) = (v, 0usize, 0u8);
         while x != 0 {
             if x & 1 == 1 {
                 t[v][j] = bit;
