@@ -2335,13 +2335,13 @@ impl Tokenizer {
                 continue;
             }
             let d: &[u8] = &norm[doc as usize];
-            if !trusted[doc as usize] && simdutf8::basic::from_utf8(&d[a0..b0]).is_err() {
-                bad_bytes(doc);
-                continue;
-            }
             let n = d.len();
             let (start, stop) = if seg { (a0, b0) } else { (0, n) };
             if n > u32::MAX as usize {
+                if !trusted[doc as usize] && simdutf8::basic::from_utf8(&d[a0..b0]).is_err() {
+                    bad_bytes(doc);
+                    continue;
+                }
                 flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                 cnt = 0;
                 segs.clear();
@@ -2370,6 +2370,9 @@ impl Tokenizer {
                     cnt = 0;
                     segs.clear();
                 }
+            }
+            if !trusted[doc as usize] && scan.needs_utf8(stop) && simdutf8::basic::from_utf8(&d[a0..b0]).is_err() {
+                bad_bytes(doc);
             }
         }
         flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
@@ -2820,27 +2823,35 @@ impl Tokenizer {
         let mut bad_local: Option<usize> = None;
         let n = chunk.len();
         let k = sep.len();
+        let sep1 = if k == 1 { Some(sep[0]) } else { None };
         loop {
-            let m = finder.find(&chunk[p..]);
+            let m = match sep1 {
+                Some(b0) => memchr::memchr(b0, &chunk[p..]),
+                None => finder.find(&chunk[p..]),
+            };
             let doc_end = match m {
                 Some(rel) => p + rel,
                 None => n,
             };
             let di = doc_counts.len();
             doc_counts.push(0);
-            let doc = &chunk[p..doc_end];
-            if !doc.is_empty() {
-                if !trusted && simdutf8::basic::from_utf8(doc).is_err() {
-                    if bad_local.is_none() {
-                        bad_local = Some(di);
+            let doc_len = doc_end - p;
+            if doc_len != 0 {
+                let avail = &chunk[p..];
+                let doc = &avail[..doc_len];
+                if doc_len > u32::MAX as usize {
+                    if !trusted && simdutf8::basic::from_utf8(doc).is_err() {
+                        if bad_local.is_none() {
+                            bad_local = Some(di);
+                        }
+                    } else {
+                        flush(&buf[..cnt], &ends[..cnt], &segs, s, doc_counts, view, lview);
+                        cnt = 0;
+                        segs.clear();
+                        let before = s.out.len();
+                        self.encode_range(doc, 0, doc_len, s);
+                        doc_counts[di] += s.out.len() - before;
                     }
-                } else if doc.len() > u32::MAX as usize {
-                    flush(&buf[..cnt], &ends[..cnt], &segs, s, doc_counts, view, lview);
-                    cnt = 0;
-                    segs.clear();
-                    let before = s.out.len();
-                    self.encode_range(doc, 0, doc.len(), s);
-                    doc_counts[di] += s.out.len() - before;
                 } else {
                     let mut scan = blockscan::Scan::new(0);
                     let mut a = 0usize;
@@ -2849,12 +2860,15 @@ impl Tokenizer {
                             view = self.learned.view();
                             lview = self.long_table.view();
                         }
-                        let k1 = scan.fill(self.kind, doc, doc.len(), &mut ends, cnt, CAP);
+                        let k1 = scan.fill_in(self.kind, avail, doc_len, doc_len, &mut ends, cnt, CAP);
                         if k1 == cnt {
                             break;
                         }
                         let first_a = a;
-                        a = self.fill_recs(doc, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
+                        // Pass `avail` (the full macro-chunk tail) so `pack_wide_any`
+                        // reads 16 bytes directly without calling `pack_tail` on the
+                        // last 16 bytes of every short document!
+                        a = self.fill_recs(avail, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
                         segs.push((cnt, k1, di, first_a, p, doc_end));
                         cnt = k1;
                         if cnt >= CAP {
@@ -2862,6 +2876,12 @@ impl Tokenizer {
                             cnt = 0;
                             segs.clear();
                         }
+                    }
+                    if !trusted && scan.needs_utf8(doc_len) && simdutf8::basic::from_utf8(doc).is_err() {
+                        if bad_local.is_none() {
+                            bad_local = Some(di);
+                        }
+                        break;
                     }
                 }
             }
