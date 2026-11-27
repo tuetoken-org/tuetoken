@@ -9,6 +9,7 @@
 //!   * no canonical composition has an ASCII char as its SECOND element, so an
 //!     ASCII char never composes with what precedes it;
 //!   * it is NF*_QC = Yes, i.e. unchanged by (de)composition itself.
+//!
 //! (An ASCII char CAN be the first element of a composition — `e` + U+0301 ->
 //! `é` — so each non-ASCII run is normalized together with the one ASCII char
 //! in front of it.)
@@ -138,6 +139,7 @@ pub enum NormStage {
 pub struct Normalizer {
     stages: Vec<NormStage>,
     fast_unicode: u8,
+    ascii_identity: bool,
 }
 
 fn parse_stages(val: &Value, out: &mut Vec<NormStage>) -> Result<(), String> {
@@ -238,13 +240,23 @@ impl Normalizer {
         } else {
             0
         };
-        Ok(Normalizer { stages, fast_unicode })
+        let ascii_identity = stages
+            .iter()
+            .all(|s| matches!(s, NormStage::Unicode(_) | NormStage::StripAccents));
+        Ok(Normalizer { stages, fast_unicode, ascii_identity })
     }
 
     /// True when the normalizer is a no-op (null or empty Sequence).
     #[inline(always)]
     pub fn is_identity(&self) -> bool {
         self.stages.is_empty()
+    }
+
+    /// True when the normalizer is guaranteed to leave every pure-ASCII string
+    /// byte-for-byte unchanged (empty pipeline, NFC/NFD/NFKC/NFKD, StripAccents).
+    #[inline(always)]
+    pub fn is_ascii_identity(&self) -> bool {
+        self.ascii_identity
     }
 
     /// True if any stage replaces `' '` with `ch` (e.g. SentencePiece `'▁'`).

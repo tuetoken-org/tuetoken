@@ -758,6 +758,88 @@ def test_tekken_and_legacy_formats():
     return ok, tot
 
 
+def test_review_regressions():
+    """Regressions for Unicode lstrip/rstrip, NFC FastBatch mixed scripts/errors,
+    and HF/vLLM AutoTokenizer protocol helpers (is_fast, get_added_vocab,
+    convert_tokens_to_string)."""
+    print("=== review regressions (Unicode strip, NFC FastBatch, vLLM helpers) ===")
+    import json
+    import tempfile
+    ok = tot = 0
+    # 1. Synthetic NFC ByteLevel tokenizer with Unicode lstrip/rstrip added token
+    from tuetoken import _tiktoken as _tt
+    base_tj = json.load(open(_tt.get_cached_tokenizer_path("cl100k_base"), encoding="utf-8"))
+    base_tj["normalizer"] = {"type": "NFC"}
+    strip_id = max(base_tj["model"]["vocab"].values()) + 10
+    base_tj["added_tokens"].append({
+        "id": strip_id, "content": "<|strip|>", "single_word": False,
+        "lstrip": True, "rstrip": True, "normalized": False, "special": True,
+    })
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(base_tj, f)
+        tmp_path = f.name
+    try:
+        at = tuetoken.AutoTokenizer.from_file(tmp_path)
+        core = tuetoken.Tokenizer(tmp_path)
+        # HF/vLLM helpers
+        tot += 1; ok += (at.is_fast is True)
+        added_v = at.get_added_vocab()
+        tot += 1; ok += (added_v.get("<|strip|>") == strip_id)
+        toks = at.tokenize("Hello, world!")
+        tot += 1; ok += (at.convert_tokens_to_string(toks) == "Hello, world!")
+
+        # Unicode whitespace lstrip/rstrip (\u00a0 NBSP, \u2003 EM SPACE, \u3000 IDEOGRAPHIC SPACE)
+        want_strip = core.encode_ordinary("hello") + [strip_id] + core.encode_ordinary("world")
+        for s in [
+            "hello <|strip|> world",
+            "hello\u00a0<|strip|>\u00a0world",
+            "hello\u2003<|strip|>\u3000world",
+        ]:
+            tot += 1; ok += (at.encode(s, add_special_tokens=False) == want_strip)
+
+        # NFC FastBatch on mixed ASCII, Latin-1, UCS-2, UCS-4, NFD decomposed, and bytes
+        mixed = [
+            "pure ascii sentence 123",
+            "caf\u00e9 na\u00efve \u00c4\u00d6\u00dc",
+            "cafe\u0301 naive\u0308 A\u0308O\u0308U\u0308",  # NFD -> NFC changes bytes!
+            "日本語と한국어と中文",
+            "emojis 🚀🔥✨ and café + cafe\u0301",
+            b"bytes ascii + cafe\xcc\x81!",
+            "",
+        ] * 20
+        want_batch = [
+            core.encode_ordinary(x.decode("utf-8") if isinstance(x, bytes) else x)
+            for x in mixed
+        ]
+        for nt in (1, 0):
+            got = core.encode_ordinary_batch(mixed, num_threads=nt)
+            tot += 1; ok += (got == want_batch)
+            got_cnt = core.count_tokens_batch(mixed, num_threads=nt)
+            tot += 1; ok += (got_cnt == [len(w) for w in want_batch])
+            buf = core.encode_ordinary_to_buffer(mixed, num_threads=nt)
+            offs = buf["offsets"]
+            got_buf = [buf["data"][offs[i]:offs[i + 1]].tolist() for i in range(len(mixed))]
+            tot += 1; ok += (got_buf == want_batch)
+        # Invalid UTF-8 bytes & lone surrogate in NFC FastBatch must still raise
+        try:
+            core.encode_ordinary_batch(["ok", b"\xff\xfe"], num_threads=1)
+            raised_b = False
+        except ValueError:
+            raised_b = True
+        tot += 1; ok += raised_b
+        try:
+            core.encode_ordinary_batch(["ok", "\ud800"], num_threads=1)
+            raised_s = False
+        except (ValueError, UnicodeEncodeError):
+            raised_s = True
+        tot += 1; ok += raised_s
+    finally:
+        os.unlink(tmp_path)
+    _line("review regressions", ok, tot)
+    assert ok == tot, f"review_regressions: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -765,6 +847,7 @@ def main():
         test_normalization(), test_new_features(), test_rank_inversion(),
         test_auto(), test_kimi_tiktoken_model(), test_tekken_and_legacy_formats(),
         test_bytes_inputs(), test_warmup_and_fast_startup(),
+        test_review_regressions(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

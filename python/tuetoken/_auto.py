@@ -36,6 +36,8 @@ class _ChatDict(dict):
 
 
 class AutoTokenizer:
+    is_fast = True
+
     # ---- construction -------------------------------------------------------
     def __init__(self, tokenizer_json, config=None, warmup=None):
         self._tokenizer_json = tokenizer_json
@@ -251,6 +253,13 @@ class AutoTokenizer:
     def get_vocab(self):
         return dict(self._token_to_id)
 
+    def get_added_vocab(self):
+        return dict(self._added_content_to_id)
+
+    def convert_tokens_to_string(self, tokens):
+        ids = [i for i in (self._token_to_id.get(t) for t in tokens) if i is not None]
+        return self._core.decode(ids)
+
     @property
     def vocab_size(self):
         return self._core.n_vocab
@@ -445,20 +454,21 @@ class AutoTokenizer:
         # no Python per-row work or int-boxing.
         if return_tensors in ("np", "pt") and text_pair is None:
             prefix, suffix = self._post_prefix_suffix() if add_special_tokens else ([], [])
-            d = self._core.encode_special_padded(
-                texts, prefix, suffix, max_length, self.pad_token_id or 0,
-                bool(truncation), padding == "max_length",
-                self.padding_side == "left", self.truncation_side == "left", 0)
-            out = {"input_ids": d["input_ids"]}
-            if return_attention_mask:
-                out["attention_mask"] = d["attention_mask"]
-            if return_token_type_ids:
-                import numpy as np
-                out["token_type_ids"] = np.zeros_like(d["input_ids"])
-            if return_tensors == "pt":
-                import torch
-                out = {k: torch.as_tensor(v) for k, v in out.items()}
-            return out
+            if not add_special_tokens or self.__dict__.get("_ps_exact", False):
+                d = self._core.encode_special_padded(
+                    texts, prefix, suffix, max_length, self.pad_token_id or 0,
+                    bool(truncation), padding == "max_length",
+                    self.padding_side == "left", self.truncation_side == "left", 0)
+                out = {"input_ids": d["input_ids"]}
+                if return_attention_mask:
+                    out["attention_mask"] = d["attention_mask"]
+                if return_token_type_ids:
+                    import numpy as np
+                    out["token_type_ids"] = np.zeros_like(d["input_ids"])
+                if return_tensors == "pt":
+                    import torch
+                    out = {k: torch.as_tensor(v) for k, v in out.items()}
+                return out
 
         # Rust fast path for lists (single sequences): encode + specials +
         # truncation build the rows in one Rust pass; Python only adds masks and

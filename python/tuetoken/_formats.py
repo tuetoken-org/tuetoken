@@ -218,12 +218,13 @@ def get_tekken_tokenizer_path(tekken_path, cache_dir=None):
         raw = json.load(f)
     tj, default_cfg = build_tekken_tokenizer_json(raw)
 
-    tmp_tj = str(cached_tj) + ".tmp"
+    pid = os.getpid()
+    tmp_tj = f"{cached_tj}.{pid}.tmp"
     with open(tmp_tj, "w", encoding="utf-8") as f:
         json.dump(tj, f)
     os.replace(tmp_tj, str(cached_tj))
 
-    tmp_cfg = str(cached_cfg) + ".tmp"
+    tmp_cfg = f"{cached_cfg}.{pid}.tmp"
     with open(tmp_cfg, "w", encoding="utf-8") as f:
         json.dump(default_cfg, f)
     os.replace(tmp_cfg, str(cached_cfg))
@@ -292,8 +293,19 @@ def try_load_legacy_bpe_repo(repo_id, revision=None, cache_dir=None):
 
     abs_v = os.path.abspath(vocab_path)
     abs_m = os.path.abspath(merges_path)
+    st_v = os.stat(abs_v)
+    st_m = os.stat(abs_m)
+    at_path = None
+    at_sig = ""
+    try:
+        at_path = os.path.abspath(hf_hub_download(repo_id, "added_tokens.json", **kw))
+        st_a = os.stat(at_path)
+        at_sig = f"{at_path}:{st_a.st_size}:{st_a.st_mtime_ns}"
+    except Exception:
+        pass
     key = hashlib.sha1(
-        f"v1\x00{abs_v}\x00{abs_m}\x00{tok_cls}\x00{model_type}\x00{cfg.get('add_prefix_space', False)}".encode()
+        f"v2\x00{abs_v}:{st_v.st_size}:{st_v.st_mtime_ns}\x00{abs_m}:{st_m.st_size}:{st_m.st_mtime_ns}"
+        f"\x00{at_sig}\x00{tok_cls}\x00{model_type}\x00{cfg.get('add_prefix_space', False)}\x00{cfg.get('add_bos_token', True)}".encode()
     ).hexdigest()[:16]
     cdir = Path(cache_dir) if cache_dir else (Path.home() / ".cache" / "tuetoken")
     cdir.mkdir(parents=True, exist_ok=True)
@@ -315,13 +327,13 @@ def try_load_legacy_bpe_repo(repo_id, revision=None, cache_dir=None):
 
     # Collect added / special tokens from config + optional added_tokens.json
     added_map = {}
-    try:
-        at_path = hf_hub_download(repo_id, "added_tokens.json", **kw)
-        with open(at_path, encoding="utf-8") as f:
-            for content, tid in json.load(f).items():
-                added_map[content] = (int(tid), False)
-    except Exception:
-        pass
+    if at_path is not None:
+        try:
+            with open(at_path, encoding="utf-8") as f:
+                for content, tid in json.load(f).items():
+                    added_map[content] = (int(tid), False)
+        except Exception:
+            pass
 
     for field in ("bos_token", "eos_token", "unk_token", "pad_token", "cls_token", "sep_token", "mask_token"):
         c = _tok_content(cfg.get(field))
@@ -391,7 +403,7 @@ def try_load_legacy_bpe_repo(repo_id, revision=None, cache_dir=None):
         "decoder": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True},
         "added_tokens": added_tokens,
     }
-    tmp = str(cached_tj) + ".tmp"
+    tmp = f"{cached_tj}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(tj, f)
     os.replace(tmp, str(cached_tj))

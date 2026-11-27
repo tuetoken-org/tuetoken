@@ -688,7 +688,9 @@ unsafe fn classify_with<S: Simd>(b: &[u8], base: usize) -> Classes {
 #[allow(dead_code)]
 pub fn classify(b: &[u8], base: usize) -> Classes {
     #[cfg(target_arch = "aarch64")]
-    return unsafe { classify_with::<Neon>(b, base) };
+    {
+        unsafe { classify_with::<Neon>(b, base) }
+    }
     #[cfg(target_arch = "x86_64")]
     {
         #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
@@ -699,14 +701,16 @@ pub fn classify(b: &[u8], base: usize) -> Classes {
         unsafe fn c256(b: &[u8], base: usize) -> Classes {
             classify_with::<Avx2>(b, base)
         }
-        return match x86_tier() {
+        match x86_tier() {
             3 => unsafe { c512(b, base) },
             2 => unsafe { c256(b, base) },
             _ => unsafe { classify_with::<Sse2>(b, base) },
-        };
+        }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    classify_scalar(b, base)
+    {
+        classify_scalar(b, base)
+    }
 }
 
 /// Contraction length at an apostrophe at `q` (0 = none). `ci`: case-insensitive.
@@ -821,16 +825,18 @@ fn resolve_na<const CONT: bool>(b: &[u8], base: usize, m: &mut Classes) -> u64 {
         let c = b[base + i];
         if c == 0xC3 && i + 1 < lim {
             let d = b[base + i + 1];
-            let w = 3u64 << i;
-            if d == 0x97 || d == 0xB7 { up |= w } else { ul |= w }
-            if d <= 0x9E && d != 0x97 {
-                upper |= w;
+            if (d & 0xC0) == 0x80 {
+                let w = 3u64 << i;
+                if d == 0x97 || d == 0xB7 { up |= w } else { ul |= w }
+                if d <= 0x9E && d != 0x97 {
+                    upper |= w;
+                }
+                if CONT {
+                    cont |= 2u64 << i;
+                }
+                r &= !w;
+                continue;
             }
-            if CONT {
-                cont |= 2u64 << i;
-            }
-            r &= !w;
-            continue;
         }
         if c == 0xE2 && i + 2 < lim && b[base + i + 1] == 0x80 {
             let d = b[base + i + 2];
@@ -865,8 +871,8 @@ fn ctx_m<const RESOLVE: bool, const CONT: bool>(b: &[u8], base: usize, mut m: Cl
         o: !(m.l | m.d | m.ws | m.na) & valid,
         m,
         valid,
-        next_ws: next.map_or(false, is_ws),
-        next_na: next.map_or(false, |c| c >= 0x80),
+        next_ws: next.is_some_and(is_ws),
+        next_na: next.is_some_and(|c| c >= 0x80),
         cont,
     }
 }
@@ -1213,6 +1219,7 @@ unsafe fn generic_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, max_
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn camel_fast<const FULL: bool>(
     b: &[u8],
     base: usize,
@@ -1973,6 +1980,7 @@ fn validate_dirty_span(b: &[u8], lo: usize, hi: usize) -> bool {
 /// on exact UTF-8 boundaries and can be validated surgically (typically 64B)
 /// without re-scanning the surrounding clean document!
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_loop<S: Simd>(
     scan: &mut Scan,
     kind: Pretok,
@@ -2085,64 +2093,76 @@ unsafe fn fill_loop<S: Simd>(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn fill_word_neon(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
     unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Neon>(a, dl, base, indiv, f, s)) }
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn fill_generic_neon(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Neon>(a, dl, base, max_digits, f, s)) }
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn fill_camel_neon(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Neon>(a, dl, base, contractions, max_digits, f, s)) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_word_avx512(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Avx512>(a, dl, base, indiv, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_generic_avx512(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512>(a, dl, base, max_digits, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_camel_avx512(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Avx512>(a, dl, base, contractions, max_digits, f, s))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_word_avx2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Avx2>(a, dl, base, indiv, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_generic_avx2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx2>(a, dl, base, max_digits, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_camel_avx2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Avx2>(a, dl, base, contractions, max_digits, f, s))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_word_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Sse2>(a, dl, base, indiv, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_generic_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Sse2>(a, dl, base, max_digits, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn fill_camel_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
     fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Sse2>(a, dl, base, contractions, max_digits, f, s))
 }
@@ -2200,6 +2220,7 @@ impl Scan {
     /// `doc = &avail[..doc_len]` (`stop <= doc_len <= avail.len()`). Enables
     /// zero-copy 64-byte SIMD loads even on document tails.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_in(&mut self, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, out: &mut [u32], k: usize, limit: usize) -> usize {
         assert!(out.len() >= limit + SCAN_SLACK);
         debug_assert!(stop <= doc_len && doc_len <= avail.len());

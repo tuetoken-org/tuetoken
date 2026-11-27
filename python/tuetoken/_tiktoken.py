@@ -353,8 +353,8 @@ def get_cached_tokenizer_path(name, cache_dir=None):
     # Download, convert, and cache
     tokenizer_json = convert_tiktoken_encoding(encoding_name)
 
-    # Write atomically
-    tmp_path = str(cached_path) + ".tmp"
+    # Write atomically (PID-unique temp name prevents races across worker processes)
+    tmp_path = f"{cached_path}.{os.getpid()}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(tokenizer_json, f)
     os.replace(tmp_path, str(cached_path))
@@ -459,7 +459,7 @@ def get_tiktoken_model_path(source, pattern, special_tokens=None, revision=None,
     if not cached.exists():
         ranks = load_tiktoken_model_file(model_path)
         tj = build_tiktoken_model_json(ranks, pattern, special_tokens)
-        tmp = str(cached) + ".tmp"
+        tmp = f"{cached}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(tj, f)
         os.replace(tmp, str(cached))

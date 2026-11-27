@@ -71,9 +71,6 @@ pub struct MergeMap {
     /// (true for 100% of gpt2 / cl100k / o200k), `linear_off != u32::MAX` and
     /// `target(rank)` is one ADD with zero memory loads; otherwise `targets[rank]`.
     linear_off: u32,
-    /// True iff every merge target has token ID >= 256 (true for all standard
-    /// ByteLevel BPEs), letting the inner merge loop skip the `merged >= 256` check.
-    all_targets_ge_256: bool,
     /// Number of token IDs covered by `can_lr` (`can_lr.len() * 4`).
     vocab_n: usize,
     targets: Vec<u32>,
@@ -114,7 +111,6 @@ impl MergeMap {
         } else {
             u32::MAX
         };
-        let all_targets_ge_256 = merges.iter().all(|&(_, _, tg)| tg >= 256);
         let targets = if linear_off == u32::MAX {
             merges.iter().map(|&(_, _, tg)| tg).collect()
         } else {
@@ -298,7 +294,6 @@ impl MergeMap {
             can_lr,
             bloom,
             linear_off,
-            all_targets_ge_256,
             vocab_n,
             targets,
         }
@@ -514,8 +509,8 @@ impl MergeMap {
         }
     }
 
-    /// x86_64 AVX-512F 8-wide branchless 64B-bucket probe: 1 aligned 64B load
-    /// + `vpandq` + `vpcmpeqq` + `vpcompressq` extracts the matching rank in
+    /// x86_64 AVX-512F 8-wide branchless 64B-bucket probe: 1 aligned 64B load,
+    /// `vpandq`, `vpcmpeqq`, and `vpcompressq` extract the matching rank in
     /// registers with 1 branch across all 8 slots and zero wrap masking.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,bmi1,bmi2")]
@@ -574,17 +569,21 @@ impl MergeMap {
     #[inline(always)]
     fn probe_bucket_best(&self, kh: u64, b: usize) -> u32 {
         #[cfg(target_arch = "aarch64")]
-        return unsafe { self.probe_bucket_neon(kh, b) };
+        {
+            unsafe { self.probe_bucket_neon(kh, b) }
+        }
         #[cfg(target_arch = "x86_64")]
         {
             match bpe_x86_tier() {
-                3 => return unsafe { self.probe_bucket_avx512(kh, b) },
-                2 => return unsafe { self.probe_bucket_avx2(kh, b) },
-                _ => return self.probe_bucket_scalar(kh, b),
+                3 => unsafe { self.probe_bucket_avx512(kh, b) },
+                2 => unsafe { self.probe_bucket_avx2(kh, b) },
+                _ => self.probe_bucket_scalar(kh, b),
             }
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        self.probe_bucket_scalar(kh, b)
+        {
+            self.probe_bucket_scalar(kh, b)
+        }
     }
 
     #[inline(always)]
@@ -1064,7 +1063,7 @@ fn bpe_x86_tier() -> u8 {
 macro_rules! merge_small_ll_body {
     ($tokens:expr, $map:expr, $probe:ident) => {{
         let n = $tokens.len();
-        debug_assert!(n >= 2 && n <= MAX_SMALL && !$map.buckets.is_empty());
+        debug_assert!((2..=MAX_SMALL).contains(&n) && !$map.buckets.is_empty());
         if n == 2 {
             let r = $map.lookup_rank(*$tokens.get_unchecked(0), *$tokens.get_unchecked(1));
             if r != u32::MAX {
@@ -1294,7 +1293,7 @@ fn merge_small_canonical(tokens: &mut Vec<u32>, map: &MergeMap) {
 macro_rules! merge_bytes_ll_body {
     ($chunk:expr, $singleton:expr, $map:expr, $out:expr, $probe:ident) => {{
         let n = $chunk.len();
-        debug_assert!(n >= 1 && n <= MAX_SMALL && !$map.dense_byte.is_empty());
+        debug_assert!((1..=MAX_SMALL).contains(&n) && !$map.dense_byte.is_empty());
         let cp = $chunk.as_ptr();
         if n == 1 {
             $out.push(*$singleton.get_unchecked(*cp as usize));
@@ -1453,7 +1452,7 @@ macro_rules! merge_bytes_ll_body {
             std::ptr::copy_nonoverlapping(INIT_PREV.as_ptr(), prev, 64);
             std::ptr::copy_nonoverlapping(INIT_NEXT.as_ptr(), next, 64);
         }
-        let fast_target = $map.linear_off != u32::MAX && $map.all_targets_ge_256;
+        let fast_target = $map.linear_off != u32::MAX;
         let lin_off = $map.linear_off;
         loop {
             let rank = best >> 6;

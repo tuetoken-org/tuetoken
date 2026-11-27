@@ -242,6 +242,17 @@ fn word(b: &[u8], start: usize, indiv_digits: bool) -> usize {
 }
 
 fn generic(b: &[u8], start: usize, max_digits: u32, marks: bool) -> usize {
+    generic_impl(b, start, max_digits, marks, 1)
+}
+
+/// Generic pre-tokenizer variant whose symbol branch (` ?[^\s\p{L}\p{N}\r\n]+`)
+/// does NOT absorb trailing `\r`/`\n` (`trail = 0`, e.g. Seed-Coder).
+pub(crate) fn next_chunk_end_generic_no_nl(b: &[u8], start: usize, max_digits: u32, marks: bool) -> usize {
+    generic_impl(b, start, max_digits, marks, 0)
+}
+
+#[inline]
+fn generic_impl(b: &[u8], start: usize, max_digits: u32, marks: bool, sym_trail: u8) -> usize {
     let n = b.len();
     if let Some(e) = contraction(b, start, true) {
         return e;
@@ -280,8 +291,8 @@ fn generic(b: &[u8], start: usize, max_digits: u32, marks: bool) -> usize {
             return pos;
         }
     }
-    // ` ?[^\s\p{L}\p{N}]+[\r\n]*`  (excludes Marks when `marks`)
-    if let Some(e) = symbol_run(b, start, 1, marks) {
+    // ` ?[^\s\p{L}\p{N}]+[\r\n]*`  (excludes Marks when `marks`; `sym_trail = 0` drops `[\r\n]*`)
+    if let Some(e) = symbol_run(b, start, sym_trail, marks) {
         return e;
     }
     // `\s*[\r\n]+`

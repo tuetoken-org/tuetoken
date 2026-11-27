@@ -10,8 +10,7 @@
 //!      A `[ascii-punct][A-Za-z]+`                       (snake_case-style)
 //!      B `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`         optional prefix + letter/mark run
 //!      C ` ?[\p{P}\p{S}]+[\r\n]*`                       optional space + punct/symbol run
-//!      D `\s*[\r\n]+`   E `\s+(?!\S)`   F `\s+`         whitespace (same as the
-//!                                                       generic/camelcase machines)
+//!      D `\s*[\r\n]+`   E `\s+(?!\S)`   F `\s+`         whitespace (generic/camelcase rules)
 //!
 //! Each stage's regex is run by HF per-substring (on the piece), so the `(?!\S)`
 //! lookahead is bounded by the piece — which is why the whitespace helpers stop at
@@ -237,6 +236,28 @@ fn apply_stage(stage: Stage, b: &[u8], cur: &[(usize, usize)], nxt: &mut Vec<(us
         if last < pe {
             nxt.push((last, pe));
         }
+    }
+}
+
+/// Apply only the DeepSeek stage-3 `Main` Isolated Split pattern to `sub`
+/// (`base`-anchored), pushing resulting `(abs_start, abs_end)` pieces to `out`.
+/// Reused by `PretokPipe` whenever any model (e.g. Dolphin-X1) embeds this exact
+/// regex stage.
+pub(crate) fn split_main_stage(sub: &str, base: usize, out: &mut Vec<(usize, usize)>) {
+    let b = sub.as_bytes();
+    let pe = b.len();
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some((ms, me)) = find_next(Stage::Main, b, from, pe) {
+        if ms > last {
+            out.push((base + last, base + ms));
+        }
+        out.push((base + ms, base + me));
+        last = me;
+        from = me;
+    }
+    if last < pe {
+        out.push((base + last, base + pe));
     }
 }
 

@@ -50,7 +50,7 @@ pub struct ChunkTable {
 /// SAFETY: `p .. p+len` must be readable; `1 <= len <= 15`.
 #[inline(always)]
 pub unsafe fn pack_short_safe(p: *const u8, len: usize) -> (u64, u64) {
-    debug_assert!(len >= 1 && len <= MAX_KEY);
+    debug_assert!((1..=MAX_KEY).contains(&len));
     let (lo, hi_bytes) = if len >= 8 {
         let lo = u64::from_le((p as *const u64).read_unaligned());
         let hi_raw = u64::from_le((p.add(len - 8) as *const u64).read_unaligned());
@@ -74,7 +74,7 @@ pub unsafe fn pack_short_safe(p: *const u8, len: usize) -> (u64, u64) {
 #[inline(always)]
 pub fn pack(chunk: &[u8]) -> (u64, u64) {
     let n = chunk.len();
-    debug_assert!(n >= 1 && n <= MAX_KEY);
+    debug_assert!((1..=MAX_KEY).contains(&n));
     // SAFETY: chunk has `n` readable bytes with 1 <= n <= MAX_KEY.
     unsafe { pack_short_safe(chunk.as_ptr(), n) }
 }
@@ -86,7 +86,7 @@ pub fn pack(chunk: &[u8]) -> (u64, u64) {
 /// SAFETY: `p .. p+16` must be readable; 1 ≤ len ≤ 15.
 #[inline(always)]
 pub unsafe fn pack_wide(p: *const u8, len: usize) -> (u64, u64) {
-    debug_assert!(len >= 1 && len <= MAX_KEY);
+    debug_assert!((1..=MAX_KEY).contains(&len));
     let (m0, m1) = *KEY_MASK64.get_unchecked(len);
     let lo = u64::from_le((p as *const u64).read_unaligned()) & m0;
     let hi = (u64::from_le((p.add(8) as *const u64).read_unaligned()) & m1) | ((len as u64) << 56);
@@ -606,10 +606,8 @@ struct ArenaMap {
 
 #[inline(always)]
 pub fn hash_bytes(key: &[u8]) -> u64 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let mut h = rustc_hash::FxBuildHasher.build_hasher();
-    key.hash(&mut h);
-    h.finish() | 1
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(key) | 1
 }
 
 impl ArenaMap {
@@ -723,7 +721,7 @@ const LONG_MAX_BYTES: usize = u16::MAX as usize; // matches ArenaSlot::k_len: u1
 impl LongCache {
     #[inline]
     pub fn claim(&mut self, owner: u64) {
-        if self.maps.first().map_or(false, |m| m.owner == owner) {
+        if self.maps.first().is_some_and(|m| m.owner == owner) {
             return;
         }
         if let Some(i) = self.maps.iter().position(|m| m.owner == owner) {
@@ -848,9 +846,11 @@ pub enum InlineHit {
 const SHARED_MIN_BITS: u32 = 14;
 
 /// Inserts a thread batches before publishing them to a table's count.
+/// Keyed by `(table_ptr, pending_count)` so switching between tokenizers on the
+/// same thread never credits one tokenizer's inserts to another.
 const COUNT_BATCH: usize = 64;
 thread_local! {
-    static PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PENDING: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// See [`SharedTable::view`]. Zero-wrap: `STable` allocates `+ PROBE_MAX` tail
@@ -889,7 +889,7 @@ unsafe fn unpack_packed6(p: *const SSlot<3>, m: u32, dst: *mut u32) -> usize {
 #[inline(always)]
 fn pack_6_words(toks: &[u32]) -> Option<([u32; 3], u32)> {
     let n = toks.len();
-    if n < 4 || n > 6 {
+    if !(4..=6).contains(&n) {
         return None;
     }
     let t0 = toks[0];
@@ -948,6 +948,7 @@ impl View<'_, 3> {
     ///   minimal L1d load port pressure and zero loop overhead).
     /// - 1..=3 tokens (`m & 3 == 2`): ONE 128-bit load + ONE 128-bit store.
     /// - 4..=6 tokens (`m & 3 == 3`): 20-bit bit-packed unpack from same 32B slot.
+    ///
     /// Returns `InlineHit::Hit(1..=6)` on hit, `InlineHit::Empty` on empty slot, or `InlineHit::Spilled`.
     ///
     /// SAFETY: `dst` must have capacity for at least 6 `u32`s.
@@ -1018,6 +1019,8 @@ fn spin_or_yield(spins: &mut u32) {
 /// disjoint 4096-slot stripes (`[s_lo..s_hi) -> [d_lo..d_hi)` with zero CAS)
 /// and then inserts its pending entry into the new table (zero lost entries,
 /// zero duplicate BPE storms during table growth).
+type ShortOverflow<const W: usize> = (u64, u64, [u32; W], u32, u64);
+
 struct GrowJob<const W: usize> {
     old: *const STable<W>,
     new: *mut STable<W>,
@@ -1027,7 +1030,7 @@ struct GrowJob<const W: usize> {
     n_stripes: usize,
     stripe: usize,
     diff: u32,
-    overflow: std::sync::Mutex<Vec<(u64, u64, [u32; W], u32, u64)>>,
+    overflow: std::sync::Mutex<Vec<ShortOverflow<W>>>,
     finished: AtomicBool,
 }
 
@@ -1155,7 +1158,16 @@ impl<const W: usize> SharedTable<W> {
     }
 
     pub fn len(&self) -> usize {
-        self.table().count.0.load(Ordering::Relaxed)
+        let t = self.table();
+        let t_ptr = t as *const STable<W> as usize;
+        PENDING.with(|c| {
+            let (lp, cnt) = c.get();
+            if lp == t_ptr && cnt > 0 {
+                t.count.0.fetch_add(cnt, Ordering::Relaxed);
+                c.set((t_ptr, 0));
+            }
+        });
+        t.count.0.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
@@ -1252,15 +1264,21 @@ impl<const W: usize> SharedTable<W> {
                             d.store(toks.get(k).copied().unwrap_or(0), Ordering::Relaxed);
                         }
                         s.meta.store(pub_meta, Ordering::Release);
-                        PENDING.with(|c| {
-                            let v = c.get() + 1;
-                            if v >= COUNT_BATCH {
-                                t.count.0.fetch_add(v, Ordering::Relaxed);
-                                c.set(0);
-                            } else {
-                                c.set(v);
-                            }
-                        });
+                        let t_ptr = t as *const STable<W> as usize;
+                        if t.count.0.load(Ordering::Relaxed) < 256 {
+                            t.count.0.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            PENDING.with(|c| {
+                                let (lp, cnt) = c.get();
+                                let v = if lp == t_ptr { cnt + 1 } else { 1 };
+                                if v >= COUNT_BATCH {
+                                    t.count.0.fetch_add(v, Ordering::Relaxed);
+                                    c.set((t_ptr, 0));
+                                } else {
+                                    c.set((t_ptr, v));
+                                }
+                            });
+                        }
                         return;
                     }
                     Err(cur) => m = cur,
@@ -1397,7 +1415,7 @@ impl SharedTable<3> {
     #[inline]
     pub fn put_6(&self, lo: u64, hi: u64, h: u64, toks: &[u32]) -> bool {
         let n = toks.len();
-        if n >= 1 && n <= 3 {
+        if (1..=3).contains(&n) {
             self.put_n(lo, hi, h, toks, 2 | ((n as u32) << 2));
             return true;
         }
@@ -1638,13 +1656,13 @@ impl SpillMap {
 pub const MAX_LONG_KEY: usize = 31;
 const LONG_MIN_BITS: u32 = 11; // 2048 slots * 64B = 128 KiB initial (lazy)
 thread_local! {
-    static PENDING_LONG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PENDING_LONG: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Pack a 16..=31 byte slice into a lossless 32-byte key (`buf[31] = len`).
 #[inline(always)]
 pub fn pack32_at(b: &[u8], pos: usize, len: usize) -> [u64; 4] {
-    debug_assert!(len >= 16 && len <= MAX_LONG_KEY);
+    debug_assert!((16..=MAX_LONG_KEY).contains(&len));
     if pos + 32 <= b.len() {
         // SAFETY: 32 bytes readable at pos; `len - 16` is in 0..=15.
         unsafe {
@@ -1701,14 +1719,15 @@ const _: () = assert!(std::mem::size_of::<LSlot>() == 64);
 struct LTable {
     ptr: *mut LSlot,
     len: usize,
-    mask: usize,
     shift: u32,
     count: PaddedCount,
 }
 
 impl LTable {
+    /// Zero-wrap allocation: `n + PROBE_MAX` slots so linear probing from any
+    /// home slot in `0..n` never wraps around the end of the buffer.
     fn layout(n: usize) -> std::alloc::Layout {
-        let bytes = 64 * n;
+        let bytes = 64 * (n + PROBE_MAX);
         #[cfg(target_os = "linux")]
         let align = if bytes >= (2 << 20) { 2 << 20 } else { 64 };
         #[cfg(not(target_os = "linux"))]
@@ -1720,7 +1739,7 @@ impl LTable {
         let n = 1usize << bits;
         let layout = Self::layout(n);
         let ptr = unsafe { alloc_zeroed_huge(layout) } as *mut LSlot;
-        Box::new(LTable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
+        Box::new(LTable { ptr, len: n, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
     }
 
     #[inline(always)]
@@ -1742,7 +1761,7 @@ impl Drop for LTable {
 #[inline(always)]
 fn pack_11_words(toks: &[u32]) -> Option<([u32; 7], u32)> {
     let n = toks.len();
-    if n < 8 || n > 11 {
+    if !(8..=11).contains(&n) {
         return None;
     }
     let mut or_all = 0u32;
@@ -1816,10 +1835,11 @@ pub enum LongHit {
 }
 
 /// Read-only snapshot view of [`SharedLongTable`] for 256-deep pipelined prefetching.
+/// Zero-wrap: `LTable` allocates `+ PROBE_MAX` tail slots so `LongView` fits in
+/// 2 words (`base`, `shift`) with no `end` pointer.
 #[derive(Clone, Copy)]
 pub struct LongView<'a> {
     base: *const LSlot,
-    end: *const LSlot,
     shift: u32,
     _t: std::marker::PhantomData<&'a ()>,
 }
@@ -1860,11 +1880,12 @@ impl LongView<'_> {
         if m0 == 0 {
             return LongHit::Empty;
         }
-        if ((s0.k[0].load(Ordering::Relaxed) ^ k[0])
-            | (s0.k[1].load(Ordering::Relaxed) ^ k[1])
-            | (s0.k[2].load(Ordering::Relaxed) ^ k[2])
-            | (s0.k[3].load(Ordering::Relaxed) ^ k[3]))
-            == 0
+        if m0 >= 2
+            && ((s0.k[0].load(Ordering::Relaxed) ^ k[0])
+                | (s0.k[1].load(Ordering::Relaxed) ^ k[1])
+                | (s0.k[2].load(Ordering::Relaxed) ^ k[2])
+                | (s0.k[3].load(Ordering::Relaxed) ^ k[3]))
+                == 0
         {
             if (m0 & 3) == 2 {
                 let n = (m0 >> 2) as usize;
@@ -1883,12 +1904,9 @@ impl LongView<'_> {
                 return LongHit::Hit;
             }
         }
-        // Probe 1..PROBE_MAX: linear scan.
+        // Probe 1..PROBE_MAX: zero-wrap linear scan into `+ PROBE_MAX` tail.
         for _ in 1..PROBE_MAX {
             p = p.add(1);
-            if p == self.end {
-                p = self.base;
-            }
             let s = &*p;
             let m = SharedLongTable::load_meta(s);
             if m == 0 {
@@ -1923,6 +1941,8 @@ impl LongView<'_> {
     }
 }
 
+type LongOverflow = ([u64; 4], [u32; 7], u32, u64);
+
 struct LGrowJob {
     old: *const LTable,
     new: *mut LTable,
@@ -1932,7 +1952,7 @@ struct LGrowJob {
     n_stripes: usize,
     stripe: usize,
     diff: u32,
-    overflow: std::sync::Mutex<Vec<([u64; 4], [u32; 7], u32, u64)>>,
+    overflow: std::sync::Mutex<Vec<LongOverflow>>,
     finished: AtomicBool,
 }
 
@@ -1945,16 +1965,16 @@ impl LGrowJob {
         let old_t = unsafe { &*self.old };
         let new_t = unsafe { &*self.new };
         let mut local_copied = 0usize;
-        let mut local_ov: Vec<([u64; 4], [u32; 7], u32, u64)> = Vec::new();
+        let mut local_ov: Vec<LongOverflow> = Vec::new();
         loop {
             let si = self.next_stripe.fetch_add(1, Ordering::Relaxed);
             if si >= self.n_stripes {
                 break;
             }
             let s_lo = si * self.stripe;
-            let s_hi = (s_lo + self.stripe).min(old_t.len);
-            let d_lo = s_lo << self.diff;
-            let d_hi = s_hi << self.diff;
+            let s_hi = (s_lo + self.stripe).min(old_t.len + PROBE_MAX);
+            let d_lo = s_lo.min(old_t.len) << self.diff;
+            let d_hi = s_hi.min(old_t.len) << self.diff;
             for i in s_lo..s_hi {
                 let s = old_t.slot(i);
                 let mut m = s.meta.load(Ordering::Acquire);
@@ -1978,11 +1998,11 @@ impl LGrowJob {
                     while j < d_hi {
                         let d = new_t.slot(j);
                         if d.meta.load(Ordering::Relaxed) == 0 {
-                            for x in 0..4 {
-                                d.k[x].store(k[x], Ordering::Relaxed);
+                            for (dst, &val) in d.k.iter().zip(k.iter()) {
+                                dst.store(val, Ordering::Relaxed);
                             }
-                            for x in 0..7 {
-                                d.toks[x].store(s.toks[x].load(Ordering::Relaxed), Ordering::Relaxed);
+                            for (dst, src) in d.toks.iter().zip(s.toks.iter()) {
+                                dst.store(src.load(Ordering::Relaxed), Ordering::Relaxed);
                             }
                             d.meta.store(m, Ordering::Relaxed);
                             local_copied += 1;
@@ -1992,15 +2012,15 @@ impl LGrowJob {
                     }
                     if j == d_hi {
                         let mut tv = [0u32; 7];
-                        for x in 0..7 {
-                            tv[x] = s.toks[x].load(Ordering::Relaxed);
+                        for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                            *dst = src.load(Ordering::Relaxed);
                         }
                         local_ov.push((k, tv, m, h));
                     }
                 } else {
                     let mut tv = [0u32; 7];
-                    for x in 0..7 {
-                        tv[x] = s.toks[x].load(Ordering::Relaxed);
+                    for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                        *dst = src.load(Ordering::Relaxed);
                     }
                     local_ov.push((k, tv, m, h));
                 }
@@ -2085,7 +2105,6 @@ impl SharedLongTable {
         if tp.is_null() {
             return LongView {
                 base: std::ptr::null(),
-                end: std::ptr::null(),
                 shift: 0,
                 _t: std::marker::PhantomData,
             };
@@ -2093,7 +2112,6 @@ impl SharedLongTable {
         let t = unsafe { &*tp };
         LongView {
             base: t.ptr as *const LSlot,
-            end: unsafe { (t.ptr as *const LSlot).add(t.len) },
             shift: t.shift,
             _t: std::marker::PhantomData,
         }
@@ -2162,27 +2180,29 @@ impl SharedLongTable {
         } else {
             ([0u32; 7], 2 | ((SPILLED as u32) << 2), false)
         };
-        let mut i = (h >> t.shift) as usize;
-        for _ in 0..PROBE_MAX {
-            let s = t.slot(i);
+        let home = (h >> t.shift) as usize;
+        for step in 0..PROBE_MAX {
+            let s = t.slot(home + step);
             let mut m = s.meta.load(Ordering::Acquire);
             if m == 0 {
                 match s.meta.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
                     Ok(_) => {
-                        for j in 0..4 {
-                            s.k[j].store(k[j], Ordering::Relaxed);
+                        for (dst, &val) in s.k.iter().zip(k.iter()) {
+                            dst.store(val, Ordering::Relaxed);
                         }
-                        for j in 0..7 {
-                            s.toks[j].store(words[j], Ordering::Relaxed);
+                        for (dst, &val) in s.toks.iter().zip(words.iter()) {
+                            dst.store(val, Ordering::Relaxed);
                         }
                         s.meta.store(pub_meta, Ordering::Release);
+                        let t_ptr = t as *const LTable as usize;
                         PENDING_LONG.with(|c| {
-                            let v = c.get() + 1;
+                            let (lp, cnt) = c.get();
+                            let v = if lp == t_ptr { cnt + 1 } else { 1 };
                             if v >= 16 {
                                 t.count.0.fetch_add(v, Ordering::Relaxed);
-                                c.set(0);
+                                c.set((t_ptr, 0));
                             } else {
-                                c.set(v);
+                                c.set((t_ptr, v));
                             }
                         });
                         return inline;
@@ -2203,7 +2223,6 @@ impl SharedLongTable {
             {
                 return inline;
             }
-            i = (i + 1) & t.mask;
         }
         false
     }
@@ -2243,7 +2262,7 @@ impl SharedLongTable {
         let newp = Box::into_raw(LTable::new(bits));
         let diff = bits - old.bits();
         let stripe = 2048usize.min(old.len).max(1);
-        let n_stripes = old.len.div_ceil(stripe);
+        let n_stripes = (old.len + PROBE_MAX).div_ceil(stripe);
         let jobp = Box::into_raw(Box::new(LGrowJob {
             old: old as *const LTable,
             new: newp,
@@ -2267,21 +2286,20 @@ impl SharedLongTable {
         let mut total = job.copied.load(Ordering::Relaxed);
         let ov = std::mem::take(&mut *job.overflow.lock().unwrap_or_else(|e| e.into_inner()));
         for (k, tv, m, h) in ov {
-            let mut j = (h >> new.shift) as usize;
-            loop {
-                let d = new.slot(j);
+            let home = (h >> new.shift) as usize;
+            for step in 0..PROBE_MAX {
+                let d = new.slot(home + step);
                 if d.meta.load(Ordering::Relaxed) == 0 {
-                    for x in 0..4 {
-                        d.k[x].store(k[x], Ordering::Relaxed);
+                    for (dst, &val) in d.k.iter().zip(k.iter()) {
+                        dst.store(val, Ordering::Relaxed);
                     }
-                    for x in 0..7 {
-                        d.toks[x].store(tv[x], Ordering::Relaxed);
+                    for (dst, &val) in d.toks.iter().zip(tv.iter()) {
+                        dst.store(val, Ordering::Relaxed);
                     }
                     d.meta.store(m, Ordering::Relaxed);
                     total += 1;
                     break;
                 }
-                j = (j + 1) & new.mask;
             }
         }
         new.count.0.store(total, Ordering::Relaxed);
@@ -2388,5 +2406,26 @@ mod long_table_tests {
             }
         }
         assert!(found * 100 >= keys.len() * 99, "found only {found} of {}", keys.len());
+    }
+
+    #[test]
+    fn shared_table_count_isolated_and_exact_small() {
+        let a: SharedTable<3> = SharedTable::new(4);
+        let b: SharedTable<3> = SharedTable::new(4);
+        for i in 1u64..=10 {
+            let (lo, hi) = (i, 1u64 << 56);
+            a.put(lo, hi, hash(lo, hi), &[i as u32]);
+        }
+        assert_eq!(a.len(), 10);
+        assert_eq!(b.len(), 0);
+        // Push past the 256-entry exact threshold into thread-local PENDING batching,
+        // then switch to table B and verify B does NOT inherit A's pending inserts.
+        for i in 11u64..=300 {
+            let (lo, hi) = (i, 1u64 << 56);
+            a.put(lo, hi, hash(lo, hi), &[i as u32]);
+        }
+        b.put(999, 1u64 << 56, hash(999, 1u64 << 56), &[42]);
+        assert_eq!(b.len(), 1);
+        assert!(a.len() >= 256 && a.len() <= 300);
     }
 }
