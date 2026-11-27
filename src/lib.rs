@@ -14,6 +14,7 @@ mod chunk_table;
 mod cjk;
 mod norm;
 mod pretok;
+mod pretok_pipe;
 mod unicode;
 mod unicode_tables;
 
@@ -196,11 +197,15 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for BorrowedStr<'a> {
 }
 
 struct RawModel<'a> {
+    model_type: Option<String>,
     vocab: Option<FxHashMap<BorrowedStr<'a>, u32>>,
     max_id: u32,
     merges: Vec<(u32, u32, u32)>,
+    has_merges: bool,
     byte_fallback: bool,
     ignore_merges: bool,
+    continuing_subword_prefix: Option<String>,
+    end_of_word_suffix: Option<String>,
 }
 
 struct VocabSeed<'m, 'a> {
@@ -334,20 +339,34 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for RawModel<'a> {
                 f.write_str("a tokenizer model object")
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<RawModel<'a>, A::Error> {
+                let mut model_type: Option<String> = None;
                 let mut vocab: Option<FxHashMap<BorrowedStr<'a>, u32>> = None;
                 let mut max_id = 0u32;
                 let mut merges: Vec<(u32, u32, u32)> = Vec::new();
                 let mut deferred_merges: Vec<(String, String)> = Vec::new();
+                let mut has_merges = false;
                 let mut byte_fallback = false;
                 let mut ignore_merges = false;
+                let mut continuing_subword_prefix: Option<String> = None;
+                let mut end_of_word_suffix: Option<String> = None;
                 while let Some(key) = map.next_key::<BorrowedStr<'a>>()? {
                     match key.as_str() {
+                        "type" => {
+                            model_type = map.next_value::<Option<String>>()?;
+                        }
                         "vocab" => {
+                            if let Some(ref mt) = model_type {
+                                if mt != "BPE" {
+                                    let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                                    continue;
+                                }
+                            }
                             let mut v = FxHashMap::with_capacity_and_hasher(65536, Default::default());
                             map.next_value_seed(VocabSeed { vocab: &mut v, max_id: &mut max_id })?;
                             vocab = Some(v);
                         }
                         "merges" => {
+                            has_merges = true;
                             map.next_value_seed(MergesSeed {
                                 vocab: vocab.as_ref(),
                                 merges: &mut merges,
@@ -359,6 +378,12 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for RawModel<'a> {
                         }
                         "ignore_merges" => {
                             ignore_merges = map.next_value::<Option<bool>>()?.unwrap_or(false);
+                        }
+                        "continuing_subword_prefix" => {
+                            continuing_subword_prefix = map.next_value::<Option<String>>()?;
+                        }
+                        "end_of_word_suffix" => {
+                            end_of_word_suffix = map.next_value::<Option<String>>()?;
                         }
                         _ => {
                             let _ = map.next_value::<serde::de::IgnoredAny>()?;
@@ -382,7 +407,17 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for RawModel<'a> {
                     }
                     deferred_merges.clear();
                 }
-                Ok(RawModel { vocab, max_id, merges, byte_fallback, ignore_merges })
+                Ok(RawModel {
+                    model_type,
+                    vocab,
+                    max_id,
+                    merges,
+                    has_merges,
+                    byte_fallback,
+                    ignore_merges,
+                    continuing_subword_prefix,
+                    end_of_word_suffix,
+                })
             }
         }
         deserializer.deserialize_map(Vis(std::marker::PhantomData))
@@ -451,52 +486,6 @@ fn detect_prepend_scheme_str(pre: &Value, norm: &Value) -> String {
     }
 }
 
-/// Metaspace prepend mode (matches the C `_apply_metaspace` variants):
-/// 0 = none, 1 = replace-only, 2 = always-prepend (Replace+Prepend normalizers),
-/// 3 = prepend-first (a Metaspace pre-tokenizer).
-fn detect_meta_mode(pre: &Value, norm: &Value) -> u8 {
-    let has_metaspace = |p: &Value| -> bool {
-        match p.get("type").and_then(|v| v.as_str()) {
-            Some("Metaspace") => true,
-            Some("Sequence") => p
-                .get("pretokenizers")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().any(|x| x.get("type").and_then(|v| v.as_str()) == Some("Metaspace")))
-                .unwrap_or(false),
-            _ => false,
-        }
-    };
-    if has_metaspace(pre) {
-        return 3;
-    }
-    if !norm.is_null() {
-        let list: Vec<&Value> = if norm.get("type").and_then(|v| v.as_str()) == Some("Sequence") {
-            norm.get("normalizers").and_then(|v| v.as_array()).map(|a| a.iter().collect()).unwrap_or_default()
-        } else {
-            vec![norm]
-        };
-        let mut has_prepend = false;
-        let mut has_replace = false;
-        for nm in list {
-            if nm.get("type").and_then(|v| v.as_str()) == Some("Prepend")
-                && nm.get("prepend").and_then(|v| v.as_str()) == Some("\u{2581}")
-            {
-                has_prepend = true;
-            }
-            if nm.get("type").and_then(|v| v.as_str()) == Some("Replace")
-                && nm.get("content").and_then(|v| v.as_str()) == Some("\u{2581}")
-                && nm.get("pattern").and_then(|p| p.get("String")).and_then(|v| v.as_str()) == Some(" ")
-            {
-                has_replace = true;
-            }
-        }
-        if has_replace {
-            return if has_prepend { 2 } else { 1 };
-        }
-    }
-    0
-}
-
 /// SentencePiece decoders end with `Strip{content:" ", start:1}` — strip the one
 /// leading space the metaspace prepend added back (matches C/HF decode).
 fn detect_decode_strip(dec: &Value) -> bool {
@@ -518,187 +507,203 @@ fn detect_decode_strip(dec: &Value) -> bool {
     false
 }
 
-/// 0 = none, 1 = NFC, 2 = NFD, 3 = NFKC, 4 = NFKD.
-fn detect_norm_form(norm: &Value) -> u8 {
-    let code = |s: &str| match s {
-        "NFC" => 1,
-        "NFD" => 2,
-        "NFKC" => 3,
-        "NFKD" => 4,
-        _ => 0,
-    };
-    if norm.is_null() {
-        return 0;
+/// True if `val` (a pre_tokenizer or decoder JSON node) contains a `ByteLevel` stage.
+fn contains_bytelevel(val: &Value, list_key: &str) -> bool {
+    match val.get("type").and_then(|v| v.as_str()) {
+        Some("ByteLevel") => true,
+        Some("Sequence") => val
+            .get(list_key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|x| contains_bytelevel(x, list_key)))
+            .unwrap_or(false),
+        _ => false,
     }
-    if let Some(s) = norm.get("type").and_then(|v| v.as_str()) {
-        let c = code(s);
-        if c != 0 {
-            return c;
-        }
-        if s == "Sequence" {
-            if let Some(arr) = norm.get("normalizers").and_then(|v| v.as_array()) {
-                for nm in arr {
-                    if let Some(t) = nm.get("type").and_then(|v| v.as_str()) {
-                        let c = code(t);
-                        if c != 0 {
-                            return c;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    0
 }
 
-/// Fail-closed normalizer check: return the type of the first normalizer stage we
-/// don't actually reproduce, or None if every stage is one we apply. We model
-/// exactly three kinds of stage — Unicode normalization (NFC/NFD/NFKC/NFKD, via
-/// `normalize`) and the two SentencePiece metaspace stages (`Prepend{"▁"}` and
-/// `Replace{" " -> "▁"}`, via `apply_metaspace`). Anything else (Lowercase,
-/// StripAccents, Strip, a non-metaspace Replace, Precompiled, BertNormalizer, …)
-/// rewrites the text in a way we'd silently ignore, mistokenizing every input it
-/// touches — so we reject the model at load instead of lying about its output.
-fn unsupported_normalizer_stage(norm: &Value) -> Option<String> {
-    if norm.is_null() {
+/// Normalize literal CR/LF bytes inside a regex pattern string to `\\r`/`\\n`
+/// so JSON strings using raw `\n` and escaped `\\n` compare identically.
+fn norm_regex_escapes(pat: &str) -> String {
+    let mut out = String::with_capacity(pat.len());
+    for ch in pat.chars() {
+        match ch {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Parse an exact digit-branch pattern for `Pretok::Generic` / `Pretok::CamelCase`.
+/// Returns `Some(max_digits)` (`0` = unlimited, `1` = single digit, `3` = up to 3).
+fn parse_exact_digit_branch(s: &str) -> Option<u32> {
+    match s {
+        r"\p{N}{1,3}" | r"\p{N}{1,3}+" => Some(3),
+        r"\p{N}" | r"\p{N}{1}" => Some(1),
+        r"\p{N}+" | r"\p{N}++" => Some(0),
+        _ => None,
+    }
+}
+
+/// Match an exact proven-equivalent whitespace tail for `Generic` / `CamelCase`.
+/// Note: `\s*[\r\n]` equals `\s*[\r\n]+` because `[\r\n] ⊂ \s` and `\s*` is greedy;
+/// `\s++$` before `\s*[\r\n]` only triggers at EOF with no trailing newline, where
+/// `\s+` already consumes the entire trailing whitespace run.
+fn is_exact_ws_tail(s: &str) -> bool {
+    matches!(
+        s,
+        r"\s*[\r\n]+|\s+(?!\S)|\s+"
+            | r"\s*[\r\n]|\s+(?!\S)|\s+"
+            | r"\s++$|\s*[\r\n]|\s+(?!\S)|\s"
+            | r"\s++$|\s*[\r\n]+|\s+(?!\S)|\s+"
+    )
+}
+
+/// Strictly match a single `Split` regex string to one of the hand-written
+/// `pretok` / `blockscan` grammars (`Pretok`). Used both by `detect_pretok`
+/// (to dispatch top-level models to SIMD `blockscan`) and by `PretokPipe`
+/// (to accelerate any `Split` stage inside a multi-stage `Sequence`, such as
+/// `Falcon-H1`'s `[Punctuation, Split(CamelCase), ByteLevel, Split([0-9])]`).
+pub(crate) fn match_fast_split_regex(raw_pat: &str) -> Option<Pretok> {
+    let pat = norm_regex_escapes(raw_pat);
+
+    // 1. Canonical GPT-2 / r50k / p50k plain-word grammar.
+    if matches!(
+        pat.as_str(),
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+            | r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s+"
+            | r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"
+    ) {
+        return Some(Pretok::Word(false));
+    }
+
+    // 2. Generic family (cl100k, Llama-3, Qwen2.5/3/3.6, SmolLM3, GLM, OLMo, Phi-4, ...).
+    let rest_after_contr = pat
+        .strip_prefix(r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|")
+        .or_else(|| pat.strip_prefix(r"'(?i:[sdmt]|ll|ve|re)|"));
+    if let Some(rest) = rest_after_contr {
+        // Plain letter class (`marks = false`) vs mark-inclusive (`marks = true`).
+        let (marks, rest) = if let Some(r) = rest
+            .strip_prefix(r"[^\r\n\p{L}\p{N}]?\p{L}+|")
+            .or_else(|| rest.strip_prefix(r"[^\r\n\p{L}\p{N}]?+\p{L}+|"))
+            .or_else(|| rest.strip_prefix(r"[^\r\n\p{L}\p{N}]?+\p{L}++|"))
+        {
+            (false, r)
+        } else if let Some(r) = rest.strip_prefix(r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|") {
+            (true, r)
+        } else {
+            return None;
+        };
+        let (dig_part, rest) = rest.split_once('|')?;
+        let max_digits = parse_exact_digit_branch(dig_part)?;
+        let rest = if marks {
+            rest.strip_prefix(r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|")?
+        } else {
+            rest.strip_prefix(r" ?[^\s\p{L}\p{N}]+[\r\n]*|")
+                .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{N}]++[\r\n]*|"))
+                .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{N}]++[\r\n]*+|"))?
+        };
+        if is_exact_ws_tail(rest) {
+            return Some(Pretok::Generic { max_digits, marks });
+        }
         return None;
     }
-    let stages: Vec<&Value> = if norm.get("type").and_then(|v| v.as_str()) == Some("Sequence") {
-        norm.get("normalizers").and_then(|v| v.as_array()).map(|a| a.iter().collect()).unwrap_or_default()
+
+    // 3. CamelCase family (o200k, gpt-oss, Llama-4, MiniMax, Phi-4-mini,
+    //    Mistral Nemo/Small/Devstral/Magistral/Tekken, Nemotron-Nano).
+    const CAMEL_CONTR: &str = concat!(
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    );
+    const CAMEL_NO_CONTR: &str = concat!(
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|"
+    );
+    let (contractions, rest) = if let Some(r) = pat.strip_prefix(CAMEL_CONTR) {
+        (true, r)
+    } else if let Some(r) = pat.strip_prefix(CAMEL_NO_CONTR) {
+        (false, r)
     } else {
-        vec![norm]
+        return None;
     };
-    for st in stages {
-        let t = st.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let handled = match t {
-            "NFC" | "NFD" | "NFKC" | "NFKD" => true,
-            "Prepend" => st.get("prepend").and_then(|v| v.as_str()) == Some("\u{2581}"),
-            "Replace" => {
-                st.get("content").and_then(|v| v.as_str()) == Some("\u{2581}")
-                    && st.get("pattern").and_then(|p| p.get("String")).and_then(|v| v.as_str())
-                        == Some(" ")
-            }
-            _ => false,
-        };
-        if !handled {
-            return Some(if t.is_empty() { "<unknown>".to_string() } else { t.to_string() });
-        }
+    let (dig_part, rest) = rest.split_once('|')?;
+    let max_digits = parse_exact_digit_branch(dig_part)?;
+    let rest = rest.strip_prefix(r" ?[^\s\p{L}\p{N}]+[\r\n/]*|")?;
+    if is_exact_ws_tail(rest) {
+        return Some(Pretok::CamelCase { contractions, max_digits });
     }
     None
 }
 
+/// Strictly match a ByteLevel pre-tokenizer to one of the hand-written SIMD
+/// `blockscan` grammars (`Pretok`). Returns `None` on ANY deviation — e.g.,
+/// `add_prefix_space: true`, custom symbol/newline rules like Seed-Coder's
+/// ` ?[^\s\p{L}\p{N}\r\n]+`, multi-stage pipelines, or non-equivalent behaviors —
+/// so unrecognized models seamlessly route to the exact universal `PretokPipe`
+/// instead of silently mistokenizing.
 fn detect_pretok(pre: &Value) -> Option<Pretok> {
     let t = pre.get("type")?.as_str()?;
     if t == "ByteLevel" {
+        let aps = pre.get("add_prefix_space").and_then(|v| v.as_bool()).unwrap_or(false);
         let use_regex = pre.get("use_regex").and_then(|v| v.as_bool()).unwrap_or(true);
-        return if use_regex { Some(Pretok::Word(false)) } else { None };
+        return if !aps && use_regex { Some(Pretok::Word(false)) } else { None };
     }
-    if t == "Sequence" {
-        let pts = pre.get("pretokenizers")?.as_array()?;
-        let mut has_bl = false;
-        let mut bl_use_regex = false;
-        let mut indiv_digits = false;
-        let mut split_pat: Option<&str> = None;
-        let mut n_split = 0u32;
-        for pt in pts {
-            match pt.get("type").and_then(|v| v.as_str()) {
-                Some("ByteLevel") => {
-                    has_bl = true;
-                    bl_use_regex =
-                        pt.get("use_regex").and_then(|v| v.as_bool()).unwrap_or(true);
-                }
-                Some("Digits") => {
-                    indiv_digits = pt
-                        .get("individual_digits")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                }
-                Some("Split") => {
-                    n_split += 1;
-                    split_pat = pt
-                        .get("pattern")
-                        .and_then(|p| p.get("Regex"))
-                        .and_then(|v| v.as_str());
-                }
-                // Any other pre-tokenizer (Punctuation, Metaspace, ...) changes
-                // chunking in a way we don't model — fail closed (e.g. a
-                // Punctuation+ByteLevel+Digits sequence must NOT be treated as a
-                // plain word grammar).
-                _ => return None,
+    if t != "Sequence" {
+        return None;
+    }
+    let pts = pre.get("pretokenizers")?.as_array()?;
+    if pts.len() != 2 {
+        return None;
+    }
+    // Second stage MUST be ByteLevel with add_prefix_space == false.
+    if pts[1].get("type").and_then(|v| v.as_str()) != Some("ByteLevel") {
+        return None;
+    }
+    let bl_aps = pts[1].get("add_prefix_space").and_then(|v| v.as_bool()).unwrap_or(false);
+    let bl_use_regex = pts[1].get("use_regex").and_then(|v| v.as_bool()).unwrap_or(true);
+    if bl_aps {
+        return None;
+    }
+
+    match pts[0].get("type").and_then(|v| v.as_str())? {
+        "Digits" => {
+            let indiv = pts[0]
+                .get("individual_digits")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // `[Digits(individual_digits=true), ByteLevel(add_prefix_space=false, use_regex=true)]`
+            if indiv && bl_use_regex {
+                Some(Pretok::Word(true))
+            } else {
+                None
             }
         }
-        // Multiple Split stages compose in ways a single machine can't reproduce —
-        // only one Split is modeled.
-        if !has_bl || n_split > 1 {
-            return None;
-        }
-        // Digits{individual_digits} + ByteLevel{use_regex}: the plain word grammar
-        // with each digit isolated (common in code tokenizers).
-        if split_pat.is_none() && bl_use_regex && indiv_digits {
-            return Some(Pretok::Word(true));
-        }
-        // A Split stage AND a ByteLevel that itself splits (`use_regex`) would
-        // double-split: each Split chunk is further cut by ByteLevel's GPT-2
-        // regex. Our machines apply only the Split pattern, so we'd produce
-        // different boundaries — fail closed. (Real Split-based models set
-        // `use_regex:false`; this only rejects the unhandled composition.)
-        if split_pat.is_some() && bl_use_regex {
-            return None;
-        }
-        let pat = split_pat?;
-        // Case-aware CamelCase letter runs (`[\p{Lu}\p{Lt}…]*[\p{Ll}…]+`).
-        // Contractions are optional; the digit cap comes from the quantifier
-        // (`\p{N}{1,3}` -> 3, `\p{N}+` -> unlimited, otherwise single-digit).
-        if pat.contains("[\\p{Lu}\\p{Lt}") {
-            let contractions = pat.contains("(?i:");
-            let max_digits = if pat.contains("\\p{N}{1,3}") {
-                3
-            } else if pat.contains("\\p{N}+") {
-                0
-            } else {
-                1
-            };
-            return Some(Pretok::CamelCase { contractions, max_digits });
-        }
-        // The canonical plain-word pattern (case-sensitive contractions, exact match).
-        let canonical = "'(?:[sdmt]|ll|ve|re)| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
-        if pat == canonical {
-            return Some(Pretok::Word(indiv_digits));
-        }
-        // Generic family: case-insensitive contractions + plain `\p{L}+` letter
-        // run, digit cap from the quantifier.
-        let digit_cap = || {
-            if pat.contains("\\p{N}{1,3}") {
-                3
-            } else if pat.contains("\\p{N}+") {
-                0
-            } else {
-                1
+        "Split" => {
+            // Double-splitting (`Split` followed by `ByteLevel(use_regex=true)`) must
+            // go to `PretokPipe` so both stages compose accurately.
+            if bl_use_regex {
+                return None;
             }
-        };
-        // Mark-inclusive variant (e.g. Qwen3.6): letter runs are `[\p{L}\p{M}]+`
-        // AND the symbol class excludes Marks (`[^\s\p{L}\p{M}\p{N}]`). Require
-        // BOTH so we only claim the shape the mark-aware machine reproduces;
-        // any other mark handling falls through to the regex fallback.
-        if pat.contains("(?i:")
-            && pat.contains("[\\p{L}\\p{M}]+")
-            && pat.contains("[^\\s\\p{L}\\p{M}\\p{N}]")
-        {
-            return Some(Pretok::Generic { max_digits: digit_cap(), marks: true });
+            // All grammars matched below are total (every non-empty byte is matched),
+            // so `Isolated + invert=false` and `Removed + invert=true` are identical.
+            let beh = pts[0].get("behavior").and_then(|v| v.as_str()).unwrap_or("Isolated");
+            let inv = pts[0].get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
+            let total_ok = (beh == "Isolated" && !inv) || (beh == "Removed" && inv);
+            if !total_ok {
+                return None;
+            }
+            let raw_pat = pts[0].get("pattern")?.get("Regex")?.as_str()?;
+            match_fast_split_regex(raw_pat)
         }
-        if pat.contains("(?i:") && pat.contains("\\p{L}+") {
-            return Some(Pretok::Generic { max_digits: digit_cap(), marks: false });
-        }
+        _ => None,
     }
-    None
 }
 
-/// Recognize the exact DeepSeek-V3/R1/V4 pre-tokenizer: a 3-stage Isolated Split
+/// Recognize the exact DeepSeek-V3/R1/V3.1/V4 pre-tokenizer: a 3-stage Isolated Split
 /// sequence (`\p{N}{1,3}`, a CJK/kana run, then the mark-inclusive main pattern)
 /// followed by a non-regex ByteLevel. Matched byte-exact and fail-closed: any
-/// deviation returns false and the model takes the (correct, slower) fancy-regex
-/// fallback instead. When it matches, `cjk::chunk_ranges` reproduces it ~10x
-/// faster. See src/cjk.rs.
+/// deviation returns false and the model takes the universal `PretokPipe` instead.
+/// When it matches, `cjk::chunk_ranges` reproduces it ~10x faster. See src/cjk.rs.
 fn is_cjk_pretok(pre: &Value) -> bool {
     const STAGE1: &str = "\\p{N}{1,3}";
     const STAGE2: &str = "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+";
@@ -724,68 +729,21 @@ fn is_cjk_pretok(pre: &Value) -> bool {
         && is_split(&pts[1], STAGE2)
         && is_split(&pts[2], STAGE3)
         && pts[3].get("type").and_then(|v| v.as_str()) == Some("ByteLevel")
+        && !pts[3].get("add_prefix_space").and_then(|v| v.as_bool()).unwrap_or(false)
         && !pts[3].get("use_regex").and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
-/// For a ByteLevel pre-tokenizer the fast machines don't recognize, return the
-/// ordered list of split regexes to run via fancy-regex (one per Split / Digits
-/// stage). Returns None if it isn't a generically-handleable ByteLevel pipeline
-/// (e.g. byte_fallback handled elsewhere, Metaspace, Punctuation, non-Isolated
-/// Split behavior, or a ByteLevel that also applies use_regex alongside splits).
-fn extract_split_fallback(pre: &Value) -> Option<Vec<String>> {
-    let t = pre.get("type")?.as_str()?;
-    if t != "Sequence" {
-        return None;
-    }
-    let pts = pre.get("pretokenizers")?.as_array()?;
-    let mut stages: Vec<String> = Vec::new();
-    let mut has_bl = false;
-    for pt in pts {
-        match pt.get("type").and_then(|v| v.as_str()) {
-            Some("ByteLevel") => {
-                has_bl = true;
-                // If ByteLevel itself splits (use_regex) on top of explicit
-                // Splits, the composition is ambiguous — bail.
-                if pt.get("use_regex").and_then(|v| v.as_bool()).unwrap_or(true)
-                    && !stages.is_empty()
-                {
-                    return None;
-                }
-            }
-            Some("Split") => {
-                // Only the standard Isolated, non-inverted Split is a simple
-                // "matches are the pre-tokens, gaps kept" segmentation.
-                if pt.get("behavior").and_then(|v| v.as_str()) != Some("Isolated")
-                    || pt.get("invert").and_then(|v| v.as_bool()).unwrap_or(false)
-                {
-                    return None;
-                }
-                let re = pt.get("pattern").and_then(|p| p.get("Regex")).and_then(|v| v.as_str())?;
-                // \A / \G / \z / \Z anchor against the WHOLE input or the previous
-                // match end. We apply each Split stage chunk-wise (HF "Isolated"),
-                // so those anchors would bind to chunk boundaries instead — silently
-                // mis-grouping (e.g. right-aligned 3-digit number grouping). Reject
-                // rather than mistokenize.
-                if re.contains("\\A") || re.contains("\\G")
-                    || re.contains("\\z") || re.contains("\\Z")
-                {
-                    return None;
-                }
-                stages.push(re.to_string());
-            }
-            Some("Digits") => {
-                let indiv = pt.get("individual_digits").and_then(|v| v.as_bool()).unwrap_or(false);
-                stages.push(if indiv { "\\p{N}".to_string() } else { "\\p{N}+".to_string() });
-            }
-            // Anything else (Metaspace, Punctuation, ...) we can't reproduce here.
-            _ => return None,
-        }
-    }
-    if has_bl && !stages.is_empty() {
-        Some(stages)
-    } else {
-        None
-    }
+/// Pre-tokenizer dispatch mode selected once at load time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FastPretok {
+    /// Hand-written 64B SIMD `blockscan` + 256-deep pipelined `SharedTable` path.
+    BlockScan,
+    /// Hand-written 3-stage DeepSeek-V3/R1 chunker (`src/cjk.rs`).
+    Cjk,
+    /// Universal composable HF pre-tokenizer pipeline (`src/pretok_pipe.rs`).
+    Pipe,
+    /// Null / empty pre-tokenizer (whole normalized text as one chunk).
+    WholeText,
 }
 
 /// Default memory cap (MiB) of each tokenizer's shared learned-chunk table.
@@ -809,8 +767,12 @@ enum Merge {
 #[pyclass(module = "tuetoken")]
 struct Tokenizer {
     kind: Pretok,
+    fast_pretok: FastPretok,
     singleton: [i32; 256],
     singleton_u32: [u32; 256],
+    /// Optional end-of-word singleton table for BPE models with `end_of_word_suffix`
+    /// (e.g. `</w>` in CLIP/SDXL/FLUX): applied to the final byte of each chunk.
+    singleton_eow: Option<[i32; 256]>,
     byte_fast: bool,
     map: bpe::MergeMap,
     raw_merges: Vec<(u32, u32, u32)>,
@@ -820,15 +782,17 @@ struct Tokenizer {
     // heap allocations. Matches the C engine's vocab arena.
     byte_arena: Vec<u8>,
     byte_span: Vec<(u32, u32)>,
+    c2b: [u16; 324],
     ignore_lookup: Option<FxHashMap<Box<[u8]>, u32>>,
     vocab_size: usize,
-    // Non-empty => use the generic regex pre-tokenizer (fancy-regex) instead of
-    // `kind`'s state machine, for ByteLevel Split patterns we don't hand-code.
-    fallback_re: Vec<fancy_regex::Regex>,
+    // Composable HF normalizer & pre-tokenizer pipelines.
+    normalizer: norm::Normalizer,
+    pretok_pipe: Option<pretok_pipe::PretokPipe>,
     // --- SentencePiece / byte_fallback path ---
     byte_fallback: bool,
-    meta_mode: u8, // 0 none, 1 replace-only, 2 always-prepend, 3 prepend-first
-    norm_form: u8, // 0 none, 1 NFC, 2 NFD, 3 NFKC, 4 NFKD
+    // Proven-exact metaspace chunk split char (e.g. Some('▁')): set only when
+    // load-time verification proves no merge crosses `(non-rep | rep)` boundaries.
+    safe_meta_split: Option<char>,
     // char (codepoint) -> token id for single-character vocab tokens. ASCII goes
     // in the array (hot path), the rest in the map.
     char_ascii: [i32; 128],
@@ -842,9 +806,6 @@ struct Tokenizer {
     // with rank inversions (e.g. gemma's whitespace-run tokens), which route to the
     // canonical merger. Every normal trained BPE is monotonic; see bpe::merge.
     monotonic: bool,
-    // Use the hand-written DeepSeek 3-stage chunker (src/cjk.rs) instead of the
-    // fancy-regex fallback — set only when the pre-tokenizer matches it byte-exact.
-    cjk: bool,
     // Special-token splitter for the AutoTokenizer path: a leftmost-longest matcher
     // over the added-token surfaces, so `encode_special` tokenizes a whole chat
     // string (specials + gaps) in one Rust pass instead of Python regex + a call
@@ -853,7 +814,7 @@ struct Tokenizer {
     special_ids: Vec<u32>,     // pattern i -> token id
     special_lstrip: Vec<bool>, // absorb whitespace to the left of the match
     special_rstrip: Vec<bool>, // absorb whitespace to the right
-    prepend_scheme: u8,        // 0 none, 1 always, 2 first (metaspace prepend)
+    prepend_scheme: u8,        // 0 none, 1 always, 2 first, 3 never (metaspace prepend)
     // Load-time verified whole-chunk table (≤15-byte pre-token -> its single
     // token). See chunk_table.rs. Only consulted under Merge::Auto.
     chunk_table: chunk_table::ChunkTable,
@@ -2340,6 +2301,13 @@ impl Tokenizer {
     /// Any token not proven by the fast DAG check falls back to exact `self.emit`,
     /// guaranteeing 100% identical output for every possible vocabulary.
     fn build_chunk_table(&mut self) {
+        if self.singleton_eow.is_some() {
+            // Models with `end_of_word_suffix` (e.g. CLIP `</w>`) store the suffix
+            // in `byte_span`, whereas pre-token chunks arrive without it; leave the
+            // static table empty and rely on `dyn_cache` / `learned` instead.
+            self.chunk_table = chunk_table::ChunkTable::empty();
+            return;
+        }
         let this = &*self;
         let n_vocab = this.byte_span.len();
         let emit_one = |s: &mut Scratch, id: u32| -> Option<(&[u8], u32)> {
@@ -2574,10 +2542,25 @@ impl Tokenizer {
             }
         }
         s.chunk.clear();
-        for &b in chunk {
-            let t = self.singleton[b as usize];
+        if let Some(eow) = &self.singleton_eow {
+            let last = chunk.len() - 1;
+            for &b in &chunk[..last] {
+                let t = self.singleton[b as usize];
+                if t >= 0 {
+                    s.chunk.push(t as u32);
+                }
+            }
+            let b = chunk[last] as usize;
+            let t = if eow[b] >= 0 { eow[b] } else { self.singleton[b] };
             if t >= 0 {
                 s.chunk.push(t as u32);
+            }
+        } else {
+            for &b in chunk {
+                let t = self.singleton[b as usize];
+                if t >= 0 {
+                    s.chunk.push(t as u32);
+                }
             }
         }
         self.finish_chunk(s, mode);
@@ -2613,50 +2596,27 @@ impl Tokenizer {
         self.finish_chunk(s, mode);
     }
 
-    /// Unicode-normalize input (NFC/NFD/NFKC/NFKD) if the model declares one.
-    /// The quick-check short-circuits already-normalized text to a borrow (no
-    /// allocation), so the common case — ASCII / already-NFC input on a model that
-    /// declares an NFC normalizer — stays zero-copy on the hot path.
+    /// Apply the model's composable normalizer pipeline (`Cow::Borrowed` when
+    /// identity or already normalized).
     #[inline]
     fn normalize<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
-        norm::normalize(self.norm_form, text)
+        self.normalizer.apply(text)
     }
 
-    /// SentencePiece metaspace: ' ' -> U+2581, with the model's prepend variant.
-    /// `prepend` gates the leading metaspace: the HF `AutoTokenizer` wrapper passes
-    /// false for fragments after a special token under `prepend_scheme="first"`
-    /// (only the first fragment of the whole sequence gets the ▁).
-    fn apply_metaspace(&self, text: &str, prepend: bool) -> String {
-        if text.is_empty() {
-            return String::new(); // empty input -> no tokens (no stray prepend)
-        }
-        let mut out = String::with_capacity(text.len() + 4);
-        if prepend && self.meta_mode == 2 {
-            out.push('\u{2581}'); // always-prepend
-        }
-        for ch in text.chars() {
-            if ch == ' ' {
-                out.push('\u{2581}');
-            } else {
-                out.push(ch);
-            }
-        }
-        if prepend && self.meta_mode == 3 && !out.starts_with('\u{2581}') {
-            out.insert(0, '\u{2581}'); // prepend-first
-        }
-        out
-    }
-
-    /// Split metaspace text on U+2581 boundaries (`▁* non-▁*`) and emit each.
-    fn encode_meta(&self, meta: &str, s: &mut Scratch, mode: Merge) {
+    /// Split metaspace text on `rep` boundaries (`rep* non-rep*`) and emit each.
+    /// Used only when load-time verification proved no merge crosses `(non-rep | rep)`.
+    fn encode_meta_char(&self, meta: &str, rep: char, s: &mut Scratch, mode: Merge) {
         let b = meta.as_bytes();
         let n = b.len();
-        let is_ms = |p: usize| p + 2 < n && b[p] == 0xE2 && b[p + 1] == 0x96 && b[p + 2] == 0x81;
+        let mut rbuf = [0u8; 4];
+        let rb = rep.encode_utf8(&mut rbuf).as_bytes();
+        let rl = rb.len();
+        let is_ms = |p: usize| p + rl <= n && &b[p..p + rl] == rb;
         let mut pos = 0usize;
         while pos < n {
             let start = pos;
             while is_ms(pos) {
-                pos += 3; // leading ▁ run
+                pos += rl; // leading rep run
             }
             if pos > start && pos >= n {
                 self.emit(&b[start..pos], s, mode);
@@ -2665,7 +2625,7 @@ impl Tokenizer {
             while pos < n {
                 if is_ms(pos) {
                     if pos == start {
-                        pos += 3;
+                        pos += rl;
                         continue;
                     }
                     break;
@@ -2949,7 +2909,7 @@ impl Tokenizer {
                 return false;
             }
         }
-        self.meta_mode == 0 && !self.byte_fallback && !self.cjk && self.fallback_re.is_empty()
+        self.fast_pretok == FastPretok::BlockScan
     }
 
     /// Phase 2 of the pipeline for records of one buffer `bytes` (len `n`).
@@ -3907,7 +3867,7 @@ impl Tokenizer {
     /// Can one long document be split across threads? Only the hand-written
     /// state-machine path, where the split rule below is proven (see split_points).
     fn splittable(&self) -> bool {
-        self.meta_mode == 0 && !self.byte_fallback && !self.cjk && self.fallback_re.is_empty()
+        self.fast_pretok == FastPretok::BlockScan
     }
 
     /// Positions `p` that are GUARANTEED chunk boundaries for every grammar
@@ -4000,7 +3960,7 @@ impl Tokenizer {
                 Src::Raw(_) | Src::Wide(_) => unreachable!("unvalidated bytes/wide reach plan() only without a normalizer"),
             }
         };
-        let norm: Vec<Cow<'t, [u8]>> = if self.norm_form == 0 {
+        let norm: Vec<Cow<'t, [u8]>> = if self.normalizer.is_identity() {
             texts
                 .iter()
                 .map(|t| {
@@ -4119,7 +4079,7 @@ impl Tokenizer {
     /// L1/L2 scratch without touching `PyObject_Malloc` or mutating the strings.
     #[inline]
     fn stream_wide_ok(&self, sep: Option<&[u8]>) -> bool {
-        sep.is_none() && self.norm_form == 0 && self.items_pipe_ok()
+        sep.is_none() && self.normalizer.is_identity() && self.items_pipe_ok()
     }
 
     /// Encode one macro-chunk `chunk` split on `sep` in a single streaming pass
@@ -4546,13 +4506,13 @@ impl Tokenizer {
             let src = texts_as_src_stream(texts);
             return self.encode_src_t::<O>(&src, num_threads, want_output).map_err(Ok);
         }
-        let src = texts_as_src(texts, wide, self.norm_form == 0).map_err(Err)?;
+        let src = texts_as_src(texts, wide, self.normalizer.is_identity()).map_err(Err)?;
         // Single-pass fused separator split + encode for one large buffer.
         if let Some(sep) = sep {
             if sep.is_empty() {
                 return Err(Err(PyValueError::new_err("separator must not be empty")));
             }
-            if src.len() == 1 && self.norm_form == 0 && self.items_pipe_ok() {
+            if src.len() == 1 && self.normalizer.is_identity() && self.items_pipe_ok() {
                 let (raw, trusted) = match src[0] {
                     Src::Str(s) => {
                         if std::str::from_utf8(sep).is_err() {
@@ -4603,7 +4563,10 @@ impl Tokenizer {
     fn encode_src_t<O: OutTok>(&self, texts: &[Src<'_>], num_threads: usize, want_output: bool) -> Result<(Vec<O>, Vec<usize>), BadInput> {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
         let (norm, items, tasks) = self.plan(texts, num_threads);
-        let trusted: Vec<bool> = texts.iter().map(|t| matches!(t, Src::Str(_) | Src::Wide(_)) || self.norm_form != 0).collect();
+        let trusted: Vec<bool> = texts
+            .iter()
+            .map(|t| matches!(t, Src::Str(_) | Src::Wide(_)) || !self.normalizer.is_identity())
+            .collect();
         let bad_doc = AtomicUsize::new(usize::MAX);
         let bad_wide = AtomicUsize::new(usize::MAX);
         let ntask = tasks.len();
@@ -4913,59 +4876,21 @@ impl Tokenizer {
     }
 
 
-    /// Fallback path: pre-tokenize via the model's actual Split regex(es)
-    /// (`fancy-regex`), composing multiple Split stages with HF "Isolated"
-    /// semantics (each match isolated, gaps kept). Used only for ByteLevel
-    /// models whose pattern the fast machines don't recognize.
-    /// Byte ranges of the pre-token pieces for the fancy-regex Split fallback,
-    /// composing each Split stage with HF "Isolated" semantics (matches isolated,
-    /// gaps kept). Shared by `encode_text_regex` and `encode_with_offsets`.
-    fn regex_chunk_ranges(&self, text: &str) -> Vec<(usize, usize)> {
-        let mut pieces: Vec<(usize, usize)> = vec![(0, text.len())];
-        let mut next: Vec<(usize, usize)> = Vec::new();
-        for re in &self.fallback_re {
-            next.clear();
-            for &(ps, pe) in &pieces {
-                let sub = &text[ps..pe];
-                let mut last = ps;
-                for m in re.find_iter(sub) {
-                    let m = match m {
-                        Ok(m) => m,
-                        Err(_) => break, // backtracking blow-up: stop refining
-                    };
-                    let (ms, me) = (ps + m.start(), ps + m.end());
-                    if me == ms {
-                        continue; // skip zero-width matches
-                    }
-                    if ms > last {
-                        next.push((last, ms)); // gap before the match
-                    }
-                    next.push((ms, me));
-                    last = me;
-                }
-                if last < pe {
-                    next.push((last, pe));
-                }
-            }
-            std::mem::swap(&mut pieces, &mut next);
-        }
-        pieces
-    }
-
-    fn encode_text_regex(&self, text: &str, s: &mut Scratch, mode: Merge) {
-        let bytes = text.as_bytes();
-        for (ps, pe) in self.regex_chunk_ranges(text) {
-            self.emit(&bytes[ps..pe], s, mode);
-        }
-    }
-
-    /// DeepSeek path: hand-written 3-stage chunker, then emit each piece.
+    /// DeepSeek path: hand-written 3-stage chunker, then emit each piece (using
+    /// the shared cross-thread chunk tables under `Merge::Auto`).
     fn encode_cjk(&self, text: &str, s: &mut Scratch, mode: Merge) {
         let bytes = text.as_bytes();
+        let n = bytes.len();
         let (mut cur, mut nxt) = (Vec::new(), Vec::new());
         cjk::chunk_ranges(text, &mut cur, &mut nxt);
-        for &(ps, pe) in &cur {
-            self.emit(&bytes[ps..pe], s, mode);
+        if mode == Merge::Auto && self.singleton_eow.is_none() {
+            for &(ps, pe) in &cur {
+                self.emit_chunk(bytes, ps, pe, n, s);
+            }
+        } else {
+            for &(ps, pe) in &cur {
+                self.emit(&bytes[ps..pe], s, mode);
+            }
         }
     }
 
@@ -5047,23 +4972,39 @@ impl Tokenizer {
 
     /// `encode_into` for text that is ALREADY normalized. Appends to `s.out`.
     fn encode_into_norm(&self, text: &str, mode: Merge, prepend: bool, s: &mut Scratch) {
-        if self.meta_mode != 0 {
-            // SentencePiece: metaspace -> split on U+2581 -> emit.
-            let meta = self.apply_metaspace(text, prepend);
-            self.encode_meta(&meta, s, mode);
-        } else if self.byte_fallback {
-            // byte_fallback without metaspace (Split pretok, or whole-text).
-            if self.fallback_re.is_empty() {
-                self.emit(text.as_bytes(), s, mode);
-            } else {
-                self.encode_text_regex(text, s, mode);
+        match self.fast_pretok {
+            FastPretok::BlockScan => {
+                self.encode_bytes(text.as_bytes(), s, mode);
             }
-        } else if self.cjk {
-            self.encode_cjk(text, s, mode);
-        } else if !self.fallback_re.is_empty() {
-            self.encode_text_regex(text, s, mode);
-        } else {
-            self.encode_bytes(text.as_bytes(), s, mode);
+            FastPretok::Cjk => {
+                self.encode_cjk(text, s, mode);
+            }
+            FastPretok::Pipe => {
+                let pipe = self.pretok_pipe.as_ref().expect("Pipe mode has pretok_pipe");
+                let use_shared =
+                    mode == Merge::Auto && !self.byte_fallback && self.singleton_eow.is_none();
+                let split_ms = self.safe_meta_split;
+                pipe.for_each_chunk(text, prepend, &self.c2b, |chunk| {
+                    if let Some(rep) = split_ms {
+                        if let Ok(cs) = std::str::from_utf8(chunk) {
+                            self.encode_meta_char(cs, rep, s, mode);
+                            return;
+                        }
+                    }
+                    if use_shared {
+                        self.emit_chunk(chunk, 0, chunk.len(), chunk.len(), s);
+                    } else {
+                        self.emit(chunk, s, mode);
+                    }
+                });
+            }
+            FastPretok::WholeText => {
+                if let Some(rep) = self.safe_meta_split {
+                    self.encode_meta_char(text, rep, s, mode);
+                } else {
+                    self.emit(text.as_bytes(), s, mode);
+                }
+            }
         }
     }
 
@@ -5129,19 +5070,37 @@ impl Tokenizer {
         let pre = raw.pre_tokenizer.as_ref().unwrap_or(&Value::Null);
         let dec_val = raw.decoder.as_ref().unwrap_or(&Value::Null);
 
-        // Fail closed on any normalizer stage we don't actually apply, rather
-        // than silently ignoring it and mistokenizing (e.g. a Lowercase model).
-        if let Some(t) = unsupported_normalizer_stage(norm_val) {
-            return Err(PyValueError::new_err(format!(
-                "unsupported normalizer stage {t:?}: this model rewrites text in a \
-                 way tuetoken does not reproduce (only NFC/NFD/NFKC/NFKD and \
-                 the SentencePiece metaspace Prepend/Replace are modeled)"
-            )));
+        // Fail closed on non-BPE models (WordPiece, Unigram, WordLevel, ...).
+        if let Some(ref mt) = model.model_type {
+            if mt != "BPE" {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported model type {mt:?}: tuetoken only supports BPE models"
+                )));
+            }
+        } else if !model.has_merges {
+            return Err(PyValueError::new_err(
+                "unsupported non-BPE model (missing merges): tuetoken only supports BPE models",
+            ));
         }
+        if let Some(ref pfx) = model.continuing_subword_prefix {
+            if !pfx.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported BPE continuing_subword_prefix {pfx:?}"
+                )));
+            }
+        }
+        let eow_suffix = model.end_of_word_suffix.filter(|s| !s.is_empty());
+
+        // Composable HF normalizer pipeline — fails closed on unknown normalizer types
+        // (e.g. BertNormalizer, Precompiled) rather than silently mistokenizing.
+        let normalizer = norm::Normalizer::from_json(norm_val).map_err(|t| {
+            PyValueError::new_err(format!(
+                "unsupported normalizer stage {t:?}: this model rewrites text in a \
+                 way tuetoken does not reproduce"
+            ))
+        })?;
 
         let byte_fallback = model.byte_fallback;
-        let meta_mode = detect_meta_mode(pre, norm_val);
-        let norm_form = detect_norm_form(norm_val);
         let decode_strip_space = detect_decode_strip(dec_val);
         let prepend_scheme_str = detect_prepend_scheme_str(pre, norm_val);
         let post_processor_json = raw
@@ -5150,58 +5109,61 @@ impl Tokenizer {
             .filter(|v| !v.is_null())
             .and_then(|v| serde_json::to_string(v).ok());
 
-        let compile_split = |pats: &[String]| -> PyResult<Vec<fancy_regex::Regex>> {
-            let mut res = Vec::with_capacity(pats.len());
-            for p in pats {
-                res.push(fancy_regex::Regex::new(p).map_err(|e| {
-                    PyValueError::new_err(format!("cannot compile split regex {p:?}: {e}"))
-                })?);
-            }
-            Ok(res)
-        };
-
-        // Chunking source: a byte-level machine, a fancy-regex Split fallback,
-        // metaspace (▁-split), or whole-text. byte_fallback only affects how each
-        // chunk is turned into initial tokens (char lookup vs raw bytes).
-        let (kind, fallback_re) = if byte_fallback {
-            if meta_mode != 0 {
-                (Pretok::Word(false), Vec::new()) // chunker = encode_meta
-            } else {
-                match extract_split_fallback(pre) {
-                    Some(pats) => (Pretok::Word(false), compile_split(&pats)?),
-                    // A missing/null pre_tokenizer is a legitimate whole-text
-                    // SentencePiece model (one chunk). But a pre_tokenizer we DON'T
-                    // recognize (e.g. Punctuation) must fail closed — collapsing it
-                    // to one chunk would silently mistokenize. Same fail-closed rule
-                    // the ByteLevel path already applies below.
-                    None if pre.is_null() => (Pretok::Word(false), Vec::new()),
-                    None => {
-                        return Err(PyValueError::new_err(
-                            "unsupported pre_tokenizer for byte_fallback model \
-                             (cannot be reproduced; refusing to mistokenize)",
-                        ))
-                    }
-                }
-            }
-        } else if is_cjk_pretok(pre) {
-            // Hand-written 3-stage DeepSeek chunker (cjk::chunk_ranges).
-            (Pretok::Word(false), Vec::new())
+        // Pre-tokenizer dispatch:
+        //   1. Fast hand-written SIMD `blockscan` / `cjk` machines (exact structural match).
+        //   2. Universal composable `PretokPipe` for any other HF pre_tokenizer
+        //      (Split, Digits, Punctuation, ByteLevel, Metaspace, Whitespace, ...).
+        //   3. WholeText for `pre_tokenizer: null` / empty Sequence.
+        //   4. Fail closed on any unrecognized pre_tokenizer stage.
+        let (kind, fast_pretok, pretok_pipe) = if !byte_fallback && is_cjk_pretok(pre) {
+            (Pretok::Word(false), FastPretok::Cjk, None)
+        } else if !byte_fallback && detect_pretok(pre).is_some() {
+            (detect_pretok(pre).unwrap(), FastPretok::BlockScan, None)
         } else {
-            // Fast path: a recognized machine. Otherwise fall back to running the
-            // model's actual Split regex(es) via fancy-regex (universal ByteLevel).
-            match detect_pretok(pre) {
-                Some(k) => (k, Vec::new()),
-                None => {
-                    let pats = extract_split_fallback(pre).ok_or_else(|| {
-                        PyValueError::new_err(
-                            "unsupported pre_tokenizer (ByteLevel or byte_fallback)",
-                        )
-                    })?;
-                    (Pretok::Word(false), compile_split(&pats)?)
-                }
+            if !byte_fallback
+                && !contains_bytelevel(pre, "pretokenizers")
+                && !contains_bytelevel(dec_val, "decoders")
+            {
+                return Err(PyValueError::new_err(
+                    "unsupported pre_tokenizer (expected ByteLevel or byte_fallback)",
+                ));
+            }
+            match pretok_pipe::PretokPipe::from_json(pre)
+                .map_err(|e| PyValueError::new_err(format!("{e} (refusing to mistokenize)")))?
+            {
+                Some(pipe) => (Pretok::Word(false), FastPretok::Pipe, Some(pipe)),
+                None => (Pretok::Word(false), FastPretok::WholeText, None),
             }
         };
         let ignore_merges = model.ignore_merges;
+
+        // Candidate metaspace chunk-split character for unsplit byte_fallback models
+        // (e.g. Mistral-7B-v0.3, Phi-3.5, Yi-1.5, Gemma-2/3, ERNIE-4.5). Verified
+        // mathematically against `merges` below before enabling.
+        let meta_split_cand: Option<char> = if byte_fallback && !ignore_merges && eow_suffix.is_none()
+        {
+            if let Some(ref pipe) = pretok_pipe {
+                if let Some(rep) = pipe.single_unsplit_metaspace() {
+                    Some(rep)
+                } else if normalizer.replaces_space_with('\u{2581}')
+                    && pre.get("type").and_then(|v| v.as_str()) == Some("Split")
+                    && pre.get("pattern").and_then(|p| p.get("String")).and_then(|v| v.as_str())
+                        == Some(" ")
+                    && pre.get("behavior").and_then(|v| v.as_str()) == Some("MergedWithPrevious")
+                    && !pre.get("invert").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    Some('\u{2581}')
+                } else {
+                    None
+                }
+            } else if normalizer.replaces_space_with('\u{2581}') {
+                Some('\u{2581}')
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let c2b = bytes_to_unicode_table();
         let vocab = model.vocab.ok_or_else(|| PyValueError::new_err("no vocab"))?;
@@ -5235,15 +5197,53 @@ impl Tokenizer {
             }
         }
 
+        // Optional end-of-word singleton lookup table (e.g. CLIP's `</w>`).
+        let singleton_eow: Option<[i32; 256]> = if let Some(ref suf) = eow_suffix {
+            if byte_fallback {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported end_of_word_suffix {suf:?} with byte_fallback"
+                )));
+            }
+            let mut b2u = ['\0'; 256];
+            for (cp, &bv) in c2b.iter().enumerate() {
+                if bv != u16::MAX {
+                    b2u[bv as usize] = char::from_u32(cp as u32).unwrap();
+                }
+            }
+            let mut tbl = [-1i32; 256];
+            let mut key = String::with_capacity(suf.len() + 4);
+            for b in 0..256 {
+                key.clear();
+                key.push(b2u[b]);
+                key.push_str(suf);
+                if let Some(&id) = vocab.get(key.as_str()) {
+                    tbl[b] = id as i32;
+                }
+            }
+            Some(tbl)
+        } else {
+            None
+        };
+
         // Stream decoded token bytes directly into ONE contiguous byte_arena
         // (eliminating 200K Vec<u8> heap allocations and SipHash lookups).
         let mut byte_arena: Vec<u8> = Vec::with_capacity(vocab.len() * 8);
         let mut byte_span: Vec<(u32, u32)> = vec![(0, 0); vocab_size];
         let mut canonical = vec![false; vocab_size];
+        let mut has_internal_ms = if meta_split_cand.is_some() {
+            vec![false; vocab_size]
+        } else {
+            Vec::new()
+        };
         let mut char_ascii = [-1i32; 128];
         let mut char_map: FxHashMap<u32, u32> = FxHashMap::default();
         for (k, &id) in &vocab {
             let ks = k.as_str();
+            if let Some(rep) = meta_split_cand {
+                if ks.trim_start_matches(rep).contains(rep) {
+                    has_internal_ms[id as usize] = true;
+                }
+            }
             let start = byte_arena.len() as u32;
             if byte_fallback {
                 decode_byte_fallback_into(ks, &mut byte_arena);
@@ -5295,6 +5295,13 @@ impl Tokenizer {
         }
 
         let merges = model.merges;
+        // Enable metaspace chunk-splitting iff NO merge produces a token containing
+        // `rep` after a non-`rep` character (mathematical guarantee of BPE exactness).
+        let safe_meta_split = meta_split_cand.filter(|_| {
+            merges
+                .iter()
+                .all(|&(_, _, tg)| (tg as usize) >= vocab_size || !has_internal_ms[tg as usize])
+        });
         let mut map = bpe::MergeMap::new(&merges);
 
         // Monotonicity: a vocab is "monotonic" when every token is fully produced
@@ -5342,31 +5349,36 @@ impl Tokenizer {
                 singleton_u32[b] = singleton[b] as u32;
             }
         }
-        let byte_fast = !byte_fallback && ignore_lookup.is_none() && map.init_byte_tables(&singleton);
+        let byte_fast = !byte_fallback
+            && ignore_lookup.is_none()
+            && singleton_eow.is_none()
+            && map.init_byte_tables(&singleton);
 
         let mut tk = Tokenizer {
             kind,
+            fast_pretok,
             singleton,
             singleton_u32,
+            singleton_eow,
             byte_fast,
             map,
             raw_merges: merges,
             stream: OnceLock::new(),
             byte_arena,
             byte_span,
+            c2b,
             ignore_lookup,
             vocab_size,
-            fallback_re,
+            normalizer,
+            pretok_pipe,
             byte_fallback,
-            meta_mode,
-            norm_form,
+            safe_meta_split,
             char_ascii,
             char_map,
             decode_strip_space,
             source_path: path.to_string(),
             is_byte_level: !byte_fallback,
             monotonic,
-            cjk: !byte_fallback && is_cjk_pretok(pre),
             special_ac: None,
             special_ids: Vec::new(),
             special_lstrip: Vec::new(),
@@ -5493,8 +5505,9 @@ impl Tokenizer {
         Ok((cls, (self.source_path.clone(),)))
     }
 
-    /// Load by HuggingFace repo id (downloads `tokenizer.json`). One-liner like
-    /// HF's `from_pretrained`. Requires `huggingface_hub`.
+    /// Load by HuggingFace repo id (downloads `tokenizer.json`, or transparently
+    /// converts `tekken.json`, `tiktoken.model`, or legacy `vocab.json`+`merges.txt`
+    /// when a repo omits `tokenizer.json`). Requires `huggingface_hub`.
     #[staticmethod]
     #[pyo3(signature = (repo_id, revision = None, warmup = None))]
     fn from_pretrained(
@@ -5512,9 +5525,45 @@ impl Tokenizer {
         if let Some(rev) = revision {
             kwargs.set_item("revision", rev)?;
         }
-        let path: String = hub
-            .call_method("hf_hub_download", (repo_id, "tokenizer.json"), Some(&kwargs))?
-            .extract()?;
+        let path: String = match hub.call_method("hf_hub_download", (repo_id, "tokenizer.json"), Some(&kwargs)) {
+            Ok(p) => p.extract()?,
+            Err(orig_err) => {
+                let fmt = py.import("tuetoken._formats")?;
+                let res = fmt.call_method1("resolve_non_json_repo", (repo_id, revision))?;
+                if res.is_none() {
+                    return Err(orig_err);
+                }
+                res.extract()?
+            }
+        };
+        let tk = Self::new(&path)?;
+        if let Some(w) = warmup {
+            if w.is_instance_of::<pyo3::types::PyBool>() {
+                if w.extract::<bool>()? {
+                    tk.warmup(py, None, 0)?;
+                }
+            } else if !w.is_none() {
+                tk.warmup(py, Some(w), 0)?;
+            }
+        }
+        Ok(tk)
+    }
+
+    /// Load a Mistral `tekken.json` tokenizer from a local path or HF repo id.
+    #[staticmethod]
+    #[pyo3(signature = (source, revision = None, warmup = None))]
+    fn from_tekken(
+        py: Python<'_>,
+        source: &str,
+        revision: Option<&str>,
+        warmup: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let fmt = py.import("tuetoken._formats")?;
+        let res = fmt.call_method1("try_load_tekken_repo", (source, revision))?;
+        if res.is_none() {
+            return Err(PyValueError::new_err(format!("no tekken.json found for {source:?}")));
+        }
+        let (path, _cfg): (String, Py<PyAny>) = res.extract()?;
         let tk = Self::new(&path)?;
         if let Some(w) = warmup {
             if w.is_instance_of::<pyo3::types::PyBool>() {
@@ -5692,22 +5741,31 @@ impl Tokenizer {
         py: Python<'_>,
         text: &str,
     ) -> PyResult<(Vec<u32>, Vec<(usize, usize)>)> {
-        if !self.is_byte_level {
+        if !self.is_byte_level || self.singleton_eow.is_some() {
             return Err(PyValueError::new_err(
-                "encode_with_offsets is only available for ByteLevel models \
-                 (byte_fallback/SentencePiece transform the text, so offsets \
-                 wouldn't map to the original)",
+                "encode_with_offsets is only available for plain ByteLevel models \
+                 (byte_fallback/SentencePiece or end_of_word_suffix models transform \
+                 the text, so offsets wouldn't map to the original)",
             ));
         }
         // A normalizer rewrites the text (e.g. NFC composes decomposed chars),
         // which shifts byte positions — offsets into the original would be wrong.
         // Already-normalized input is unchanged, so offsets stay valid; only fail
         // when normalization would actually alter the bytes.
-        if self.norm_form != 0 && self.normalize(text) != text {
+        if !self.normalizer.is_identity() && self.normalize(text) != text {
             return Err(PyValueError::new_err(
                 "encode_with_offsets: input is not already normalized and this \
-                 model applies a Unicode normalizer; byte offsets into the \
+                 model applies a normalizer; byte offsets into the \
                  original text are undefined (normalize the text first)",
+            ));
+        }
+        if self.fast_pretok == FastPretok::Pipe
+            && !self.pretok_pipe.as_ref().is_some_and(|p| p.is_slice_only())
+        {
+            return Err(PyValueError::new_err(
+                "encode_with_offsets: this model's pre_tokenizer mutates piece bytes \
+                 (e.g. add_prefix_space or post-ByteLevel splitting); raw input byte \
+                 offsets are undefined",
             ));
         }
         // The offset path uses the batch span-merger (`merge_with_spans`), which
@@ -5728,28 +5786,38 @@ impl Tokenizer {
             let mut ids = Vec::new();
             let mut spans = Vec::new();
             let (mut toks, mut sp, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
-            if self.cjk {
-                let (mut cur, mut nxt) = (Vec::new(), Vec::new());
-                cjk::chunk_ranges(text, &mut cur, &mut nxt);
-                for &(ps, pe) in &cur {
-                    self.emit_chunk_offsets(
-                        bytes, ps, pe, &mut ids, &mut spans, &mut toks, &mut sp, &mut pairs,
-                    );
+            match self.fast_pretok {
+                FastPretok::Cjk => {
+                    let (mut cur, mut nxt) = (Vec::new(), Vec::new());
+                    cjk::chunk_ranges(text, &mut cur, &mut nxt);
+                    for &(ps, pe) in &cur {
+                        self.emit_chunk_offsets(
+                            bytes, ps, pe, &mut ids, &mut spans, &mut toks, &mut sp, &mut pairs,
+                        );
+                    }
                 }
-            } else if self.fallback_re.is_empty() {
-                let n = bytes.len();
-                let mut pos = 0usize;
-                while pos < n {
-                    let end = pretok::next_chunk_end(self.kind, bytes, pos);
-                    self.emit_chunk_offsets(
-                        bytes, pos, end, &mut ids, &mut spans, &mut toks, &mut sp, &mut pairs,
-                    );
-                    pos = end;
+                FastPretok::BlockScan => {
+                    let n = bytes.len();
+                    let mut pos = 0usize;
+                    while pos < n {
+                        let end = pretok::next_chunk_end(self.kind, bytes, pos);
+                        self.emit_chunk_offsets(
+                            bytes, pos, end, &mut ids, &mut spans, &mut toks, &mut sp, &mut pairs,
+                        );
+                        pos = end;
+                    }
                 }
-            } else {
-                for (ps, pe) in self.regex_chunk_ranges(text) {
+                FastPretok::Pipe => {
+                    let pipe = self.pretok_pipe.as_ref().expect("Pipe mode has pretok_pipe");
+                    for (ps, pe) in pipe.chunk_ranges(text) {
+                        self.emit_chunk_offsets(
+                            bytes, ps, pe, &mut ids, &mut spans, &mut toks, &mut sp, &mut pairs,
+                        );
+                    }
+                }
+                FastPretok::WholeText => {
                     self.emit_chunk_offsets(
-                        bytes, ps, pe, &mut ids, &mut spans, &mut toks, &mut sp, &mut pairs,
+                        bytes, 0, bytes.len(), &mut ids, &mut spans, &mut toks, &mut sp, &mut pairs,
                     );
                 }
             }
@@ -5764,7 +5832,7 @@ impl Tokenizer {
         texts: &Bound<'py, PyAny>,
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyList>> {
-        if self.norm_form == 0 && self.items_pipe_ok() {
+        if self.normalizer.is_identity() && self.items_pipe_ok() {
             if let Some(batch) = try_extract_fast_batch(py, texts) {
                 if batch.max_len < SPLIT_MIN {
                     let slice = &batch.items;
@@ -5795,7 +5863,7 @@ impl Tokenizer {
     /// Token counts for many texts, in parallel (no Python list of ids built).
     #[pyo3(signature = (texts, num_threads = 0, separator = None))]
     fn count_tokens_batch(&self, py: Python<'_>, texts: &Bound<'_, PyAny>, num_threads: usize, separator: Option<Vec<u8>>) -> PyResult<Vec<usize>> {
-        if separator.is_none() && self.norm_form == 0 && self.items_pipe_ok() {
+        if separator.is_none() && self.normalizer.is_identity() && self.items_pipe_ok() {
             if let Some(batch) = try_extract_fast_batch(py, texts) {
                 if batch.max_len < SPLIT_MIN {
                     let slice = &batch.items;
@@ -5919,7 +5987,7 @@ impl Tokenizer {
                 }
             }
         };
-        let (data_ba, counts) = if separator.is_none() && self.norm_form == 0 && self.items_pipe_ok() {
+        let (data_ba, counts) = if separator.is_none() && self.normalizer.is_identity() && self.items_pipe_ok() {
             if let Some(batch) = try_extract_fast_batch(py, texts) {
                 if batch.max_len < SPLIT_MIN {
                     let slice = &batch.items;

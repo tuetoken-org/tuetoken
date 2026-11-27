@@ -152,6 +152,11 @@ HF_MODELS = [
     "mistralai/Mistral-7B-Instruct-v0.3", "01-ai/Yi-1.5-6B-Chat",  # byte_fallback/SP
     "deepseek-ai/DeepSeek-V3-0324",                              # CJK 3-stage machine
     "Qwen/Qwen3.6-35B-A3B",                                      # mark-inclusive Generic ([\p{L}\p{M}]+)
+    "ByteDance-Seed/Seed-Coder-8B-Instruct",                     # custom symbol-no-NL Split (exact matcher)
+    "tiiuae/Falcon3-7B-Instruct",                                # Punctuation + ByteLevel(re) + Digits
+    "tiiuae/Falcon-H1-7B-Instruct",                              # Punctuation + CamelCase Split + ByteLevel + Split
+    "dphn/Dolphin-X1-Trinity-Nano",                              # 6-stage \A/\G/\z + Onig {3}+ digits
+    "openai/clip-vit-large-patch14",                             # NFC+Replace+Lowercase + </w> eow suffix
 ]
 
 
@@ -276,18 +281,113 @@ def test_normalization():
     return ok, tot
 
 
-# --- 5c. fail-closed on pre-tokenizers we can't reproduce faithfully ---------
-def test_failclosed():
-    # Reject (don't silently mistokenize) constructs the engine can't replicate:
-    #   * Punctuation pre-tokenizer (Falcon) -- Contiguous, not Isolated Split
-    #   * \A/\G/\z-anchored Splits (Dolphin right-aligned digit grouping) -- our
-    #     chunk-wise Isolated application can't honor whole-input/contiguous anchors
-    print("=== fail-closed: unsupported pre-tokenizers rejected ===")
+# --- 5c. composable HF pipeline parity + fail-closed on unsupported configs ---
+def test_composable_pipeline():
+    # Universal composable normalizer + pre-tokenizer pipeline must match HF
+    # byte-exact across real-world multi-stage models AND synthetic compositions
+    # (Lowercase, Strip, Replace(Regex), Punctuation, ByteLevel(add_prefix_space),
+    # Metaspace(never), Whitespace, WhitespaceSplit, byte_fallback + Punctuation).
+    print("=== composable HF pipeline parity (real + synthetic) ===")
     import json, tempfile
     from huggingface_hub import hf_hub_download
     ok = tot = 0
-    for repo, why in [("tiiuae/falcon-7b", "Punctuation"),
-                      ("dphn/Dolphin-X1-Trinity-Nano", "\\A/\\G/\\z Split")]:
+
+    extra_inputs = TEST_TEXTS + [
+        "Привет в мире! 1234567890",           # Falcon3 post-ByteLevel Cyrillic 0xB2='²' split
+        "1234 12345 123456 1234567 " + "1" * 515,  # Dolphin right-aligned 3-digit & 510-digit grouping
+        "def foo(x: int):\n    return x\n",    # Seed-Coder symbol-without-newline Split
+        "  UPPER   CASE\t\nCafe\u0301  ",       # Lowercase / Strip / Replace(\s+) / NFC
+    ]
+    for repo in ["tiiuae/falcon-7b", "tiiuae/Falcon3-7B-Instruct",
+                 "tiiuae/Falcon-H1-7B-Instruct", "dphn/Dolphin-X1-Trinity-Nano",
+                 "ByteDance-Seed/Seed-Coder-8B-Instruct", "openai/clip-vit-large-patch14"]:
+        try:
+            tj = hf_hub_download(repo, "tokenizer.json")
+        except Exception:
+            print(f"  {repo:42} SKIP (unavailable)")
+            continue
+        fast = HFTokenizer.from_file(tj); fast.no_truncation()
+        R = tuetoken.Tokenizer(tj)
+        AT = tuetoken.AutoTokenizer.from_file(tj)
+        local = sum(
+            1 for s in extra_inputs
+            if AT.encode(s, add_special_tokens=False) == fast.encode(s, add_special_tokens=False).ids
+            and R.decode(AT.encode(s, add_special_tokens=False)) == fast.decode(fast.encode(s, add_special_tokens=False).ids)
+        )
+        ok += local; tot += len(extra_inputs)
+        _line(repo, local, len(extra_inputs))
+
+    # Offline synthetic ByteLevel + byte_fallback composable configs vs HF tokenizers
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs = list(bs); n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b); cs.append(256 + n); n += 1
+    bl_vocab = {chr(c): i for i, c in enumerate(cs)}
+    bf_vocab = {f"<0x{b:02X}>": b for b in range(256)}
+    for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?-\u2581":
+        if ch not in bf_vocab:
+            bf_vocab[ch] = len(bf_vocab)
+
+    bl_dec = {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True}
+    synth_cases = [
+        ("Lowercase + Strip + Replace(Regex) + ByteLevel(aps=True)",
+         {"version": "1.0", "model": {"type": "BPE", "vocab": bl_vocab, "merges": []},
+          "normalizer": {"type": "Sequence", "normalizers": [
+              {"type": "NFC"},
+              {"type": "Strip", "strip_left": True, "strip_right": True},
+              {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": " "},
+              {"type": "Lowercase"}]},
+          "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True},
+          "decoder": bl_dec}),
+        ("Metaspace(prepend_scheme=never, split=True) + byte_fallback",
+         {"version": "1.0", "model": {"type": "BPE", "vocab": bf_vocab, "merges": [], "byte_fallback": True},
+          "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "prepend_scheme": "never", "split": True},
+          "decoder": {"type": "Metaspace", "replacement": "\u2581", "prepend_scheme": "never", "split": True}}),
+        ("Punctuation(MergedWithPrevious) + byte_fallback",
+         {"version": "1.0", "model": {"type": "BPE", "vocab": bf_vocab, "merges": [], "byte_fallback": True},
+          "pre_tokenizer": {"type": "Punctuation", "behavior": "MergedWithPrevious"}}),
+        ("Whitespace + ByteLevel(use_regex=False)",
+         {"version": "1.0", "model": {"type": "BPE", "vocab": bl_vocab, "merges": []},
+          "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+              {"type": "Whitespace"},
+              {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False}]},
+          "decoder": bl_dec}),
+        ("WhitespaceSplit + ByteLevel(add_prefix_space=True, use_regex=False)",
+         {"version": "1.0", "model": {"type": "BPE", "vocab": bl_vocab, "merges": []},
+          "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+              {"type": "WhitespaceSplit"},
+              {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": False}]},
+          "decoder": bl_dec}),
+    ]
+    synth_texts = ["", " ", "Hello,  World! 123", "  a...b!? c  ", "café naïve — test"]
+    for label, cfg in synth_cases:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f); path = f.name
+        try:
+            fast = HFTokenizer.from_file(path)
+            AT = tuetoken.AutoTokenizer.from_file(path)
+            good = all(AT.encode(s, add_special_tokens=False) == fast.encode(s, add_special_tokens=False).ids
+                       for s in synth_texts)
+            tot += 1; ok += int(good)
+            _line(label[:34], int(good), 1)
+        finally:
+            os.unlink(path)
+    assert ok == tot, f"composable_pipeline: {ok}/{tot}"
+    return ok, tot
+
+
+def test_failclosed():
+    # Reject (don't silently mistokenize) constructs the engine genuinely does not
+    # implement: non-BPE models (WordPiece, Unigram), unknown normalizers
+    # (BertNormalizer, Precompiled), unknown pre-tokenizers (BertPreTokenizer,
+    # UnicodeScripts), and unsupported BPE subword prefixes.
+    print("=== fail-closed: unsupported models/stages rejected ===")
+    import json, tempfile
+    from huggingface_hub import hf_hub_download
+    ok = tot = 0
+    for repo, why in [("google-bert/bert-base-uncased", "WordPiece"),
+                      ("cross-encoder/nli-deberta-v3-small", "Unigram")]:
         try:
             tj = hf_hub_download(repo, "tokenizer.json")
         except Exception:
@@ -299,21 +399,27 @@ def test_failclosed():
         except Exception:
             ok += 1; print(f"  {repo} ({why}): rejected [PASS]")
 
-    # Offline synthetic configs for the stages we don't model — these must be
-    # rejected at load, not silently mistokenized (the reviewer's Lowercase case
-    # and a byte_fallback model with an unreproducible Punctuation pre-tokenizer).
     synthetic = [
-        ("Lowercase normalizer",
-         {"model": {"type": "BPE", "vocab": {}, "merges": []},
-          "normalizer": {"type": "Lowercase"},
+        ("Unigram model",
+         {"model": {"type": "Unigram", "vocab": [["<unk>", 0.0]]},
           "pre_tokenizer": {"type": "ByteLevel", "use_regex": True}}),
-        ("Strip normalizer",
+        ("WordPiece model",
+         {"model": {"type": "WordPiece", "vocab": {"[UNK]": 0}},
+          "pre_tokenizer": {"type": "Whitespace"}}),
+        ("BertNormalizer",
          {"model": {"type": "BPE", "vocab": {}, "merges": []},
-          "normalizer": {"type": "Sequence", "normalizers": [{"type": "NFC"}, {"type": "Strip"}]},
+          "normalizer": {"type": "BertNormalizer"},
           "pre_tokenizer": {"type": "ByteLevel", "use_regex": True}}),
-        ("byte_fallback + Punctuation",
+        ("Precompiled normalizer",
+         {"model": {"type": "BPE", "vocab": {}, "merges": []},
+          "normalizer": {"type": "Sequence", "normalizers": [{"type": "NFC"}, {"type": "Precompiled", "precompiled_charsmap": ""}]},
+          "pre_tokenizer": {"type": "ByteLevel", "use_regex": True}}),
+        ("UnicodeScripts pre_tokenizer",
          {"model": {"type": "BPE", "vocab": {}, "merges": [], "byte_fallback": True},
-          "pre_tokenizer": {"type": "Punctuation"}}),
+          "pre_tokenizer": {"type": "UnicodeScripts"}}),
+        ("BPE continuing_subword_prefix",
+         {"model": {"type": "BPE", "vocab": {}, "merges": [], "continuing_subword_prefix": "##"},
+          "pre_tokenizer": {"type": "ByteLevel", "use_regex": True}}),
     ]
     for why, cfg in synthetic:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -324,6 +430,8 @@ def test_failclosed():
             print(f"  synthetic ({why}): LOADED (should reject) [FAIL]")
         except Exception:
             ok += 1; print(f"  synthetic ({why}): rejected [PASS]")
+        finally:
+            os.unlink(path)
     assert ok == tot, f"fail-closed: {ok}/{tot}"
     return ok, tot
 
@@ -599,12 +707,64 @@ def test_warmup_and_fast_startup():
     return ok, tot
 
 
+def test_tekken_and_legacy_formats():
+    """Mistral tekken.json (Devstral, Mistral-Small-3.2, Magistral) and legacy
+    vocab.json+merges.txt (OPT) load transparently via from_pretrained == HF."""
+    print("=== Mistral tekken.json & legacy BPE formats == transformers ===")
+    try:
+        from transformers import AutoTokenizer as HF
+    except Exception as e:
+        print(f"  SKIP ({type(e).__name__})")
+        return 0, 0
+    ok = tot = 0
+    repos = [
+        "mistralai/Devstral-Small-2505",               # Tekken v7
+        "mistralai/Mistral-Small-3.2-24B-Instruct-2506",  # Tekken v11
+        "mistralai/Magistral-Small-2506",              # Tekken v11
+        "facebook/opt-125m",                           # legacy vocab.json + merges.txt
+    ]
+    samples = [
+        "Hello, world!",
+        "def foo_bar(x: int = 123456):\n    return x * 2  # comment\n",
+        "café naïve 日本語 한국어 中文 🚀🔥",
+        "1 12 123 1234 1234567890   spaces\t\ttabs\r\nnewlines",
+        "camelCaseWord HTTPSConnection XMLParser don't we'll",
+    ]
+    for repo in repos:
+        try:
+            hf = HF.from_pretrained(repo)
+            at = tuetoken.AutoTokenizer.from_pretrained(repo)
+            core = tuetoken.Tokenizer.from_pretrained(repo)
+        except Exception as e:
+            print(f"  {repo:46} SKIP ({type(e).__name__}: {str(e)[:50]})")
+            continue
+        local = 0
+        n_chk = 0
+        for s in samples:
+            for add_sp in (False, True):
+                n_chk += 1
+                local += int(at.encode(s, add_special_tokens=add_sp) == hf.encode(s, add_special_tokens=add_sp))
+            n_chk += 1
+            local += int(core.encode_ordinary(s) == hf.encode(s, add_special_tokens=False))
+            ids = hf.encode(s, add_special_tokens=False)
+            n_chk += 1
+            local += int(at.decode(ids) == hf.decode(ids))
+        n_chk += 1
+        local += int(at.vocab_size == len(hf) and at.bos_token_id == hf.bos_token_id
+                     and at.eos_token_id == hf.eos_token_id and at.pad_token_id == hf.pad_token_id)
+        ok += local; tot += n_chk
+        _line(repo, local, n_chk)
+    assert ok == tot, f"tekken_and_legacy: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
-        test_hf_models(), test_failclosed(), test_normalization(),
-        test_new_features(), test_rank_inversion(), test_auto(),
-        test_kimi_tiktoken_model(), test_bytes_inputs(), test_warmup_and_fast_startup(),
+        test_hf_models(), test_composable_pipeline(), test_failclosed(),
+        test_normalization(), test_new_features(), test_rank_inversion(),
+        test_auto(), test_kimi_tiktoken_model(), test_tekken_and_legacy_formats(),
+        test_bytes_inputs(), test_warmup_and_fast_startup(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

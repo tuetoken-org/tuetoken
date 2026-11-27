@@ -2,8 +2,9 @@
 //! (so pre-tokenization is byte-for-byte parity with HF/tiktoken).
 
 use crate::unicode_tables::{
-    LETTER_ASTRAL, LETTER_BMP, LOWER_ASTRAL, LOWER_BMP, MARK_ASTRAL, MARK_BMP, NUMBER_ASTRAL,
-    NUMBER_BMP, PUNCTSYM_ASTRAL, PUNCTSYM_BMP, UPPER_ASTRAL, UPPER_BMP,
+    LETTER_ASTRAL, LETTER_BMP, LOWER_ASTRAL, LOWER_BMP, MARK_ASTRAL, MARK_BMP,
+    MARK_NONSPACING_ASTRAL, MARK_NONSPACING_BMP, NUMBER_ASTRAL, NUMBER_BMP, PUNCT_ASTRAL,
+    PUNCT_BMP, PUNCTSYM_ASTRAL, PUNCTSYM_BMP, UPPER_ASTRAL, UPPER_BMP,
 };
 
 #[inline]
@@ -109,6 +110,26 @@ pub fn is_mark(cp: u32) -> bool {
         return false;
     }
     has_prop(&MARK_BMP, MARK_ASTRAL, cp)
+}
+
+/// `\p{Mn}` (nonspacing combining marks) — used by HF's `StripAccents` normalizer.
+#[inline]
+pub fn is_mark_nonspacing(cp: u32) -> bool {
+    if cp < 0x80 {
+        return false;
+    }
+    has_prop(&MARK_NONSPACING_BMP, MARK_NONSPACING_ASTRAL, cp)
+}
+
+/// HF `tokenizers` `Punctuation` character predicate: ASCII punctuation
+/// (`is_ascii_punctuation`, i.e. 33..=47 | 58..=64 | 91..=96 | 123..=126)
+/// OR Unicode General Category `P` (`Pc`/`Pd`/`Ps`/`Pe`/`Pi`/`Pf`/`Po`).
+#[inline]
+pub fn is_hf_punctuation(cp: u32) -> bool {
+    if cp < 0x80 {
+        return (cp as u8).is_ascii_punctuation();
+    }
+    has_prop(&PUNCT_BMP, PUNCT_ASTRAL, cp)
 }
 
 /// `\p{P}` (punctuation) | `\p{S}` (symbol). ASCII punctuation/symbols are exactly

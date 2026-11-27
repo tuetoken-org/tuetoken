@@ -94,10 +94,7 @@ class AutoTokenizer:
 
         # Hand the added tokens to the Rust core so `encode_special` splits + BPEs a
         # whole chat string in one pass (no Python regex / per-fragment crossing).
-        # The core reproduces "first" (prepend ▁ to the first fragment) and "always"
-        # (every fragment); HF's "never" (suppress the prepend) has no core mode, so
-        # fail closed with a clear message instead of a cryptic KeyError.
-        _scheme_map = {"none": 0, "always": 1, "first": 2}
+        _scheme_map = {"none": 0, "always": 1, "first": 2, "never": 3}
         if self._prepend_scheme not in _scheme_map:
             raise ValueError(
                 f"unsupported SentencePiece prepend_scheme {self._prepend_scheme!r}: "
@@ -193,21 +190,41 @@ class AutoTokenizer:
         return cls(tj_path, cfg, warmup=warmup)
 
     @classmethod
+    def from_tekken(cls, source, revision=None, warmup=None):
+        """Load a Mistral `tekken.json` model (e.g. Devstral-Small, Mistral-Small-3.2,
+        Magistral-Small) from a local `tekken.json` path or HF repo id."""
+        from . import _formats as _fmt
+        res = _fmt.try_load_tekken_repo(source, revision=revision)
+        if res is None:
+            raise FileNotFoundError(f"no tekken.json found for {source!r}")
+        tj_path, cfg = res
+        return cls(tj_path, cfg, warmup=warmup)
+
+    @classmethod
     def from_pretrained(cls, repo_id, revision=None, warmup=None, **_):
         from huggingface_hub import hf_hub_download
         kw = {"revision": revision} if revision else {}
         try:
             tj = hf_hub_download(repo_id, "tokenizer.json", **kw)
         except Exception as e:
-            # tiktoken-format model (ships tiktoken.model + a tokenization_*.py, no
-            # tokenizer.json — e.g. Kimi)? Recover its split pattern statically from
-            # the module named in tokenizer_config.json's auto_map (config-driven,
-            # never the model name; pure AST, no code execution) and load it
-            # transparently — so from_pretrained "just works".
+            # 1. Mistral Tekken format (tekken.json — Devstral, Mistral-Small-3.2,
+            #    Magistral, Pixtral, ...)?
+            from . import _formats as _fmt
+            res = _fmt.try_load_tekken_repo(repo_id, revision=revision)
+            if res is not None:
+                tj_path, cfg = res
+                return cls(tj_path, cfg, warmup=warmup)
+            # 2. tiktoken-format model (ships tiktoken.model + a tokenization_*.py,
+            #    e.g. Kimi-K2 / Kimi-VL)? Recover pat_str via pure static AST.
             from . import _tiktoken as _tt
             pattern = _tt.tiktoken_pattern_from_repo(repo_id, revision)
             if pattern is not None:
                 return cls.from_tiktoken_model(repo_id, pattern=pattern, revision=revision, warmup=warmup)
+            # 3. Legacy ByteLevel BPE (vocab.json + merges.txt, e.g. facebook/opt-125m)?
+            legacy = _fmt.try_load_legacy_bpe_repo(repo_id, revision=revision)
+            if legacy is not None:
+                tj_path, cfg = legacy
+                return cls(tj_path, cfg, warmup=warmup)
             # Not auto-recoverable: actionable error if it IS tiktoken-format, else
             # re-raise the original download failure.
             try:

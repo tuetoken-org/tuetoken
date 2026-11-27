@@ -1,7 +1,9 @@
-//! Unicode normalization (NFC/NFD/NFKC/NFKD) that only touches non-ASCII text.
+//! Composable HuggingFace normalizer pipeline + fast ASCII-skipping Unicode
+//! normalization (NFC/NFD/NFKC/NFKD).
 //!
-//! Key fact: splitting a string immediately BEFORE any ASCII character is safe
-//! for all four forms — `N(a + b) == N(a) + N(b)` whenever `b` starts with ASCII:
+//! Key fact for segmented Unicode normalization: splitting a string immediately
+//! BEFORE any ASCII character is safe for all four forms — `N(a + b) == N(a) + N(b)`
+//! whenever `b` starts with ASCII:
 //!   * every ASCII char is a starter (ccc = 0), so canonical reordering never
 //!     moves a mark across it;
 //!   * no canonical composition has an ASCII char as its SECOND element, so an
@@ -16,6 +18,7 @@
 //! it. Already-normalized input returns `Cow::Borrowed` with no allocation; a
 //! 100 MB document with one decomposed accent no longer re-normalizes 100 MB.
 
+use serde_json::Value;
 use std::borrow::Cow;
 use unicode_normalization::{
     is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized, UnicodeNormalization,
@@ -114,9 +117,226 @@ pub fn normalize(form: u8, text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// A single composable HuggingFace normalizer stage.
+#[derive(Clone, Debug)]
+pub enum NormStage {
+    Unicode(u8), // 1 NFC, 2 NFD, 3 NFKC, 4 NFKD
+    Lowercase,
+    StripAccents,
+    Strip { left: bool, right: bool },
+    Prepend(String),
+    ReplaceStr { from: String, to: String },
+    ReplaceRe { re: fancy_regex::Regex, to: String },
+}
+
+/// Ordered pipeline of HuggingFace normalizer stages.
+///
+/// Empty pipelines (`is_identity()`) and single-stage Unicode normalization
+/// (`fast_unicode != 0`) take zero-overhead fast paths so standard LLMs pay no
+/// extra indirection.
+#[derive(Clone, Debug, Default)]
+pub struct Normalizer {
+    stages: Vec<NormStage>,
+    fast_unicode: u8,
+}
+
+fn parse_stages(val: &Value, out: &mut Vec<NormStage>) -> Result<(), String> {
+    if val.is_null() {
+        return Ok(());
+    }
+    let t = val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "<unknown>".to_string())?;
+    match t {
+        "Sequence" => {
+            if let Some(arr) = val.get("normalizers").and_then(|v| v.as_array()) {
+                for item in arr {
+                    parse_stages(item, out)?;
+                }
+            }
+            Ok(())
+        }
+        "NFC" => {
+            out.push(NormStage::Unicode(1));
+            Ok(())
+        }
+        "NFD" => {
+            out.push(NormStage::Unicode(2));
+            Ok(())
+        }
+        "NFKC" => {
+            out.push(NormStage::Unicode(3));
+            Ok(())
+        }
+        "NFKD" => {
+            out.push(NormStage::Unicode(4));
+            Ok(())
+        }
+        "Lowercase" => {
+            out.push(NormStage::Lowercase);
+            Ok(())
+        }
+        "StripAccents" => {
+            out.push(NormStage::StripAccents);
+            Ok(())
+        }
+        "Strip" => {
+            let left = val.get("strip_left").and_then(|v| v.as_bool()).unwrap_or(true);
+            let right = val.get("strip_right").and_then(|v| v.as_bool()).unwrap_or(true);
+            if left || right {
+                out.push(NormStage::Strip { left, right });
+            }
+            Ok(())
+        }
+        "Prepend" => {
+            let prepend = val
+                .get("prepend")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Prepend(missing prepend)".to_string())?;
+            if !prepend.is_empty() {
+                out.push(NormStage::Prepend(prepend.to_string()));
+            }
+            Ok(())
+        }
+        "Replace" => {
+            let to = val
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Replace(missing content)".to_string())?
+                .to_string();
+            let pat = val
+                .get("pattern")
+                .ok_or_else(|| "Replace(missing pattern)".to_string())?;
+            if let Some(s) = pat.get("String").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    out.push(NormStage::ReplaceStr { from: s.to_string(), to });
+                }
+                Ok(())
+            } else if let Some(r) = pat.get("Regex").and_then(|v| v.as_str()) {
+                let re = fancy_regex::Regex::new(r)
+                    .map_err(|e| format!("Replace(Regex {r:?}: {e})"))?;
+                out.push(NormStage::ReplaceRe { re, to });
+                Ok(())
+            } else {
+                Err("Replace(unknown pattern)".to_string())
+            }
+        }
+        other => Err(other.to_string()),
+    }
+}
+
+impl Normalizer {
+    pub fn from_json(val: &Value) -> Result<Self, String> {
+        let mut stages = Vec::new();
+        parse_stages(val, &mut stages)?;
+        let fast_unicode = if stages.len() == 1 {
+            match stages[0] {
+                NormStage::Unicode(code) => code,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        Ok(Normalizer { stages, fast_unicode })
+    }
+
+    /// True when the normalizer is a no-op (null or empty Sequence).
+    #[inline(always)]
+    pub fn is_identity(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    /// True if any stage replaces `' '` with `ch` (e.g. SentencePiece `'▁'`).
+    pub fn replaces_space_with(&self, ch: char) -> bool {
+        let mut buf = [0u8; 4];
+        let target = ch.encode_utf8(&mut buf);
+        self.stages.iter().any(|s| match s {
+            NormStage::ReplaceStr { from, to } => from == " " && to == target,
+            _ => false,
+        })
+    }
+
+    /// Apply every stage in order, staying zero-copy (`Cow::Borrowed`) whenever
+    /// no stage alters the input text.
+    #[inline]
+    pub fn apply<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if self.stages.is_empty() {
+            return Cow::Borrowed(text);
+        }
+        if self.fast_unicode != 0 {
+            return normalize(self.fast_unicode, text);
+        }
+        let mut cur: Cow<'a, str> = Cow::Borrowed(text);
+        for st in &self.stages {
+            match st {
+                NormStage::Unicode(code) => match normalize(*code, &cur) {
+                    Cow::Borrowed(_) => {}
+                    Cow::Owned(s) => cur = Cow::Owned(s),
+                },
+                NormStage::Lowercase => {
+                    // Fast ASCII check: avoid allocating if already all lowercase ASCII.
+                    if cur.bytes().all(|b| b < 0x80 && !b.is_ascii_uppercase()) {
+                        continue;
+                    }
+                    cur = Cow::Owned(cur.to_lowercase());
+                }
+                NormStage::StripAccents => {
+                    if cur.chars().any(|c| crate::unicode::is_mark_nonspacing(c as u32)) {
+                        let s: String = cur
+                            .chars()
+                            .filter(|&c| !crate::unicode::is_mark_nonspacing(c as u32))
+                            .collect();
+                        cur = Cow::Owned(s);
+                    }
+                }
+                NormStage::Strip { left, right } => {
+                    let trimmed = match (*left, *right) {
+                        (true, true) => cur.trim(),
+                        (true, false) => cur.trim_start(),
+                        (false, true) => cur.trim_end(),
+                        (false, false) => cur.as_ref(),
+                    };
+                    if trimmed.len() != cur.len() {
+                        cur = match cur {
+                            Cow::Borrowed(orig) => {
+                                let start = trimmed.as_ptr() as usize - orig.as_ptr() as usize;
+                                Cow::Borrowed(&orig[start..start + trimmed.len()])
+                            }
+                            Cow::Owned(_) => Cow::Owned(trimmed.to_owned()),
+                        };
+                    }
+                }
+                NormStage::Prepend(p) => {
+                    if !cur.is_empty() {
+                        let mut s = String::with_capacity(p.len() + cur.len());
+                        s.push_str(p);
+                        s.push_str(&cur);
+                        cur = Cow::Owned(s);
+                    }
+                }
+                NormStage::ReplaceStr { from, to } => {
+                    if cur.contains(from.as_str()) {
+                        cur = Cow::Owned(cur.replace(from.as_str(), to.as_str()));
+                    }
+                }
+                NormStage::ReplaceRe { re, to } => {
+                    // HF Replace treats `content` literally (no $1 expansion).
+                    match re.replace_all(&cur, fancy_regex::NoExpand(to.as_str())) {
+                        Cow::Borrowed(_) => {}
+                        Cow::Owned(s) => cur = Cow::Owned(s),
+                    }
+                }
+            }
+        }
+        cur
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn lcg(s: &mut u64) -> u64 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -141,5 +361,49 @@ mod tests {
                 assert_eq!(normalize(form, &s).as_ref(), want, "form={form} s={s:?}");
             }
         }
+    }
+
+    #[test]
+    fn composable_normalizer_stages() {
+        // CLIP-style pipeline: NFC -> Replace(\s+ -> " ") -> Lowercase
+        let n = Normalizer::from_json(&json!({
+            "type": "Sequence",
+            "normalizers": [
+                {"type": "NFC"},
+                {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": " "},
+                {"type": "Lowercase"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(n.apply("Hello   \t\n WORLD  Cafe\u{0301}"), "hello world café");
+
+        // Prepend on empty stays empty (HF semantics)
+        let sp = Normalizer::from_json(&json!({
+            "type": "Sequence",
+            "normalizers": [
+                {"type": "Prepend", "prepend": "\u{2581}"},
+                {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(sp.apply(""), "");
+        assert_eq!(sp.apply("hello world"), "\u{2581}hello\u{2581}world");
+        assert_eq!(sp.apply(" hello"), "\u{2581}\u{2581}hello");
+
+        // Strip + NFD + StripAccents
+        let sa = Normalizer::from_json(&json!({
+            "type": "Sequence",
+            "normalizers": [
+                {"type": "Strip", "strip_left": true, "strip_right": true},
+                {"type": "NFD"},
+                {"type": "StripAccents"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(sa.apply("  café  "), "cafe");
+
+        // Fail closed on unknown normalizer types
+        assert!(Normalizer::from_json(&json!({"type": "BertNormalizer"})).is_err());
+        assert!(Normalizer::from_json(&json!({"type": "Precompiled"})).is_err());
     }
 }

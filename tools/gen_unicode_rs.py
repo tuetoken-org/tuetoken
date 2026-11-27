@@ -10,13 +10,14 @@ import unicodedata
 LETTER = {"Lu", "Ll", "Lt", "Lm", "Lo"}
 NUMBER = {"Nd", "Nl", "No"}
 MARK = {"Mn", "Mc", "Me"}
-# \p{P} (punctuation) + \p{S} (symbol), one combined category for the DeepSeek
-# pre-tokenizer's `[\p{P}\p{S}]+` run and `[^\r\n\p{L}\p{P}\p{S}]` prefix.
-PUNCTSYM = {"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So"}
+# \p{P} (punctuation) only (for HF Punctuation pre-tokenizer) and \p{P} + \p{S}
+# (one combined category for the DeepSeek pre-tokenizer's `[\p{P}\p{S}]+` run).
+PUNCT = {"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po"}
+PUNCTSYM = PUNCT | {"Sm", "Sc", "Sk", "So"}
 
 
 def collect():
-    b = {"L": [], "N": [], "M": [], "Lu": [], "Ll": [], "PS": []}
+    b = {"L": [], "N": [], "M": [], "Mn": [], "Lu": [], "Ll": [], "P": [], "PS": []}
     for cp in range(0x110000):
         if 0xD800 <= cp <= 0xDFFF:
             continue
@@ -31,8 +32,12 @@ def collect():
             b["N"].append(cp)
         elif cat in MARK:
             b["M"].append(cp)
+            if cat == "Mn":
+                b["Mn"].append(cp)
         elif cat in PUNCTSYM:
             b["PS"].append(cp)
+            if cat in PUNCT:
+                b["P"].append(cp)
     return b
 
 
@@ -54,8 +59,8 @@ def emit(b):
         "// plus sorted (lo,hi) ranges for the astral planes (cp >= 0x10000).",
         "",
     ]
-    names = {"L": "LETTER", "N": "NUMBER", "M": "MARK", "Lu": "UPPER", "Ll": "LOWER",
-             "PS": "PUNCTSYM"}
+    names = {"L": "LETTER", "N": "NUMBER", "M": "MARK", "Mn": "MARK_NONSPACING",
+             "Lu": "UPPER", "Ll": "LOWER", "P": "PUNCT", "PS": "PUNCTSYM"}
     for k, name in names.items():
         cps = b[k]
         # BMP bitmap
