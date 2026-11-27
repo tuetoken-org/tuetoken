@@ -530,37 +530,70 @@ fn contraction_len(b: &[u8], q: usize, ci: bool) -> usize {
     }
 }
 
+/// Bit layout for the single-register `Carry::flags` word.
+/// Every common-case cross-block bit + `forced0` + `bad3` + `na4` lives in one
+/// `u32` register; `SlowCarry` is ONLY read/written when `(flags & F_SLOW) != 0`.
+// Bit positions: 0=o, 1=sp, 2=d, 3=nl, 4=ws, 5=l, 6=lw, 7=na, 8=ostart,
+// 9=abs_nl, 10=abs_sl, 11=ws_unk, 12=sl_unk, 13=contr, 14=forced0, 15=slow.
+const F_D: u32 = 1 << 2;
+const F_WS: u32 = 1 << 4;
+const F_NA: u32 = 1 << 7;
+const F_ABS_NL: u32 = 1 << 9;
+const F_ABS_SL: u32 = 1 << 10;
+const F_CONTR: u32 = 1 << 13;
+/// Chunk start carried into byte 0 of the next block (set on start & realign).
+const F_FORCED0: u32 = 1 << 14;
+/// Set iff any slow-path carry is live (`na`, `na4`, `bad_in`, `contr_mask`,
+/// `forced & !1`, `suppress`). When clear, `SlowCarry` is never touched.
+const F_SLOW: u32 = 1 << 15;
+const BAD3_SHIFT: u32 = 16; // bits 16..=18: BAD flags of base-3..base-1 (bit 18 = base-1)
+const NA4_SHIFT: u32 = 20;  // bits 20..=23: bit k-1 = byte base-k is non-ASCII, k = 1..4
+
+/// Slow-only cross-block carry masks (contraction spans crossing a 64B edge).
+/// Valid iff `(flags & F_SLOW) != 0`; never touched on the fast path.
+#[derive(Clone, Copy, Default)]
+struct SlowCarry {
+    bad_in: u64,
+    contr_mask: u64,
+    forced: u64,
+    suppress: u64,
+}
+
 /// State carried from one block to the next in a sequential scan.
 #[derive(Clone, Copy, Default)]
 pub struct Carry {
-    o: bool,
-    sp: bool,
-    d: bool,
-    nl: bool,
-    ws: bool,
-    l: bool,
-    lw: bool, // ASCII lowercase
-    na: bool,
-    na4: u64,        // bit k-1 = byte base-k is non-ASCII, k = 1..4
-    ostart: bool,    // byte base-1 started a chunk as an O
-    abs_nl: bool,    // byte base-1 is an NL absorbed into a symbol chunk's tail
-    abs_sl: bool,    // byte base-1 is a '/' absorbed into a symbol chunk's tail (CamelCase)
-    bad_in: u64,     // BAD bits carried into this block (contraction spans)
-    bad3: u64,       // BAD flags of bytes base-3..base-1 (bit 2 = base-1)
-    ws_unk: bool,    // byte base-1 is whitespace in an uncertain run (CamelCase)
-    sl_unk: bool,    // byte base-1 is a '/' whose tail-absorption is uncertain (CamelCase)
-    contr: bool,     // byte base-1 ends a contraction suffix (CamelCase)
-    contr_mask: u64, // suffix-end bytes inside this block, from a suffix that began earlier
-    forced: u64,     // chunk starts carried into this block
-    suppress: u64,   // non-starts carried into this block (inside a contraction)
+    flags: u32,
+    slow: SlowCarry,
+}
+
+impl Carry {
+    #[inline(always)]
+    const fn forced_start() -> Self {
+        Carry {
+            flags: F_FORCED0,
+            slow: SlowCarry { bad_in: 0, contr_mask: 0, forced: 0, suppress: 0 },
+        }
+    }
 }
 
 /// Result of one block: (starts, bad, carry for the next block).
 type Block = (u64, u64, Carry);
 
 #[inline(always)]
+fn fbit(flags: u32, mask: u32) -> bool {
+    (flags & mask) != 0
+}
+#[inline(always)]
 fn p1(x: u64, c: bool) -> u64 {
     (x << 1) | c as u64
+}
+#[inline(always)]
+fn p1f(x: u64, flags: u32, bit: u32) -> u64 {
+    (x << 1) | (((flags >> bit) & 1) as u64)
+}
+#[inline(always)]
+fn top_bit(v: u64, bit: u32) -> u32 {
+    ((v >> 63) as u32) << bit
 }
 #[inline(always)]
 fn n1(x: u64, c: bool) -> u64 {
@@ -648,19 +681,20 @@ fn ctx_m<const RESOLVE: bool, const CONT: bool>(b: &[u8], base: usize, mut m: Cl
 }
 
 #[inline(always)]
-fn common_bad(x: &Ctx, c: &Carry) -> u64 {
+fn common_bad(x: &Ctx, flags: u32) -> u64 {
     let m = &x.m;
+    let na4 = ((flags >> NA4_SHIFT) & 0xF) as u64;
     let mut bad = m.na | (m.na << 1) | (m.na << 2) | (m.na << 3) | (m.na << 4);
-    bad |= (16u64 >> c.na4.trailing_zeros().min(63)).saturating_sub(1);
-    bad |= m.ws & (p1(m.na, c.na) | n1(m.na, x.next_na));
-    bad |= m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
+    bad |= (16u64 >> na4.trailing_zeros().min(63)).saturating_sub(1);
+    bad |= m.ws & (p1f(m.na, flags, 7) | n1(m.na, x.next_na));
+    bad |= m.ws & !m.ws.wrapping_add(1) & (((flags >> 4) & 1) as u64).wrapping_neg();
     bad
 }
 
 #[inline(always)]
-fn digit_starts(m: &Classes, c: &Carry, k: u32, prefix_sp: bool) -> (u64, u64) {
-    let runs = m.d & !p1(m.d, c.d);
-    let joined = if prefix_sp { p1(m.sp, c.sp) } else { 0 };
+fn digit_starts(m: &Classes, flags: u32, k: u32, prefix_sp: bool) -> (u64, u64) {
+    let runs = m.d & !p1f(m.d, flags, 2);
+    let joined = if prefix_sp { p1f(m.sp, flags, 1) } else { 0 };
     match k {
         0 => (runs & !joined, 0),
         1 => (m.d, 0),
@@ -669,7 +703,7 @@ fn digit_starts(m: &Classes, c: &Carry, k: u32, prefix_sp: bool) -> (u64, u64) {
             for t in 1..k {
                 dm &= m.d << t;
             }
-            let flag = runs & p1(m.na, c.na);
+            let flag = runs & p1f(m.na, flags, 7);
             let mut bad = (m.d.wrapping_add(flag) ^ m.d) & m.d;
             let mut st = runs & !flag;
             let mut sh = k;
@@ -679,7 +713,7 @@ fn digit_starts(m: &Classes, c: &Carry, k: u32, prefix_sp: bool) -> (u64, u64) {
                 sh <<= 1;
             }
             st &= !bad;
-            bad |= m.d & !m.d.wrapping_add(1) & (c.d as u64).wrapping_neg();
+            bad |= m.d & !m.d.wrapping_add(1) & (((flags >> 2) & 1) as u64).wrapping_neg();
             (st, bad)
         }
     }
@@ -716,20 +750,22 @@ fn digit_starts_ascii(d: u64, cd: bool, k: u32) -> (u64, u64) {
 }
 
 #[inline(always)]
-fn ws_starts_nl(x: &Ctx, c: &Carry, base: usize, n: usize) -> (u64, u64, u64) {
+fn ws_starts_nl(x: &Ctx, flags: u32, base: usize, n: usize) -> (u64, u64, u64) {
     let m = &x.m;
-    let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, x.next_ws));
-    let o_before = p1(x.o, c.o);
+    let c_ws = fbit(flags, F_WS);
+    let c_na = fbit(flags, F_NA);
+    let long = m.ws & (p1(m.ws, c_ws) | n1(m.ws, x.next_ws));
+    let o_before = p1f(x.o, flags, 0);
     let single_abs = m.nl & !long & o_before;
     let mut starts = m.ws & !long & !single_abs;
     let (mut bad, mut abs) = (0u64, single_abs);
-    let mut runs = long & !p1(long, c.ws);
+    let mut runs = long & !p1(long, c_ws);
     while runs != 0 {
         let r = runs.trailing_zeros() as usize;
         runs &= runs - 1;
         let e = r + ((!m.ws) >> r).trailing_zeros() as usize;
         let run = run_mask(r, e);
-        let na_before = if r == 0 { c.na } else { m.na >> (r - 1) & 1 == 1 };
+        let na_before = if r == 0 { c_na } else { m.na >> (r - 1) & 1 == 1 };
         if e >= 64 || na_before || m.na >> e & 1 == 1 {
             bad |= run;
             continue;
@@ -838,14 +874,14 @@ fn span_bad(bad: &mut u64, bad_next: &mut u64, i: usize, end: usize) {
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn generic_fast(b: &[u8], base: usize, max_digits: u32, c: &Carry, m: &Classes, cont: u64) -> Option<Block> {
+fn generic_fast(b: &[u8], base: usize, max_digits: u32, flags: u32, m: &Classes, cont: u64) -> Option<(u64, u64, u32)> {
     let o = !(m.l | m.d | m.ws);
-    let o_before = p1(o, c.o);
-    let ostart = o & !o_before & !p1(m.sp, c.sp);
-    let lstart = m.l & (p1(m.d, c.d) | p1(m.nl, c.nl) | (o_before & !p1(ostart, c.ostart)));
-    let (dstart, dbad) = digit_starts_ascii(m.d, c.d, max_digits);
-    let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast(b, base, m, o_before, c.ws);
-    let mut starts = ostart | lstart | dstart | wsstart | c.forced;
+    let o_before = p1f(o, flags, 0);
+    let ostart = o & !o_before & !p1f(m.sp, flags, 1);
+    let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart, flags, 8)));
+    let (dstart, dbad) = digit_starts_ascii(m.d, fbit(flags, F_D), max_digits);
+    let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast(b, base, m, o_before, fbit(flags, F_WS));
+    let mut starts = ostart | lstart | dstart | wsstart | (((flags >> 14) & 1) as u64);
     let mut bad = cont_ws | (m.ws & ((next_na as u64) << 63)) | dbad | wsbad;
     let mut qc = m.q & ostart;
     while qc != 0 {
@@ -863,39 +899,40 @@ fn generic_fast(b: &[u8], base: usize, max_digits: u32, c: &Carry, m: &Classes, 
             }
         }
     }
-    bad |= m.l & o_before & p1(bad, c.bad3 >> 2 & 1 == 1);
+    bad |= m.l & o_before & p1f(bad, flags, 18);
     bad |= (bad << 1) & cont;
-    // Tailored Carry: Generic never reads c.l, c.lw, c.abs_nl, c.abs_sl, etc.,
+    // Tailored 1-register Carry: Generic never reads l, lw, abs_nl, abs_sl, etc.,
     // allowing LLVM to dead-code-eliminate `m.up` and `m.sl` in classify64!
-    let top = |v: u64| v >> 63 & 1 == 1;
-    let out = Carry {
-        o: top(o),
-        sp: top(m.sp),
-        d: top(m.d),
-        nl: top(m.nl),
-        ws: top(m.ws),
-        ostart: top(ostart),
-        bad3: bad >> 61,
-        ..Carry::default()
-    };
-    Some((starts, bad, out))
+    let out_flags = top_bit(o, 0)
+        | top_bit(m.sp, 1)
+        | top_bit(m.d, 2)
+        | top_bit(m.nl, 3)
+        | top_bit(m.ws, 4)
+        | top_bit(ostart, 8)
+        | (((bad >> 61) as u32) << BAD3_SHIFT);
+    Some((starts, bad, out_flags))
 }
 
 #[cold]
 #[inline(never)]
-fn generic_slow(b: &[u8], base: usize, max_digits: u32, c: Carry, m: Classes) -> Block {
+fn generic_slow(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
+    let (c_bad_in, c_forced) = if fbit(flags, F_SLOW) {
+        (slow.bad_in, slow.forced)
+    } else {
+        (0, ((flags >> 14) & 1) as u64)
+    };
     let n = b.len();
     let x = ctx_m::<true, true>(b, base, m);
     let (m, o) = (&x.m, x.o);
-    let ostart = o & !p1(o, c.o) & !p1(m.sp, c.sp);
+    let ostart = o & !p1f(o, flags, 0) & !p1f(m.sp, flags, 1);
     let ostart_c = ostart | ((ostart << 1) & x.cont);
     let ostart_c = ostart_c | ((ostart_c << 1) & x.cont);
-    let lstart = m.l & (p1(m.d, c.d) | p1(m.nl, c.nl) | (p1(o, c.o) & !p1(ostart_c, c.ostart)));
-    let (dstart, dbad) = digit_starts(m, &c, max_digits, false);
-    let (wsstart, wsbad, _) = ws_starts_nl(&x, &c, base, n);
-    let mut starts = ostart | lstart | dstart | wsstart | c.forced;
+    let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (p1f(o, flags, 0) & !p1f(ostart_c, flags, 8)));
+    let (dstart, dbad) = digit_starts(m, flags, max_digits, false);
+    let (wsstart, wsbad, _) = ws_starts_nl(&x, flags, base, n);
+    let mut starts = ostart | lstart | dstart | wsstart | c_forced;
     let mut forced = 0u64;
-    let mut bad = common_bad(&x, &c) | dbad | wsbad | c.bad_in;
+    let mut bad = common_bad(&x, flags) | dbad | wsbad | c_bad_in;
     let mut bad_next = 0u64;
     let mut qc = m.q & ostart;
     while qc != 0 {
@@ -913,45 +950,46 @@ fn generic_slow(b: &[u8], base: usize, max_digits: u32, c: Carry, m: Classes) ->
     }
     let bad_c = bad | ((bad << 1) & x.cont);
     let bad_c = bad_c | ((bad_c << 1) & x.cont);
-    bad |= m.l & p1(o, c.o) & p1(bad_c, c.bad3 >> 2 & 1 == 1);
+    bad |= m.l & p1f(o, flags, 0) & p1f(bad_c, flags, 18);
     let bad = bad | ((bad << 1) & x.cont) | ((bad << 2) & x.cont & (x.cont << 1));
-    let top = |v: u64| v >> 63 & 1 == 1;
-    let out = Carry {
-        o: top(x.o),
-        sp: top(m.sp),
-        d: top(m.d),
-        nl: top(m.nl),
-        ws: top(m.ws),
-        na: top(m.na),
-        na4: (m.na >> 60).reverse_bits() >> 60,
-        ostart: top(ostart_c),
-        bad_in: bad_next,
-        bad3: bad >> 61,
-        forced,
-        ..Carry::default()
-    };
-    (starts & x.valid, bad & x.valid, out)
+    let na4 = ((m.na >> 60).reverse_bits() >> 60) as u32;
+    let has_slow = (m.na >> 63 != 0) || na4 != 0 || (bad_next | (forced & !1)) != 0;
+    if has_slow {
+        *slow = SlowCarry { bad_in: bad_next, contr_mask: 0, forced, suppress: 0 };
+    }
+    let out_flags = top_bit(x.o, 0)
+        | top_bit(m.sp, 1)
+        | top_bit(m.d, 2)
+        | top_bit(m.nl, 3)
+        | top_bit(m.ws, 4)
+        | top_bit(m.na, 7)
+        | top_bit(ostart_c, 8)
+        | (((forced & 1) as u32) << 14)
+        | if has_slow { F_SLOW } else { 0 }
+        | (((bad >> 61) as u32) << BAD3_SHIFT)
+        | (na4 << NA4_SHIFT);
+    (starts & x.valid, bad & x.valid, out_flags)
 }
 
 #[inline(always)]
-unsafe fn generic_block<S: Simd>(b: &[u8], base: usize, max_digits: u32, c: Carry) -> Block {
+unsafe fn generic_block<S: Simd>(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32) {
     let m = classify_with::<S>(b, base);
-    if base + 64 < b.len() && !c.na && (c.na4 | c.bad_in | (c.forced & !1)) == 0 {
+    if base + 64 < b.len() && (flags & F_SLOW) == 0 {
         if m.na == 0 {
-            if let Some(r) = generic_fast(b, base, max_digits, &c, &m, 0) {
+            if let Some(r) = generic_fast(b, base, max_digits, flags, &m, 0) {
                 return r;
             }
         } else {
             let mut rm = m;
             let (cont, punct) = S::resolve_latin1_64(b.as_ptr().add(base), &mut rm);
             if rm.na == 0 && punct == 0 {
-                if let Some(r) = generic_fast(b, base, max_digits, &c, &rm, cont) {
+                if let Some(r) = generic_fast(b, base, max_digits, flags, &rm, cont) {
                     return r;
                 }
             }
         }
     }
-    generic_slow(b, base, max_digits, c, m)
+    generic_slow(b, base, max_digits, flags, slow, m)
 }
 
 // ---------------------------------------------------------------------------
@@ -964,37 +1002,38 @@ fn camel_fast(
     base: usize,
     contractions: bool,
     max_digits: u32,
-    c: &Carry,
+    flags: u32,
     m: &Classes,
     cont: u64,
-) -> Option<Block> {
+) -> Option<(u64, u64, u32)> {
     let o = !(m.l | m.d | m.ws);
     let lw = m.l & !m.up;
-    let o_before = p1(o, c.o);
-    let (wsstart, wsbad, abs_nl, cont_ws, next_na) = ws_starts_nl_fast(b, base, m, o_before, c.ws);
-    let seed = m.sl & p1(abs_nl, c.abs_nl || c.abs_sl);
+    let o_before = p1f(o, flags, 0);
+    let (wsstart, wsbad, abs_nl, cont_ws, next_na) = ws_starts_nl_fast(b, base, m, o_before, fbit(flags, F_WS));
+    let seed = m.sl & p1(abs_nl, (flags & (F_ABS_NL | F_ABS_SL)) != 0);
     let abs_sl = (m.sl.wrapping_add(seed) ^ m.sl) & m.sl;
-    let mut ostart = (o & !o_before & !p1(m.sp, c.sp) & !abs_sl) | (o & !m.sl & p1(abs_sl, c.abs_sl));
-    let (dstart, dbad) = digit_starts_ascii(m.d, c.d, max_digits);
+    let mut ostart = (o & !o_before & !p1f(m.sp, flags, 1) & !abs_sl) | (o & !m.sl & p1f(abs_sl, flags, 10));
+    let (dstart, dbad) = digit_starts_ascii(m.d, fbit(flags, F_D), max_digits);
     let mut bad = cont_ws | (m.ws & ((next_na as u64) << 63)) | dbad | wsbad;
     let ws_unk = m.ws & bad;
-    let useed = m.sl & p1(ws_unk, c.ws_unk) | (m.sl & 1 & c.sl_unk as u64);
+    let useed = (m.sl & p1f(ws_unk, flags, 11)) | (m.sl & (((flags >> 12) & 1) as u64));
     let sl_unk = (m.sl.wrapping_add(useed) ^ m.sl) & m.sl;
-    bad |= sl_unk | (p1(sl_unk, c.sl_unk) & !m.sl);
+    bad |= sl_unk | (p1f(sl_unk, flags, 12) & !m.sl);
     let (mut suppress, mut forced_in, mut contr_end) = (0u64, 0u64, 0u64);
     if contractions {
-        let mut qs = m.q & p1(m.l, c.l);
+        let mut qs = m.q & p1f(m.l, flags, 5);
+        let c_bad3 = ((flags >> BAD3_SHIFT) & 7) as u64;
         while qs != 0 {
             let i = qs.trailing_zeros() as usize;
             qs &= qs - 1;
-            let window = ((bad << 3) | c.bad3) >> i & 0b1111;
+            let window = ((bad << 3) | c_bad3) >> i & 0b1111;
             if window != 0 {
                 if i >= 60 {
                     return None;
                 }
                 bad |= run_mask(i, i + 4);
             }
-            let prev_is_suffix_end = if i == 0 { c.contr } else { contr_end >> (i - 1) & 1 == 1 };
+            let prev_is_suffix_end = if i == 0 { fbit(flags, F_CONTR) } else { contr_end >> (i - 1) & 1 == 1 };
             if prev_is_suffix_end {
                 continue;
             }
@@ -1016,64 +1055,66 @@ fn camel_fast(
     }
     ostart &= !suppress;
     let lstart = m.l
-        & (p1(m.d, c.d) | p1(m.nl, c.nl) | (o_before & !p1(ostart, c.ostart)) | (m.up & p1(lw, c.lw)));
-    let starts = ((ostart | lstart | dstart | wsstart) & !suppress) | c.forced | forced_in;
-    bad |= m.l & o_before & p1(bad, c.bad3 >> 2 & 1 == 1);
+        & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart, flags, 8)) | (m.up & p1f(lw, flags, 6)));
+    let starts = ((ostart | lstart | dstart | wsstart) & !suppress) | (((flags >> 14) & 1) as u64) | forced_in;
+    bad |= m.l & o_before & p1f(bad, flags, 18);
     bad |= (bad << 1) & cont;
-    let top = |v: u64| v >> 63 & 1 == 1;
-    let out = Carry {
-        o: top(o),
-        sp: top(m.sp),
-        d: top(m.d),
-        nl: top(m.nl),
-        ws: top(m.ws),
-        l: top(m.l),
-        lw: top(lw),
-        ostart: top(ostart),
-        abs_nl: top(abs_nl),
-        abs_sl: top(abs_sl),
-        bad3: bad >> 61,
-        ws_unk: top(ws_unk),
-        sl_unk: top(sl_unk),
-        contr: top(contr_end),
-        ..Carry::default()
-    };
-    Some((starts, bad, out))
+    let out_flags = top_bit(o, 0)
+        | top_bit(m.sp, 1)
+        | top_bit(m.d, 2)
+        | top_bit(m.nl, 3)
+        | top_bit(m.ws, 4)
+        | top_bit(m.l, 5)
+        | top_bit(lw, 6)
+        | top_bit(ostart, 8)
+        | top_bit(abs_nl, 9)
+        | top_bit(abs_sl, 10)
+        | top_bit(ws_unk, 11)
+        | top_bit(sl_unk, 12)
+        | top_bit(contr_end, 13)
+        | (((bad >> 61) as u32) << BAD3_SHIFT);
+    Some((starts, bad, out_flags))
 }
 
 #[cold]
 #[inline(never)]
-fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Carry, m: Classes) -> Block {
+fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
+    let (c_bad_in, c_contr_mask, c_forced, c_suppress) = if fbit(flags, F_SLOW) {
+        (slow.bad_in, slow.contr_mask, slow.forced, slow.suppress)
+    } else {
+        (0, 0, ((flags >> 14) & 1) as u64, 0)
+    };
     let n = b.len();
     let x = ctx_m::<true, true>(b, base, m);
     let (m, o) = (&x.m, x.o);
     let lw = m.l & !m.up;
-    let (wsstart, wsbad, abs_nl) = ws_starts_nl(&x, &c, base, n);
-    let seed = m.sl & p1(abs_nl, c.abs_nl || c.abs_sl);
+    let (wsstart, wsbad, abs_nl) = ws_starts_nl(&x, flags, base, n);
+    let seed = m.sl & p1(abs_nl, (flags & (F_ABS_NL | F_ABS_SL)) != 0);
     let abs_sl = (m.sl.wrapping_add(seed) ^ m.sl) & m.sl;
-    let mut ostart = (o & !p1(o, c.o) & !p1(m.sp, c.sp) & !abs_sl) | (o & !m.sl & p1(abs_sl, c.abs_sl));
-    let (mut suppress, mut forced_in, mut forced, mut sup_next) = (c.suppress, 0u64, 0u64, 0u64);
-    let (dstart, dbad) = digit_starts(m, &c, max_digits, false);
-    let mut bad = common_bad(&x, &c) | dbad | wsbad | c.bad_in;
+    let mut ostart = (o & !p1f(o, flags, 0) & !p1f(m.sp, flags, 1) & !abs_sl) | (o & !m.sl & p1f(abs_sl, flags, 10));
+    let (mut suppress, mut forced_in, mut forced, mut sup_next) = (c_suppress, 0u64, 0u64, 0u64);
+    let (dstart, dbad) = digit_starts(m, flags, max_digits, false);
+    let mut bad = common_bad(&x, flags) | dbad | wsbad | c_bad_in;
     let ws_unk = m.ws & bad;
-    let useed = m.sl & p1(ws_unk, c.ws_unk) | (m.sl & 1 & c.sl_unk as u64);
+    let useed = (m.sl & p1f(ws_unk, flags, 11)) | (m.sl & (((flags >> 12) & 1) as u64));
     let sl_unk = (m.sl.wrapping_add(useed) ^ m.sl) & m.sl;
-    bad |= sl_unk | (p1(sl_unk, c.sl_unk) & !m.sl);
+    bad |= sl_unk | (p1f(sl_unk, flags, 12) & !m.sl);
     let mut bad_next = 0u64;
-    let mut contr_end = c.contr_mask;
+    let mut contr_end = c_contr_mask;
     let mut contr_next = 0u64;
     if contractions {
-        let mut qs = m.q & p1(m.l, c.l);
+        let mut qs = m.q & p1f(m.l, flags, 5);
+        let c_bad3 = ((flags >> BAD3_SHIFT) & 7) as u64;
         while qs != 0 {
             let i = qs.trailing_zeros() as usize;
             qs &= qs - 1;
-            let window = (bad << 3 | c.bad3) >> i & 0b1111;
+            let window = ((bad << 3) | c_bad3) >> i & 0b1111;
             if window != 0 {
                 span_bad(&mut bad, &mut bad_next, i, i + 3);
                 bad |= 1u64 << i;
                 span_bad(&mut bad, &mut bad_next, i, i + 3);
             }
-            let prev_is_suffix_end = if i == 0 { c.contr } else { contr_end >> (i - 1) & 1 == 1 };
+            let prev_is_suffix_end = if i == 0 { fbit(flags, F_CONTR) } else { contr_end >> (i - 1) & 1 == 1 };
             if prev_is_suffix_end {
                 continue;
             }
@@ -1102,46 +1143,61 @@ fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Car
     ostart &= !suppress;
     let ostart_c = ostart | ((ostart << 1) & x.cont);
     let ostart_c = ostart_c | ((ostart_c << 1) & x.cont);
-    let ostart_p1 = p1(ostart_c, c.ostart);
+    let ostart_p1 = p1f(ostart_c, flags, 8);
     let lstart = m.l
-        & (p1(m.d, c.d) | p1(m.nl, c.nl) | (p1(o, c.o) & !ostart_p1) | (m.up & p1(lw, c.lw)));
-    let starts = ((ostart | lstart | dstart | wsstart) & !suppress) | c.forced | forced_in;
+        & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (p1f(o, flags, 0) & !ostart_p1) | (m.up & p1f(lw, flags, 6)));
+    let starts = ((ostart | lstart | dstart | wsstart) & !suppress) | c_forced | forced_in;
     let bad_c = bad | ((bad << 1) & x.cont);
     let bad_c = bad_c | ((bad_c << 1) & x.cont);
-    bad |= m.l & p1(o, c.o) & p1(bad_c, c.bad3 >> 2 & 1 == 1);
+    bad |= m.l & p1f(o, flags, 0) & p1f(bad_c, flags, 18);
     let bad = bad | ((bad << 1) & x.cont) | ((bad << 2) & x.cont & (x.cont << 1));
-    let mut out = carry_out(&x, ostart_c, abs_nl, contr_end >> 63 & 1 == 1, forced, sup_next);
-    out.contr_mask = contr_next;
-    out.abs_sl = abs_sl >> 63 & 1 == 1;
-    out.bad_in = bad_next;
-    out.bad3 = bad >> 61;
-    out.ws_unk = ws_unk >> 63 & 1 == 1;
-    out.sl_unk = sl_unk >> 63 & 1 == 1;
-    (starts & x.valid, bad & x.valid, out)
+    let na4 = ((m.na >> 60).reverse_bits() >> 60) as u32;
+    let has_slow = (m.na >> 63 != 0)
+        || na4 != 0
+        || (bad_next | contr_next | (forced & !1) | sup_next) != 0;
+    if has_slow {
+        *slow = SlowCarry { bad_in: bad_next, contr_mask: contr_next, forced, suppress: sup_next };
+    }
+    let out_flags = top_bit(x.o, 0)
+        | top_bit(m.sp, 1)
+        | top_bit(m.d, 2)
+        | top_bit(m.nl, 3)
+        | top_bit(m.ws, 4)
+        | top_bit(m.l, 5)
+        | top_bit(lw, 6)
+        | top_bit(m.na, 7)
+        | top_bit(ostart_c, 8)
+        | top_bit(abs_nl, 9)
+        | top_bit(abs_sl, 10)
+        | top_bit(ws_unk, 11)
+        | top_bit(sl_unk, 12)
+        | top_bit(contr_end, 13)
+        | (((forced & 1) as u32) << 14)
+        | if has_slow { F_SLOW } else { 0 }
+        | (((bad >> 61) as u32) << BAD3_SHIFT)
+        | (na4 << NA4_SHIFT);
+    (starts & x.valid, bad & x.valid, out_flags)
 }
 
 #[inline(always)]
-unsafe fn camel_block<S: Simd>(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: Carry) -> Block {
+unsafe fn camel_block<S: Simd>(b: &[u8], base: usize, contractions: bool, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32) {
     let m = classify_with::<S>(b, base);
-    if base + 64 < b.len()
-        && !c.na
-        && (c.na4 | c.bad_in | c.suppress | (c.forced & !1) | c.contr_mask) == 0
-    {
+    if base + 64 < b.len() && (flags & F_SLOW) == 0 {
         if m.na == 0 {
-            if let Some(r) = camel_fast(b, base, contractions, max_digits, &c, &m, 0) {
+            if let Some(r) = camel_fast(b, base, contractions, max_digits, flags, &m, 0) {
                 return r;
             }
         } else {
             let mut rm = m;
             let (cont, punct) = S::resolve_latin1_64(b.as_ptr().add(base), &mut rm);
             if rm.na == 0 && punct == 0 {
-                if let Some(r) = camel_fast(b, base, contractions, max_digits, &c, &rm, cont) {
+                if let Some(r) = camel_fast(b, base, contractions, max_digits, flags, &rm, cont) {
                     return r;
                 }
             }
         }
     }
-    camel_slow(b, base, contractions, max_digits, c, m)
+    camel_slow(b, base, contractions, max_digits, flags, slow, m)
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,12 +1205,12 @@ unsafe fn camel_block<S: Simd>(b: &[u8], base: usize, contractions: bool, max_di
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn word_fast(b: &[u8], base: usize, indiv: bool, c: &Carry, m: &Classes) -> Option<Block> {
+fn word_fast(b: &[u8], base: usize, indiv: bool, flags: u32, m: &Classes) -> Option<(u64, u64, u32)> {
     let o = !(m.l | m.d | m.ws);
-    let sp_before = p1(m.sp, c.sp);
-    let ostart = o & !p1(o, c.o) & !sp_before;
-    let lstart = m.l & !p1(m.l, c.l) & !sp_before;
-    let dstart = if indiv { m.d } else { m.d & !p1(m.d, c.d) & !sp_before };
+    let sp_before = p1f(m.sp, flags, 1);
+    let ostart = o & !p1f(o, flags, 0) & !sp_before;
+    let lstart = m.l & !p1f(m.l, flags, 5) & !sp_before;
+    let dstart = if indiv { m.d } else { m.d & !p1f(m.d, flags, 2) & !sp_before };
     let mut starts = ostart | lstart | dstart;
     let mut qc = m.q & ostart;
     let mut suppress = 0u64;
@@ -1173,8 +1229,8 @@ fn word_fast(b: &[u8], base: usize, indiv: bool, c: &Carry, m: &Classes) -> Opti
     }
     let next = unsafe { *b.get_unchecked(base + 64) };
     let (next_ws, next_na) = (is_ws(next), next >= 0x80);
-    let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, next_ws));
-    let cont = m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
+    let long = m.ws & (p1f(m.ws, flags, 4) | n1(m.ws, next_ws));
+    let cont = m.ws & !m.ws.wrapping_add(1) & (((flags >> 4) & 1) as u64).wrapping_neg();
     let lr = long & !cont;
     let r = lr & !(lr << 1);
     let last = lr & !(lr >> 1);
@@ -1186,68 +1242,69 @@ fn word_fast(b: &[u8], base: usize, indiv: bool, c: &Carry, m: &Classes) -> Opti
     };
     let good = lr & !wsbad;
     let no_digit_rule = if indiv { !(m.d >> 1) } else { u64::MAX };
-    starts |= (m.ws & !long) | (r & good) | (last & good & (u64::MAX >> 1) & no_digit_rule) | c.forced;
+    starts |= (m.ws & !long) | (r & good) | (last & good & (u64::MAX >> 1) & no_digit_rule) | (((flags >> 14) & 1) as u64);
     starts &= !suppress;
     let bad = cont | wsbad | (m.ws & ((next_na as u64) << 63));
-    let top1 = |v: u64| v >> 63 & 1 == 1;
-    let out = Carry {
-        o: top1(o),
-        sp: top1(m.sp),
-        d: top1(m.d),
-        ws: top1(m.ws),
-        l: top1(m.l),
-        bad3: bad >> 61,
-        ..Carry::default()
-    };
-    Some((starts, bad, out))
+    let out_flags = top_bit(o, 0)
+        | top_bit(m.sp, 1)
+        | top_bit(m.d, 2)
+        | top_bit(m.ws, 4)
+        | top_bit(m.l, 5)
+        | (((bad >> 61) as u32) << BAD3_SHIFT);
+    Some((starts, bad, out_flags))
 }
 
 #[inline(always)]
-unsafe fn word_block<S: Simd>(b: &[u8], base: usize, indiv: bool, c: Carry) -> Block {
+unsafe fn word_block<S: Simd>(b: &[u8], base: usize, indiv: bool, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32) {
     let m = classify_with::<S>(b, base);
-    if base + 64 < b.len() && !c.na && (c.na4 | c.bad_in | c.suppress | (c.forced & !1)) == 0 {
+    if base + 64 < b.len() && (flags & F_SLOW) == 0 {
         if m.na == 0 {
-            if let Some(r) = word_fast(b, base, indiv, &c, &m) {
+            if let Some(r) = word_fast(b, base, indiv, flags, &m) {
                 return r;
             }
         } else {
             let mut rm = m;
             let _ = S::resolve_latin1_64(b.as_ptr().add(base), &mut rm);
             if rm.na == 0 {
-                if let Some(r) = word_fast(b, base, indiv, &c, &rm) {
+                if let Some(r) = word_fast(b, base, indiv, flags, &rm) {
                     return r;
                 }
             }
         }
     }
-    word_slow(b, base, indiv, c, m)
+    word_slow(b, base, indiv, flags, slow, m)
 }
 
 #[cold]
 #[inline(never)]
-fn word_slow(b: &[u8], base: usize, indiv: bool, c: Carry, m: Classes) -> Block {
+fn word_slow(b: &[u8], base: usize, indiv: bool, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
     let n = b.len();
-    if m.na != 0 && base + 64 < n && !c.na && (c.na4 | c.bad_in | c.suppress | c.forced) == 0 {
+    if m.na != 0 && base + 64 < n && (flags & F_SLOW) == 0 {
         let mut r = m;
         resolve_na::<false>(b, base, &mut r);
         if r.na == 0 {
-            if let Some(out) = word_fast(b, base, indiv, &c, &r) {
+            if let Some(out) = word_fast(b, base, indiv, flags, &r) {
                 return out;
             }
         }
     }
+    let (c_bad_in, c_forced, c_suppress) = if fbit(flags, F_SLOW) {
+        (slow.bad_in, slow.forced, slow.suppress)
+    } else {
+        (0, ((flags >> 14) & 1) as u64, 0)
+    };
     let x = ctx_m::<true, false>(b, base, m);
     let (m, o) = (&x.m, x.o);
-    let sp_before = p1(m.sp, c.sp);
-    let ostart = o & !p1(o, c.o) & !sp_before;
-    let lstart = m.l & !p1(m.l, c.l) & !sp_before;
-    let (dstart, dbad) = if indiv { (m.d, 0) } else { digit_starts(m, &c, 0, true) };
-    let long = m.ws & (p1(m.ws, c.ws) | n1(m.ws, x.next_ws));
-    let cont = m.ws & !m.ws.wrapping_add(1) & (c.ws as u64).wrapping_neg();
+    let sp_before = p1f(m.sp, flags, 1);
+    let ostart = o & !p1f(o, flags, 0) & !sp_before;
+    let lstart = m.l & !p1f(m.l, flags, 5) & !sp_before;
+    let (dstart, dbad) = if indiv { (m.d, 0) } else { digit_starts(m, flags, 0, true) };
+    let long = m.ws & (p1f(m.ws, flags, 4) | n1(m.ws, x.next_ws));
+    let cont = m.ws & !m.ws.wrapping_add(1) & (((flags >> 4) & 1) as u64).wrapping_neg();
     let lr = long & !cont;
     let r = lr & !(lr << 1);
     let last = lr & !(lr >> 1);
-    let flag_start = r & p1(m.na, c.na);
+    let flag_start = r & p1f(m.na, flags, 7);
     let flag_end = (last & (m.na >> 1)) | (last & (1u64 << 63));
     let smear_up = |runs: u64, f: u64| (runs.wrapping_add(f) ^ runs) & runs;
     let wsbad = smear_up(lr, flag_start)
@@ -1256,9 +1313,9 @@ fn word_slow(b: &[u8], base: usize, indiv: bool, c: Carry, m: Classes) -> Block 
     let text_follows = x.valid >> 1;
     let no_digit_rule = if indiv { !(m.d >> 1) } else { u64::MAX };
     let wsstart = (m.ws & !long) | (r & good) | (last & good & text_follows & no_digit_rule);
-    let mut starts = ostart | lstart | dstart | wsstart | c.forced;
-    let (mut suppress, mut forced, mut sup_next) = (c.suppress, 0u64, 0u64);
-    let mut bad = common_bad(&x, &c) | dbad | wsbad | c.bad_in;
+    let mut starts = ostart | lstart | dstart | wsstart | c_forced;
+    let (mut suppress, mut forced, mut sup_next) = (c_suppress, 0u64, 0u64);
+    let mut bad = common_bad(&x, flags) | dbad | wsbad | c_bad_in;
     let mut bad_next = 0u64;
     let mut qc = m.q & ostart;
     while qc != 0 {
@@ -1280,50 +1337,22 @@ fn word_slow(b: &[u8], base: usize, indiv: bool, c: Carry, m: Classes) -> Block 
         }
     }
     starts &= !suppress;
-    let top = |v: u64| v >> 63 & 1 == 1;
-    let out = Carry {
-        o: top(x.o),
-        sp: top(m.sp),
-        d: top(m.d),
-        ws: top(m.ws),
-        l: top(m.l),
-        na: top(m.na),
-        na4: (m.na >> 60).reverse_bits() >> 60,
-        bad_in: bad_next,
-        bad3: bad >> 61,
-        forced,
-        suppress: sup_next,
-        ..Carry::default()
-    };
-    (starts & x.valid, bad & x.valid, out)
-}
-
-#[inline(always)]
-fn carry_out(x: &Ctx, ostart: u64, abs_nl: u64, contr: bool, forced: u64, suppress: u64) -> Carry {
-    let m = &x.m;
-    let top = |v: u64| v >> 63 & 1 == 1;
-    Carry {
-        o: top(x.o),
-        sp: top(m.sp),
-        d: top(m.d),
-        nl: top(m.nl),
-        ws: top(m.ws),
-        l: top(m.l),
-        lw: top(m.l & !m.up),
-        na: top(m.na),
-        na4: (m.na >> 60).reverse_bits() >> 60,
-        ostart: top(ostart),
-        abs_nl: top(abs_nl),
-        abs_sl: false,
-        bad_in: 0,
-        bad3: 0,
-        ws_unk: false,
-        sl_unk: false,
-        contr,
-        contr_mask: 0,
-        forced,
-        suppress,
+    let na4 = ((m.na >> 60).reverse_bits() >> 60) as u32;
+    let has_slow = (m.na >> 63 != 0) || na4 != 0 || (bad_next | (forced & !1) | sup_next) != 0;
+    if has_slow {
+        *slow = SlowCarry { bad_in: bad_next, contr_mask: 0, forced, suppress: sup_next };
     }
+    let out_flags = top_bit(x.o, 0)
+        | top_bit(m.sp, 1)
+        | top_bit(m.d, 2)
+        | top_bit(m.ws, 4)
+        | top_bit(m.l, 5)
+        | top_bit(m.na, 7)
+        | (((forced & 1) as u32) << 14)
+        | if has_slow { F_SLOW } else { 0 }
+        | (((bad >> 61) as u32) << BAD3_SHIFT)
+        | (na4 << NA4_SHIFT);
+    (starts & x.valid, bad & x.valid, out_flags)
 }
 
 #[inline(always)]
@@ -1335,13 +1364,13 @@ pub fn block(kind: Pretok, b: &[u8], base: usize, c: Carry) -> Block {
 }
 
 #[inline(always)]
-unsafe fn block_with<S: Simd>(kind: Pretok, b: &[u8], base: usize, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = match kind {
-        Pretok::Generic { max_digits, .. } => generic_block::<S>(b, base, max_digits, *c),
-        Pretok::CamelCase { contractions, max_digits } => camel_block::<S>(b, base, contractions, max_digits, *c),
-        Pretok::Word(indiv) => word_block::<S>(b, base, indiv, *c),
+unsafe fn block_with<S: Simd>(kind: Pretok, b: &[u8], base: usize, flags: &mut u32, slow: &mut SlowCarry) -> (u64, u64) {
+    let (s, bad, out_flags) = match kind {
+        Pretok::Generic { max_digits, .. } => generic_block::<S>(b, base, max_digits, *flags, slow),
+        Pretok::CamelCase { contractions, max_digits } => camel_block::<S>(b, base, contractions, max_digits, *flags, slow),
+        Pretok::Word(indiv) => word_block::<S>(b, base, indiv, *flags, slow),
     };
-    *c = out;
+    *flags = out_flags;
     (s, bad)
 }
 
@@ -1378,94 +1407,94 @@ pub fn block_m(kind: Pretok, b: &[u8], base: usize, c: &mut Carry) -> (u64, u64)
         }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    unsafe { block_with::<Scalar>(kind, b, base, c) }
+    unsafe { block_with::<Scalar>(kind, b, base, &mut c.flags, &mut c.slow) }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn word_m_neon(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = unsafe { word_block::<Neon>(b, base, indiv, *c) };
-    *c = out;
+    let (s, bad, nf) = unsafe { word_block::<Neon>(b, base, indiv, c.flags, &mut c.slow) };
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn generic_m_neon(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = unsafe { generic_block::<Neon>(b, base, max_digits, *c) };
-    *c = out;
+    let (s, bad, nf) = unsafe { generic_block::<Neon>(b, base, max_digits, c.flags, &mut c.slow) };
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn camel_m_neon(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = unsafe { camel_block::<Neon>(b, base, contractions, max_digits, *c) };
-    *c = out;
+    let (s, bad, nf) = unsafe { camel_block::<Neon>(b, base, contractions, max_digits, c.flags, &mut c.slow) };
+    c.flags = nf;
     (s, bad)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn word_m_avx512(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = word_block::<Avx512>(b, base, indiv, *c);
-    *c = out;
+    let (s, bad, nf) = word_block::<Avx512>(b, base, indiv, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn generic_m_avx512(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = generic_block::<Avx512>(b, base, max_digits, *c);
-    *c = out;
+    let (s, bad, nf) = generic_block::<Avx512>(b, base, max_digits, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn camel_m_avx512(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = camel_block::<Avx512>(b, base, contractions, max_digits, *c);
-    *c = out;
+    let (s, bad, nf) = camel_block::<Avx512>(b, base, contractions, max_digits, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn word_m_avx2(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = word_block::<Avx2>(b, base, indiv, *c);
-    *c = out;
+    let (s, bad, nf) = word_block::<Avx2>(b, base, indiv, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn generic_m_avx2(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = generic_block::<Avx2>(b, base, max_digits, *c);
-    *c = out;
+    let (s, bad, nf) = generic_block::<Avx2>(b, base, max_digits, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn camel_m_avx2(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = camel_block::<Avx2>(b, base, contractions, max_digits, *c);
-    *c = out;
+    let (s, bad, nf) = camel_block::<Avx2>(b, base, contractions, max_digits, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn word_m_sse2(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = word_block::<Sse2>(b, base, indiv, *c);
-    *c = out;
+    let (s, bad, nf) = word_block::<Sse2>(b, base, indiv, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn generic_m_sse2(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = generic_block::<Sse2>(b, base, max_digits, *c);
-    *c = out;
+    let (s, bad, nf) = generic_block::<Sse2>(b, base, max_digits, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn camel_m_sse2(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, out) = camel_block::<Sse2>(b, base, contractions, max_digits, *c);
-    *c = out;
+    let (s, bad, nf) = camel_block::<Sse2>(b, base, contractions, max_digits, c.flags, &mut c.slow);
+    c.flags = nf;
     (s, bad)
 }
 
@@ -1484,13 +1513,14 @@ unsafe fn chunks_batched_with<S: Simd>(
     let mut ends = [0usize; 72];
     let mut pos = start;
     let mut base = start;
-    let mut carry = Carry { forced: 1, ..Carry::default() };
+    let mut flags = F_FORCED0;
+    let mut slow = SlowCarry::default();
     while pos < stop {
         if base + 64 <= pos {
             base = pos;
-            carry = Carry { forced: 1, ..Carry::default() };
+            flags = F_FORCED0;
         }
-        let (starts, bad) = block_with::<S>(kind, b, base, &mut carry);
+        let (starts, bad) = block_with::<S>(kind, b, base, &mut flags, &mut slow);
         let lim = (base + 64).min(stop);
         let lim_mask = if lim - base >= 64 { u64::MAX } else { (1u64 << (lim - base)) - 1 };
         let above0 = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
@@ -1629,17 +1659,18 @@ unsafe fn fill_loop<S: Simd>(
     out: &mut [u32],
     mut k: usize,
     limit: usize,
-    mut step: impl FnMut(&[u8], usize, Carry) -> Block,
+    mut step: impl FnMut(&[u8], usize, u32, &mut SlowCarry) -> (u64, u64, u32),
 ) -> usize {
-    let (mut pos, mut base, mut carry) = (scan.pos, scan.base, scan.carry);
+    let (mut pos, mut base, mut flags) = (scan.pos, scan.base, scan.carry.flags);
+    let slow = &mut scan.carry.slow;
     let op = out.as_mut_ptr();
     while pos < stop && k < limit {
         if base + 64 <= pos {
             base = pos;
-            carry = Carry { forced: 1, ..Carry::default() };
+            flags = F_FORCED0;
         }
-        let (starts, bad, next_carry) = step(b, base, carry);
-        carry = next_carry;
+        let (starts, bad, next_flags) = step(b, base, flags, slow);
+        flags = next_flags;
         let lim = (base + 64).min(stop);
         let lim_mask = if lim - base >= 64 { u64::MAX } else { (1u64 << (lim - base)) - 1 };
         let above0 = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
@@ -1660,7 +1691,7 @@ unsafe fn fill_loop<S: Simd>(
             loop {
                 if pos >= lim {
                     base = pos;
-                    carry = Carry { forced: 1, ..Carry::default() };
+                    flags = F_FORCED0;
                     realigned = true;
                     break;
                 }
@@ -1693,7 +1724,7 @@ unsafe fn fill_loop<S: Simd>(
                 if k >= limit + SCAN_SLACK - 1 {
                     scan.pos = pos;
                     scan.base = pos;
-                    scan.carry = Carry { forced: 1, ..Carry::default() };
+                    scan.carry.flags = F_FORCED0;
                     return k;
                 }
             }
@@ -1705,77 +1736,77 @@ unsafe fn fill_loop<S: Simd>(
     }
     scan.pos = pos;
     scan.base = base;
-    scan.carry = carry;
+    scan.carry.flags = flags;
     k
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fill_word_neon(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    unsafe { fill_loop::<Neon>(scan, kind, b, stop, out, k, limit, |b, base, c| word_block::<Neon>(b, base, indiv, c)) }
+    unsafe { fill_loop::<Neon>(scan, kind, b, stop, out, k, limit, |b, base, f, s| word_block::<Neon>(b, base, indiv, f, s)) }
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fill_generic_neon(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    unsafe { fill_loop::<Neon>(scan, kind, b, stop, out, k, limit, |b, base, c| generic_block::<Neon>(b, base, max_digits, c)) }
+    unsafe { fill_loop::<Neon>(scan, kind, b, stop, out, k, limit, |b, base, f, s| generic_block::<Neon>(b, base, max_digits, f, s)) }
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fill_camel_neon(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    unsafe { fill_loop::<Neon>(scan, kind, b, stop, out, k, limit, |b, base, c| camel_block::<Neon>(b, base, contractions, max_digits, c)) }
+    unsafe { fill_loop::<Neon>(scan, kind, b, stop, out, k, limit, |b, base, f, s| camel_block::<Neon>(b, base, contractions, max_digits, f, s)) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn fill_word_avx512(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512>(scan, kind, b, stop, out, k, limit, |b, base, c| word_block::<Avx512>(b, base, indiv, c))
+    fill_loop::<Avx512>(scan, kind, b, stop, out, k, limit, |b, base, f, s| word_block::<Avx512>(b, base, indiv, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn fill_generic_avx512(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512>(scan, kind, b, stop, out, k, limit, |b, base, c| generic_block::<Avx512>(b, base, max_digits, c))
+    fill_loop::<Avx512>(scan, kind, b, stop, out, k, limit, |b, base, f, s| generic_block::<Avx512>(b, base, max_digits, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn fill_camel_avx512(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512>(scan, kind, b, stop, out, k, limit, |b, base, c| camel_block::<Avx512>(b, base, contractions, max_digits, c))
+    fill_loop::<Avx512>(scan, kind, b, stop, out, k, limit, |b, base, f, s| camel_block::<Avx512>(b, base, contractions, max_digits, f, s))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn fill_word_avx2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx2>(scan, kind, b, stop, out, k, limit, |b, base, c| word_block::<Avx2>(b, base, indiv, c))
+    fill_loop::<Avx2>(scan, kind, b, stop, out, k, limit, |b, base, f, s| word_block::<Avx2>(b, base, indiv, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn fill_generic_avx2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx2>(scan, kind, b, stop, out, k, limit, |b, base, c| generic_block::<Avx2>(b, base, max_digits, c))
+    fill_loop::<Avx2>(scan, kind, b, stop, out, k, limit, |b, base, f, s| generic_block::<Avx2>(b, base, max_digits, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn fill_camel_avx2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx2>(scan, kind, b, stop, out, k, limit, |b, base, c| camel_block::<Avx2>(b, base, contractions, max_digits, c))
+    fill_loop::<Avx2>(scan, kind, b, stop, out, k, limit, |b, base, f, s| camel_block::<Avx2>(b, base, contractions, max_digits, f, s))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn fill_word_sse2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Sse2>(scan, kind, b, stop, out, k, limit, |b, base, c| word_block::<Sse2>(b, base, indiv, c))
+    fill_loop::<Sse2>(scan, kind, b, stop, out, k, limit, |b, base, f, s| word_block::<Sse2>(b, base, indiv, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn fill_generic_sse2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Sse2>(scan, kind, b, stop, out, k, limit, |b, base, c| generic_block::<Sse2>(b, base, max_digits, c))
+    fill_loop::<Sse2>(scan, kind, b, stop, out, k, limit, |b, base, f, s| generic_block::<Sse2>(b, base, max_digits, f, s))
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn fill_camel_sse2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Sse2>(scan, kind, b, stop, out, k, limit, |b, base, c| camel_block::<Sse2>(b, base, contractions, max_digits, c))
+    fill_loop::<Sse2>(scan, kind, b, stop, out, k, limit, |b, base, f, s| camel_block::<Sse2>(b, base, contractions, max_digits, f, s))
 }
 
 impl Scan {
     pub fn new(start: usize) -> Self {
-        Scan { pos: start, base: start, carry: Carry { forced: 1, ..Carry::default() } }
+        Scan { pos: start, base: start, carry: Carry::forced_start() }
     }
 
     /// Append ends to `out[k..]` until `k >= limit` (checked per block) or
@@ -1810,9 +1841,9 @@ impl Scan {
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         match kind {
-            Pretok::Word(indiv) => unsafe { fill_loop::<Scalar>(self, kind, b, stop, out, k, limit, |b, base, c| word_block::<Scalar>(b, base, indiv, c)) },
-            Pretok::Generic { max_digits, .. } => unsafe { fill_loop::<Scalar>(self, kind, b, stop, out, k, limit, |b, base, c| generic_block::<Scalar>(b, base, max_digits, c)) },
-            Pretok::CamelCase { contractions, max_digits } => unsafe { fill_loop::<Scalar>(self, kind, b, stop, out, k, limit, |b, base, c| camel_block::<Scalar>(b, base, contractions, max_digits, c)) },
+            Pretok::Word(indiv) => unsafe { fill_loop::<Scalar>(self, kind, b, stop, out, k, limit, |b, base, f, s| word_block::<Scalar>(b, base, indiv, f, s)) },
+            Pretok::Generic { max_digits, .. } => unsafe { fill_loop::<Scalar>(self, kind, b, stop, out, k, limit, |b, base, f, s| generic_block::<Scalar>(b, base, max_digits, f, s)) },
+            Pretok::CamelCase { contractions, max_digits } => unsafe { fill_loop::<Scalar>(self, kind, b, stop, out, k, limit, |b, base, f, s| camel_block::<Scalar>(b, base, contractions, max_digits, f, s)) },
         }
     }
 }
