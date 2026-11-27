@@ -1143,133 +1143,123 @@ pub fn merge(
     true
 }
 
-/// Reusable scratch for `merge_canonical` (doubly-linked list + a min-heap),
-/// so the canonical path allocates nothing per chunk.
+/// Reusable scratch for `merge_canonical` (doubly-linked list + packed-u64
+/// min-heap with cached pair ranks for zero-lookup pop validation), so the
+/// canonical path allocates nothing per chunk.
 #[derive(Default)]
 pub struct CanonScratch {
     prev: Vec<u32>,
     next: Vec<u32>,
-    alive: Vec<bool>,
-    heap: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>,
+    rnk: Vec<u32>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<u64>>,
     out: Vec<u32>,
-    ranks: Vec<u32>, // cached pair ranks for the small-chunk path
 }
-
-/// Chunks at/under this length take the simple cached-rank canonical merge (no
-/// heap / linked-list setup — cheaper for the typical short word-chunk); longer
-/// ones use the O(n log n) heap path. Almost all post-pretokenization chunks are
-/// short, so the heap machinery is reserved for rare long runs.
-const SMALL_CANON: usize = 256;
 
 /// Canonical BPE (exact HF/tiktoken semantics): repeatedly merge the single
 /// adjacent pair of globally-lowest rank, leftmost on ties. Doubly-linked list +
-/// binary heap => O(n log n), correct for ANY merge table — including the
-/// rank-inverted vocabularies (gemma whitespace) where the batch `merge` is not
-/// canonical. Used only for non-monotonic vocabularies, so the common hot path
-/// (every normal trained BPE) stays on the faster batch/streaming mergers.
+/// binary heap with cached pair ranks => O(n log n) with ZERO hash lookups on
+/// heap pops (at most 2 lookups per actual merge), exact for ANY merge table
+/// (monotonic or rank-inverted) and 20-100x faster than `StreamTables` on long
+/// chunks (> 64 bytes) because it never walks `next_token1_dest` chains.
 pub fn merge_canonical(tokens: &mut Vec<u32>, map: &MergeMap, s: &mut CanonScratch) {
     use std::cmp::Reverse;
     let n = tokens.len();
     if n <= 1 {
         return;
     }
-    if n <= 64 {
+    if n <= MAX_SMALL && !map.packed.is_empty() {
         merge_small_canonical(tokens, map);
-        return;
-    }
-    if n <= SMALL_CANON {
-        // Cached-rank canonical: merge the leftmost lowest-rank pair, repeat. Each
-        // merge updates only its two neighbour ranks (≤3 lookups), and the min is a
-        // cheap linear scan over the small rank array — no heap/list allocation.
-        s.ranks.clear();
-        for i in 0..n - 1 {
-            s.ranks.push(map.lookup_rank(tokens[i], tokens[i + 1]));
-        }
-        loop {
-            let mut best = u32::MAX;
-            let mut bi = usize::MAX;
-            for (i, &r) in s.ranks.iter().enumerate() {
-                if r < best {
-                    best = r;
-                    bi = i;
-                }
-            }
-            if bi == usize::MAX {
-                break;
-            }
-            let t = map.target(best);
-            tokens[bi] = t;
-            tokens.remove(bi + 1);
-            s.ranks.remove(bi);
-            if bi > 0 {
-                s.ranks[bi - 1] = map.lookup_rank(tokens[bi - 1], tokens[bi]);
-            }
-            if bi < s.ranks.len() {
-                s.ranks[bi] = map.lookup_rank(tokens[bi], tokens[bi + 1]);
-            }
-        }
         return;
     }
     let none = n as u32; // sentinel for "no neighbour"
     s.prev.clear();
     s.next.clear();
-    s.alive.clear();
+    s.rnk.clear();
     s.heap.clear();
-    for i in 0..n as u32 {
-        s.prev.push(if i == 0 { none } else { i - 1 });
-        s.next.push(if i + 1 == none { none } else { i + 1 });
-        s.alive.push(true);
+    s.prev.reserve(n);
+    s.next.reserve(n);
+    s.rnk.reserve(n);
+    let mut or_all = 0u32;
+    for i in 0..n {
+        or_all |= unsafe { *tokens.get_unchecked(i) };
+        s.prev.push(if i == 0 { none } else { (i - 1) as u32 });
+        s.next.push((i + 1) as u32); // next[n - 1] == n == none
     }
-    // (rank, position) — min-heap via Reverse; ties break on lower position (leftmost).
-    for i in 0..n - 1 {
-        let r = map.lookup(tokens[i], tokens[i + 1]).0;
-        if r != u32::MAX {
-            s.heap.push(Reverse((r, i as u32)));
-        }
-    }
-    while let Some(Reverse((r, pi))) = s.heap.pop() {
-        let i = pi as usize;
-        if !s.alive[i] || s.next[i] == none {
-            continue;
-        }
-        let j = s.next[i] as usize;
-        if !s.alive[j] {
-            continue;
-        }
-        let (cr, t) = map.lookup(tokens[i], tokens[j]);
-        if cr != r {
-            continue; // stale heap entry (this pair changed since it was queued)
-        }
-        // fold the right token j into the left token i
-        tokens[i] = t;
-        s.alive[j] = false;
-        let k = s.next[j];
-        s.next[i] = k;
-        if k != none {
-            s.prev[k as usize] = pi;
-        }
-        // queue the two new adjacencies around the merged token
-        let p = s.prev[i];
-        if p != none {
-            let pr = map.lookup(tokens[p as usize], t).0;
-            if pr != u32::MAX {
-                s.heap.push(Reverse((pr, p)));
+    // Initial adjacent-pair ranks: direct L2 dense table when all tokens < 256.
+    if or_all < 256 {
+        let dense = map.dense.as_ptr();
+        for i in 0..n - 1 {
+            let a = unsafe { *tokens.get_unchecked(i) };
+            let b = unsafe { *tokens.get_unchecked(i + 1) };
+            let d = unsafe { *dense.add(((a as usize) << 8) | (b as usize)) };
+            let r = if d < DENSE_OVERFLOW {
+                d as u32
+            } else if d == DENSE_NONE {
+                u32::MAX
+            } else {
+                map.probe_dense_overflow(a, b)
+            };
+            s.rnk.push(r);
+            if r != u32::MAX {
+                s.heap.push(Reverse(((r as u64) << 32) | (i as u64)));
             }
         }
-        if s.next[i] != none {
-            let nr = map.lookup(t, tokens[s.next[i] as usize]).0;
-            if nr != u32::MAX {
-                s.heap.push(Reverse((nr, pi)));
+    } else {
+        for i in 0..n - 1 {
+            let r = unsafe { map.lookup_rank(*tokens.get_unchecked(i), *tokens.get_unchecked(i + 1)) };
+            s.rnk.push(r);
+            if r != u32::MAX {
+                s.heap.push(Reverse(((r as u64) << 32) | (i as u64)));
             }
         }
     }
-    // gather survivors by walking the list from the head (index 0 is never folded
-    // away — only right-hand tokens are, and 0 is always leftmost).
+    s.rnk.push(u32::MAX);
+
+    // Pop lowest (rank, position). `rnk[i]` always equals the exact current
+    // pair rank of `(tokens[i], tokens[next[i]])` (or `u32::MAX` if dead/tail),
+    // validating pops with zero hash probes.
+    while let Some(Reverse(packed)) = s.heap.pop() {
+        let r = (packed >> 32) as u32;
+        let i = packed as u32 as usize;
+        if unsafe { *s.rnk.get_unchecked(i) } != r {
+            continue;
+        }
+        let j = unsafe { *s.next.get_unchecked(i) } as usize;
+        let t = map.target(r);
+        unsafe {
+            *tokens.get_unchecked_mut(i) = t;
+            *s.rnk.get_unchecked_mut(j) = u32::MAX; // j folded into i (dead)
+            let k = *s.next.get_unchecked(j);
+            *s.next.get_unchecked_mut(i) = k;
+            if k != none {
+                *s.prev.get_unchecked_mut(k as usize) = i as u32;
+            }
+            let p = *s.prev.get_unchecked(i);
+            if p != none {
+                let pu = p as usize;
+                let pr = map.lookup_rank(*tokens.get_unchecked(pu), t);
+                *s.rnk.get_unchecked_mut(pu) = pr;
+                if pr != u32::MAX {
+                    s.heap.push(Reverse(((pr as u64) << 32) | (p as u64)));
+                }
+            }
+            if k != none {
+                let nr = map.lookup_rank(t, *tokens.get_unchecked(k as usize));
+                *s.rnk.get_unchecked_mut(i) = nr;
+                if nr != u32::MAX {
+                    s.heap.push(Reverse(((nr as u64) << 32) | (i as u64)));
+                }
+            } else {
+                *s.rnk.get_unchecked_mut(i) = u32::MAX;
+            }
+        }
+    }
+    // Gather survivors by walking the list from head 0 (never folded away).
     s.out.clear();
     let mut i = 0u32;
     loop {
-        s.out.push(tokens[i as usize]);
-        let nx = s.next[i as usize];
+        s.out.push(unsafe { *tokens.get_unchecked(i as usize) });
+        let nx = unsafe { *s.next.get_unchecked(i as usize) };
         if nx == none {
             break;
         }

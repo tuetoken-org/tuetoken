@@ -459,10 +459,6 @@ fn extract_split_fallback(pre: &Value) -> Option<Vec<String>> {
     }
 }
 
-/// Chunks longer than this use the O(n) streaming merger; shorter ones use the
-/// cache-hot scan-and-merge (faster for typical short post-pretok chunks).
-const STREAM_THRESHOLD: usize = 256;
-
 /// Default memory cap (MiB) of each tokenizer's shared learned-chunk table.
 /// It starts at 512 KiB and grows only as new distinct chunks are seen.
 const DEFAULT_CACHE_MIB: usize = 128;
@@ -470,10 +466,10 @@ const DEFAULT_CACHE_MIB: usize = 128;
 /// Documents at least this long are encoded as parallel segments.
 const SPLIT_MIN: usize = 1 << 18;
 
-/// Which BPE merge implementation to run. `Auto` picks per chunk (streaming for
-/// long byte-level chunks, scan otherwise); `Stream`/`Scan` force one — used by
-/// the `_encode_ordinary_stream`/`_encode_ordinary_scan` parity-test entry points
-/// so both implementations can be checked head-to-head on identical input.
+/// Which BPE merge implementation to run. `Auto` picks the fastest exact merger
+/// per chunk (`merge_bytes_into` for <=64B, O(n log n) `merge_canonical` for
+/// longer chunks); `Stream`/`Scan` force one — used by the
+/// `_encode_ordinary_stream`/`_encode_ordinary_scan` parity-test entry points.
 #[derive(Clone, Copy, PartialEq)]
 enum Merge {
     Auto,
@@ -488,7 +484,8 @@ struct Tokenizer {
     singleton_u32: [u32; 256],
     byte_fast: bool,
     map: bpe::MergeMap,
-    stream: bpe::StreamTables,
+    raw_merges: Vec<(u32, u32, u32)>,
+    stream: OnceLock<bpe::StreamTables>,
     // Decode: all token bytes in ONE contiguous arena (cache-friendly), indexed
     // by (offset, len) per token id — instead of a Vec<Vec<u8>> of scattered
     // heap allocations. Matches the C engine's vocab arena.
@@ -1771,40 +1768,27 @@ impl Tokenizer {
         if s.chunk.is_empty() {
             return;
         }
-        let long = s.chunk.len() > STREAM_THRESHOLD;
-        // The streaming merger reproduces scan-and-merge exactly for byte-level
-        // merge tables, but NOT for the char-based byte_fallback/metaspace tables
-        // (on a long ▁-run it under-merges), and NOT for non-monotonic vocabularies
-        // (it isn't canonical there). So it's byte-level + monotonic only; everything
-        // else scans, exactly like the C engine.
-        let stream = !self.byte_fallback
-            && self.monotonic
-            && match mode {
-                Merge::Stream => true,
-                Merge::Scan => false,
-                Merge::Auto => long,
-            };
-        if stream {
-            // O(n) streaming — avoids the scan-and-merge O(n^2) on long chunks
-            self.stream
-                .merge_into(&s.chunk, &mut s.out, &mut s.state, &mut s.todo);
+        // Explicit streaming parity-test path (built lazily on demand).
+        if mode == Merge::Stream && !self.byte_fallback && self.monotonic {
+            let st = self
+                .stream
+                .get_or_init(|| bpe::StreamTables::new(&self.raw_merges, self.vocab_size));
+            st.merge_into(&s.chunk, &mut s.out, &mut s.state, &mut s.todo);
             return;
         }
-        if self.monotonic {
-            // Monotonic vocab (every normal trained BPE): the batch merge equals
-            // canonical. debug-only: it must never report a rank inversion here.
-            let ok = bpe::merge(&mut s.chunk, &self.map, &mut s.ranks, &mut s.ntok,
-                                &mut s.src, &mut s.nrank);
-            debug_assert!(ok, "monotonic vocab hit a rank inversion");
-            let _ = ok;
-            s.out.extend_from_slice(&s.chunk);
-        } else {
-            // Non-monotonic vocab (rank-inverted, e.g. gemma whitespace): the batch
-            // and streaming mergers aren't canonical, so use the O(n log n) canonical
-            // merger. Only these rare vocabularies pay for it.
+        // For chunks > 64 tokens (or non-monotonic vocabs), use our O(n log n)
+        // zero-lookup-pop canonical heap merger (20-100x faster than StreamTables'
+        // `next_token1_dest` chain walk on long runs and exact for all vocabs).
+        if !self.monotonic || s.chunk.len() > 64 {
             bpe::merge_canonical(&mut s.chunk, &self.map, &mut s.canon);
             s.out.extend_from_slice(&s.chunk);
+            return;
         }
+        let ok = bpe::merge(&mut s.chunk, &self.map, &mut s.ranks, &mut s.ntok,
+                            &mut s.src, &mut s.nrank);
+        debug_assert!(ok, "monotonic vocab hit a rank inversion");
+        let _ = ok;
+        s.out.extend_from_slice(&s.chunk);
     }
 
     /// Emit one pre-token chunk: byte_fallback (char lookup) or byte-level.
@@ -3944,7 +3928,6 @@ impl Tokenizer {
             }
         }
         let mut map = bpe::MergeMap::new(&merges);
-        let stream = bpe::StreamTables::new(&merges, vocab_size);
 
         // Monotonicity: a vocab is "monotonic" when every token is fully produced
         // (its highest-rank producing merge) before it is first consumed (its
@@ -4007,7 +3990,8 @@ impl Tokenizer {
             singleton_u32,
             byte_fast,
             map,
-            stream,
+            raw_merges: merges,
+            stream: OnceLock::new(),
             byte_arena,
             byte_span,
             ignore_lookup,
