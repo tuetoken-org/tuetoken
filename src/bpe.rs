@@ -16,10 +16,11 @@ const PACK_MAX_RANK: usize = (1 << PACK_RANK_BITS) - 2; // +1 stored in 1..=PACK
 const DENSE_NONE: u16 = u16::MAX;
 const DENSE_OVERFLOW: u16 = u16::MAX - 1;
 /// Direct-indexed 2D merge-rank matrix for `(t1 | t2) < DENSE_N`:
-/// `512 × 512 × u16 = 512 KiB` (fits in L2 on Zen 4 & Apple M4) resolves
-/// 54-66% of all post-`can_lr` BPE probes and 69-88% of all merge hits in a
-/// single `movzwl` load with zero hashing, zero Bloom, and zero SIMD probing!
-const DENSE_BITS: u32 = 9;
+/// `1024 × 1024 × u16 = 2 MiB` (backed by a single 2 MiB Huge Page on Linux
+/// for zero dTLB misses; fits cleanly inside Apple M4's 16 MiB L2) resolves
+/// ~70-80% of all post-`can_lr` BPE probes and ~85%+ of merge hits in a single
+/// `movzwl` load with zero hashing, zero Bloom, and zero SIMD probing!
+const DENSE_BITS: u32 = 10;
 const DENSE_N: u32 = 1 << DENSE_BITS;
 
 /// One 64-byte cache-line bucket holding 8 packed `(t1 << 43) | (t2 << 22) | (rank + 1)`
@@ -46,10 +47,9 @@ pub struct MergeMap {
     entries: Vec<Entry>,
     mask: usize,
     shift: u32,
-    /// Dense 16-bit rank table for byte-token pairs (t1 < 256 && t2 < 256):
-    /// 128 KiB (4x smaller than baseline 512 KiB tuple table — fits M4 L1d!).
+    /// Dense 16-bit rank table for `(t1 | t2) < DENSE_N` (2 MiB, THP-backed on Linux).
     /// `DENSE_NONE` = no merge; `DENSE_OVERFLOW` = rare rank >= 65534 (probe table).
-    dense: Vec<u16>,
+    dense: crate::chunk_table::HugeVec<u16>,
     /// True iff any byte-byte merge had rank >= DENSE_OVERFLOW (false for gpt2).
     has_dense_overflow: bool,
     /// Raw-byte indexed pair table `byte_pair[(b0 << 8) | b1]` (populated for
@@ -129,7 +129,7 @@ impl MergeMap {
         };
 
         let mut can_lr = vec![0u8; (vocab_n + 3) >> 2];
-        let mut dense = vec![DENSE_NONE; 1usize << (DENSE_BITS * 2)];
+        let mut dense = crate::chunk_table::HugeVec::<u16>::filled_byte(1usize << (DENSE_BITS * 2), 0xFF);
         let mut has_dense_overflow = false;
         let total_nb = (cap >> 3).max(16);
         let mask = cap - 1;
@@ -428,7 +428,18 @@ impl MergeMap {
         }
         let mut bp = vec![0u64; 1 << 16];
         for i in 0..(1 << 16) {
-            bp[i] = (rank_tbl[i] as u64) | ((sl_tbl[i] as u64) << 16) | ((sr_tbl[i] as u64) << 32);
+            let r = rank_tbl[i];
+            let pair_lr = if r < DENSE_OVERFLOW {
+                self.lr_bits(self.target(r as u32)) as u64
+            } else {
+                0u64
+            };
+            let b0_lr = self.byte_lr[i >> 8] as u64;
+            bp[i] = (r as u64)
+                | ((sl_tbl[i] as u64) << 16)
+                | ((sr_tbl[i] as u64) << 32)
+                | (pair_lr << 48)
+                | (b0_lr << 50);
         }
         self.byte_pair = bp;
         true
@@ -1500,22 +1511,22 @@ macro_rules! merge_bytes_ll_body {
             // disjoint rank-dominated byte pair in one branch-free pass (~48-58%
             // of all merge steps and ~12% of all hash probes eliminated before
             // entering the merge loop!).
-            let mut br_buf = std::mem::MaybeUninit::<[u16; MAX_SMALL]>::uninit();
-            let br = br_buf.as_mut_ptr() as *mut u16;
+            let mut br_buf = std::mem::MaybeUninit::<[u32; MAX_SMALL]>::uninit();
+            let br = br_buf.as_mut_ptr() as *mut u32;
             let b0 = *cp as usize;
             let b1 = *cp.add(1) as usize;
             let b2 = *cp.add(2) as usize;
             let p0 = *bp.add((b0 << 8) | b1);
             let mut p_cur = *bp.add((b1 << 8) | b2);
             let r0 = p0 as u16;
-            *br = r0;
+            *br = (r0 as u32) | (((p0 >> 48) as u32) << 16);
             let sr1 = (p_cur >> 32) as u16;
             let mut cmask = ((r0 < DENSE_OVERFLOW) & (r0 <= sr1)) as u64;
             let mut sl_prev = (p0 >> 16) as u16;
             let mut b_next = b2;
             for i in 1..(nr - 1) {
                 let r_cur = p_cur as u16;
-                *br.add(i) = r_cur;
+                *br.add(i) = (r_cur as u32) | (((p_cur >> 48) as u32) << 16);
                 let b_nn = *cp.add(i + 2) as usize;
                 let p_next = *bp.add((b_next << 8) | b_nn);
                 let sr_next = (p_next >> 32) as u16;
@@ -1525,41 +1536,40 @@ macro_rules! merge_bytes_ll_body {
                 b_next = b_nn;
             }
             let r_last = p_cur as u16;
-            *br.add(nr - 1) = r_last;
-            *br.add(nr) = DENSE_NONE;
+            *br.add(nr - 1) = (r_last as u32) | (((p_cur >> 48) as u32) << 16);
+            *br.add(nr) = (DENSE_NONE as u32) | ((*blr.add(*cp.add(nr) as usize) as u32) << 18);
             cmask |= ((r_last < sl_prev) as u64) << (nr - 1);
             debug_assert_eq!(cmask & (cmask << 1), 0);
 
             if cmask != 0 {
                 let mut m = 0usize;
                 let mut i = 0usize;
-                let can_lr = $map.can_lr.as_ptr();
                 if fast_target {
                     while i < n {
                         let is_c = ((cmask >> i) & 1) != 0;
-                        let tg = (*br.add(i) as u32).wrapping_add(lin_off);
+                        let entry = *br.add(i);
+                        let tg = (entry & 0xFFFF).wrapping_add(lin_off);
                         let sb = *$singleton.get_unchecked(*cp.add(i) as usize);
                         // Force branch-free selection (avoids LLVM turning dual
                         // L1d loads into a 50/50 mispredicted branch).
                         let mask = (is_c as u32).wrapping_neg();
-                        let t = (tg & mask) | (sb & !mask);
-                        *tok.add(m) = t;
-                        let b = (t as usize) >> 2;
-                        *lr.add(m) = (*can_lr.add(b) >> (((t as usize) & 3) * 2)) & 3;
+                        *tok.add(m) = (tg & mask) | (sb & !mask);
+                        // Zero `can_lr` loads: bits 16..18 = pair_lr, bits 18..20 = b0_lr.
+                        *lr.add(m) = ((entry >> (18 - ((is_c as u32) << 1))) & 3) as u8;
                         m += 1;
                         i += 1 + (is_c as usize);
                     }
                 } else {
                     while i < n {
                         let is_c = ((cmask >> i) & 1) != 0;
+                        let entry = *br.add(i);
                         let t = if is_c {
-                            $map.target(*br.add(i) as u32)
+                            $map.target(entry & 0xFFFF)
                         } else {
                             *$singleton.get_unchecked(*cp.add(i) as usize)
                         };
                         *tok.add(m) = t;
-                        let b = (t as usize) >> 2;
-                        *lr.add(m) = (*can_lr.add(b) >> (((t as usize) & 3) * 2)) & 3;
+                        *lr.add(m) = ((entry >> (18 - ((is_c as u32) << 1))) & 3) as u8;
                         m += 1;
                         i += 1 + (is_c as usize);
                     }
@@ -1567,7 +1577,18 @@ macro_rules! merge_bytes_ll_body {
                 if m == 2 {
                     let a = *tok;
                     let b = *tok.add(1);
-                    let r2 = $map.lookup_rank(a, b);
+                    let r2 = if ((*lr & 1) & (*lr.add(1) >> 1)) != 0 {
+                        if (a | b) < DENSE_N {
+                            $map.lookup_dense(a, b)
+                        } else {
+                            let kh = MergeMap::pack_key(a, b);
+                            let h = MergeMap::hash_packed(kh);
+                            let bk = $map.bucket_of(a, b, h);
+                            if $map.bloom_may_contain_b(h, bk) { $map.$probe(kh, bk) } else { u32::MAX }
+                        }
+                    } else {
+                        u32::MAX
+                    };
                     if r2 != u32::MAX {
                         $out.push(if fast_target { r2.wrapping_add(lin_off) } else { $map.target(r2) });
                     } else {
@@ -1584,8 +1605,30 @@ macro_rules! merge_bytes_ll_body {
                     let t0 = *tok;
                     let t1 = *tok.add(1);
                     let t2 = *tok.add(2);
-                    let r0 = $map.lookup_rank(t0, t1);
-                    let r1 = $map.lookup_rank(t1, t2);
+                    let r0 = if ((*lr & 1) & (*lr.add(1) >> 1)) != 0 {
+                        if (t0 | t1) < DENSE_N {
+                            $map.lookup_dense(t0, t1)
+                        } else {
+                            let kh = MergeMap::pack_key(t0, t1);
+                            let h = MergeMap::hash_packed(kh);
+                            let bk = $map.bucket_of(t0, t1, h);
+                            if $map.bloom_may_contain_b(h, bk) { $map.$probe(kh, bk) } else { u32::MAX }
+                        }
+                    } else {
+                        u32::MAX
+                    };
+                    let r1 = if ((*lr.add(1) & 1) & (*lr.add(2) >> 1)) != 0 {
+                        if (t1 | t2) < DENSE_N {
+                            $map.lookup_dense(t1, t2)
+                        } else {
+                            let kh = MergeMap::pack_key(t1, t2);
+                            let h = MergeMap::hash_packed(kh);
+                            let bk = $map.bucket_of(t1, t2, h);
+                            if $map.bloom_may_contain_b(h, bk) { $map.$probe(kh, bk) } else { u32::MAX }
+                        }
+                    } else {
+                        u32::MAX
+                    };
                     if r0 == u32::MAX && r1 == u32::MAX {
                         $out.reserve(3);
                         let base = $out.len();
@@ -1645,7 +1688,7 @@ macro_rules! merge_bytes_ll_body {
                     let b = *cp.add(i) as usize;
                     *tok.add(i) = *$singleton.get_unchecked(b);
                     *lr.add(i) = *blr.add(b);
-                    let d = *br.add(i);
+                    let d = (*br.add(i) & 0xFFFF) as u16;
                     if d != DENSE_NONE {
                         let p = ((d as u32) << 6) | (i as u32);
                         *rnk.add(i) = p;
@@ -1662,7 +1705,7 @@ macro_rules! merge_bytes_ll_body {
                     let t0 = *$singleton.get_unchecked(b);
                     *tok.add(i) = t0;
                     *lr.add(i) = *blr.add(b);
-                    let d = *br.add(i);
+                    let d = (*br.add(i) & 0xFFFF) as u16;
                     let r = if d < DENSE_OVERFLOW {
                         d as u32
                     } else if d == DENSE_NONE {

@@ -366,6 +366,26 @@ impl<T: Copy> HugeVec<T> {
         let ptr = unsafe { alloc_zeroed_huge(layout) } as *mut T;
         HugeVec { ptr, len, cap: len }
     }
+
+    /// Allocate `len` elements filled with repeated `byte` (e.g. `0xFF` for
+    /// `u16::MAX` sentinels), advising Linux 2 MiB THP *before* first touch.
+    #[inline]
+    pub fn filled_byte(len: usize, byte: u8) -> Self {
+        if len == 0 {
+            return Self::empty();
+        }
+        let layout = Self::layout(len);
+        let ptr = unsafe {
+            let p = std::alloc::alloc(layout);
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            advise_hugepage(p, layout.size());
+            std::ptr::write_bytes(p, byte, layout.size());
+            p as *mut T
+        };
+        HugeVec { ptr, len, cap: len }
+    }
 }
 
 impl<T: Copy> std::ops::Deref for HugeVec<T> {
