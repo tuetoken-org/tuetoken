@@ -60,25 +60,31 @@ fn fixed_pool(n: usize) -> Option<Arc<rayon::ThreadPool>> {
         .clone()
 }
 
-fn bytes_to_unicode_c2b() -> HashMap<char, u8> {
-    let mut bs: Vec<u32> = Vec::new();
+/// Flat `[u16; 324]` ByteLevel Unicode-codepoint -> raw byte table (`u16::MAX`
+/// = not in the GPT-2 byte-level alphabet). Replaces `HashMap<char, u8>` SipHash
+/// during load-time vocab decoding (1 array load per char vs SipHash).
+fn bytes_to_unicode_table() -> [u16; 324] {
+    let mut bs = [0u32; 256];
+    let mut len = 0usize;
     for (lo, hi) in [(0x21u32, 0x7e), (0xa1, 0xac), (0xae, 0xff)] {
         for b in lo..=hi {
-            bs.push(b);
+            bs[len] = b;
+            len += 1;
         }
     }
-    let mut cs = bs.clone();
+    let mut cs = bs;
     let mut n = 0u32;
     for b in 0..256u32 {
-        if !bs.contains(&b) {
-            bs.push(b);
-            cs.push(256 + n);
+        if !bs[..len].contains(&b) {
+            bs[len] = b;
+            cs[len] = 256 + n;
+            len += 1;
             n += 1;
         }
     }
-    let mut c2b = HashMap::new();
-    for (b, c) in bs.iter().zip(cs.iter()) {
-        c2b.insert(char::from_u32(*c).unwrap(), *b as u8);
+    let mut c2b = [u16::MAX; 324];
+    for i in 0..256 {
+        c2b[cs[i] as usize] = bs[i] as u16;
     }
     c2b
 }
@@ -94,35 +100,361 @@ fn bytes_to_pystr<'py>(py: Python<'py>, buf: &[u8]) -> Bound<'py, PyString> {
     }
 }
 
-fn decode_bytelevel(s: &str, c2b: &HashMap<char, u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
+#[inline]
+fn decode_bytelevel_into(s: &str, c2b: &[u16; 324], out: &mut Vec<u8>) {
     for ch in s.chars() {
-        if let Some(&b) = c2b.get(&ch) {
-            out.push(b);
-        } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        let cp = ch as usize;
+        if cp < 324 {
+            let v = c2b[cp];
+            if v != u16::MAX {
+                out.push(v as u8);
+                continue;
+            }
         }
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
     }
-    out
 }
 
-/// Decode a byte_fallback (SentencePiece) vocab token to raw bytes:
+/// Decode a byte_fallback (SentencePiece) vocab token directly into `out`:
 /// `<0xXX>` -> that byte, U+2581 -> space, otherwise the token's UTF-8 bytes.
-fn decode_byte_fallback(s: &str) -> Vec<u8> {
+#[inline]
+fn decode_byte_fallback_into(s: &str, out: &mut Vec<u8>) {
     let b = s.as_bytes();
     if b.len() == 6 && &b[..3] == b"<0x" && b[5] == b'>' {
         if let Ok(v) = u8::from_str_radix(&s[3..5], 16) {
-            return vec![v];
+            out.push(v);
+            return;
         }
     }
-    s.replace('\u{2581}', " ").into_bytes()
+    if s.contains('\u{2581}') {
+        for ch in s.chars() {
+            if ch == '\u{2581}' {
+                out.push(b' ');
+            } else {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    } else {
+        out.extend_from_slice(b);
+    }
+}
+
+/// Zero-copy streaming deserialization of HuggingFace `tokenizer.json`:
+/// avoids building a 200K-node `BTreeMap<String, serde_json::Value>` and
+/// eliminates ~600K heap allocations while resolving merges on the fly.
+#[derive(serde::Deserialize)]
+struct RawAddedToken {
+    id: Option<u64>,
+    content: Option<String>,
+    #[serde(default)]
+    special: bool,
+    #[serde(default)]
+    lstrip: bool,
+    #[serde(default)]
+    rstrip: bool,
+}
+
+#[derive(Eq, PartialEq, Hash)]
+struct BorrowedStr<'a>(std::borrow::Cow<'a, str>);
+
+impl BorrowedStr<'_> {
+    #[inline]
+    fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl std::borrow::Borrow<str> for BorrowedStr<'_> {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for BorrowedStr<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Vis<'a> {
+            type Value = BorrowedStr<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(BorrowedStr(std::borrow::Cow::Borrowed(v)))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(BorrowedStr(std::borrow::Cow::Owned(v.to_owned())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(BorrowedStr(std::borrow::Cow::Owned(v)))
+            }
+        }
+        deserializer.deserialize_str(Vis(std::marker::PhantomData))
+    }
+}
+
+struct RawModel<'a> {
+    vocab: Option<FxHashMap<BorrowedStr<'a>, u32>>,
+    max_id: u32,
+    merges: Vec<(u32, u32, u32)>,
+    byte_fallback: bool,
+    ignore_merges: bool,
+}
+
+struct VocabSeed<'m, 'a> {
+    vocab: &'m mut FxHashMap<BorrowedStr<'a>, u32>,
+    max_id: &'m mut u32,
+}
+
+impl<'de: 'a, 'a> serde::de::DeserializeSeed<'de> for VocabSeed<'_, 'a> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        struct Vis<'m, 'a>(&'m mut FxHashMap<BorrowedStr<'a>, u32>, &'m mut u32);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Vis<'_, 'a> {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a vocab object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                if let Some(sz) = map.size_hint() {
+                    self.0.reserve(sz);
+                }
+                while let Some((k, id_u64)) = map.next_entry::<BorrowedStr<'a>, u64>()? {
+                    let id = id_u64 as u32;
+                    if id > *self.1 {
+                        *self.1 = id;
+                    }
+                    self.0.insert(k, id);
+                }
+                Ok(())
+            }
+        }
+        deserializer.deserialize_map(Vis(self.vocab, self.max_id))
+    }
+}
+
+enum MergeItem<'a> {
+    Str(std::borrow::Cow<'a, str>),
+    Pair(BorrowedStr<'a>, BorrowedStr<'a>),
+    Other,
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for MergeItem<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Vis<'a> {
+            type Value = MergeItem<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a merge string or 2-element string array")
+            }
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(MergeItem::Str(std::borrow::Cow::Borrowed(v)))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(MergeItem::Str(std::borrow::Cow::Owned(v.to_owned())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(MergeItem::Str(std::borrow::Cow::Owned(v)))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let a = seq.next_element::<BorrowedStr<'a>>()?;
+                let b = seq.next_element::<BorrowedStr<'a>>()?;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                match (a, b) {
+                    (Some(x), Some(y)) => Ok(MergeItem::Pair(x, y)),
+                    _ => Ok(MergeItem::Other),
+                }
+            }
+        }
+        deserializer.deserialize_any(Vis(std::marker::PhantomData))
+    }
+}
+
+struct MergesSeed<'m, 'a> {
+    vocab: Option<&'m FxHashMap<BorrowedStr<'a>, u32>>,
+    merges: &'m mut Vec<(u32, u32, u32)>,
+    deferred: &'m mut Vec<(String, String)>,
+}
+
+impl<'de: 'a, 'a> serde::de::DeserializeSeed<'de> for MergesSeed<'_, 'a> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        struct Vis<'m, 'a> {
+            vocab: Option<&'m FxHashMap<BorrowedStr<'a>, u32>>,
+            merges: &'m mut Vec<(u32, u32, u32)>,
+            deferred: &'m mut Vec<(String, String)>,
+        }
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Vis<'_, 'a> {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a merges array")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                let mut merged_buf = String::with_capacity(64);
+                while let Some(item) = seq.next_element::<MergeItem<'a>>()? {
+                    let pair: Option<(&str, &str)> = match &item {
+                        MergeItem::Str(s) => s.split_once(' '),
+                        MergeItem::Pair(a, b) => Some((a.as_str(), b.as_str())),
+                        MergeItem::Other => None,
+                    };
+                    if let Some((t1s, t2s)) = pair {
+                        if let Some(vocab) = self.vocab {
+                            if let (Some(&t1), Some(&t2)) = (vocab.get(t1s), vocab.get(t2s)) {
+                                merged_buf.clear();
+                                merged_buf.push_str(t1s);
+                                merged_buf.push_str(t2s);
+                                if let Some(&tg) = vocab.get(merged_buf.as_str()) {
+                                    self.merges.push((t1, t2, tg));
+                                }
+                            }
+                        } else {
+                            self.deferred.push((t1s.to_owned(), t2s.to_owned()));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        deserializer.deserialize_seq(Vis {
+            vocab: self.vocab,
+            merges: self.merges,
+            deferred: self.deferred,
+        })
+    }
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for RawModel<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Vis<'a> {
+            type Value = RawModel<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tokenizer model object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<RawModel<'a>, A::Error> {
+                let mut vocab: Option<FxHashMap<BorrowedStr<'a>, u32>> = None;
+                let mut max_id = 0u32;
+                let mut merges: Vec<(u32, u32, u32)> = Vec::new();
+                let mut deferred_merges: Vec<(String, String)> = Vec::new();
+                let mut byte_fallback = false;
+                let mut ignore_merges = false;
+                while let Some(key) = map.next_key::<BorrowedStr<'a>>()? {
+                    match key.as_str() {
+                        "vocab" => {
+                            let mut v = FxHashMap::with_capacity_and_hasher(65536, Default::default());
+                            map.next_value_seed(VocabSeed { vocab: &mut v, max_id: &mut max_id })?;
+                            vocab = Some(v);
+                        }
+                        "merges" => {
+                            map.next_value_seed(MergesSeed {
+                                vocab: vocab.as_ref(),
+                                merges: &mut merges,
+                                deferred: &mut deferred_merges,
+                            })?;
+                        }
+                        "byte_fallback" => {
+                            byte_fallback = map.next_value::<Option<bool>>()?.unwrap_or(false);
+                        }
+                        "ignore_merges" => {
+                            ignore_merges = map.next_value::<Option<bool>>()?.unwrap_or(false);
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                if !deferred_merges.is_empty() {
+                    if let Some(ref v) = vocab {
+                        let mut buf = String::with_capacity(64);
+                        merges.reserve(deferred_merges.len());
+                        for (t1s, t2s) in &deferred_merges {
+                            if let (Some(&t1), Some(&t2)) = (v.get(t1s.as_str()), v.get(t2s.as_str())) {
+                                buf.clear();
+                                buf.push_str(t1s);
+                                buf.push_str(t2s);
+                                if let Some(&tg) = v.get(buf.as_str()) {
+                                    merges.push((t1, t2, tg));
+                                }
+                            }
+                        }
+                    }
+                    deferred_merges.clear();
+                }
+                Ok(RawModel { vocab, max_id, merges, byte_fallback, ignore_merges })
+            }
+        }
+        deserializer.deserialize_map(Vis(std::marker::PhantomData))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RawTokenizerJson<'a> {
+    #[serde(borrow)]
+    model: Option<RawModel<'a>>,
+    #[serde(default)]
+    normalizer: Option<Value>,
+    #[serde(default)]
+    pre_tokenizer: Option<Value>,
+    #[serde(default)]
+    decoder: Option<Value>,
+    #[serde(default)]
+    post_processor: Option<Value>,
+    #[serde(default)]
+    added_tokens: Option<Vec<RawAddedToken>>,
+}
+
+/// Compact metadata extracted during `Tokenizer::new` so `AutoTokenizer` skips
+/// re-parsing the full 12+ MB `tokenizer.json` in Python.
+struct AutoMeta {
+    added_tokens: Vec<(String, u32, bool, bool, bool)>,
+    post_processor_json: Option<String>,
+    prepend_scheme: String,
+    known_token_ids: Vec<(String, u32)>,
+}
+
+fn detect_prepend_scheme_str(pre: &Value, norm: &Value) -> String {
+    fn find_ms(p: &Value) -> Option<&Value> {
+        match p.get("type").and_then(|v| v.as_str()) {
+            Some("Metaspace") => Some(p),
+            Some("Sequence") => p
+                .get("pretokenizers")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.iter().find(|x| x.get("type").and_then(|v| v.as_str()) == Some("Metaspace"))),
+            _ => None,
+        }
+    }
+    if let Some(ms) = find_ms(pre) {
+        return ms
+            .get("prepend_scheme")
+            .and_then(|v| v.as_str())
+            .unwrap_or("always")
+            .to_string();
+    }
+    let has_prepend = |st: &Value| {
+        st.get("type").and_then(|v| v.as_str()) == Some("Prepend")
+            && st.get("prepend").and_then(|v| v.as_str()) == Some("\u{2581}")
+    };
+    let has_prepend_norm = if norm.get("type").and_then(|v| v.as_str()) == Some("Sequence") {
+        norm.get("normalizers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().any(has_prepend))
+            .unwrap_or(false)
+    } else {
+        has_prepend(norm)
+    };
+    if has_prepend_norm {
+        "always".to_string()
+    } else {
+        "none".to_string()
+    }
 }
 
 /// Metaspace prepend mode (matches the C `_apply_metaspace` variants):
 /// 0 = none, 1 = replace-only, 2 = always-prepend (Replace+Prepend normalizers),
 /// 3 = prepend-first (a Metaspace pre-tokenizer).
-fn detect_meta_mode(cfg: &Value) -> u8 {
+fn detect_meta_mode(pre: &Value, norm: &Value) -> u8 {
     let has_metaspace = |p: &Value| -> bool {
         match p.get("type").and_then(|v| v.as_str()) {
             Some("Metaspace") => true,
@@ -134,10 +466,10 @@ fn detect_meta_mode(cfg: &Value) -> u8 {
             _ => false,
         }
     };
-    if cfg.get("pre_tokenizer").map(has_metaspace).unwrap_or(false) {
+    if has_metaspace(pre) {
         return 3;
     }
-    if let Some(norm) = cfg.get("normalizer") {
+    if !norm.is_null() {
         let list: Vec<&Value> = if norm.get("type").and_then(|v| v.as_str()) == Some("Sequence") {
             norm.get("normalizers").and_then(|v| v.as_array()).map(|a| a.iter().collect()).unwrap_or_default()
         } else {
@@ -167,11 +499,10 @@ fn detect_meta_mode(cfg: &Value) -> u8 {
 
 /// SentencePiece decoders end with `Strip{content:" ", start:1}` — strip the one
 /// leading space the metaspace prepend added back (matches C/HF decode).
-fn detect_decode_strip(cfg: &Value) -> bool {
-    let dec = match cfg.get("decoder") {
-        Some(d) => d,
-        None => return false,
-    };
+fn detect_decode_strip(dec: &Value) -> bool {
+    if dec.is_null() {
+        return false;
+    }
     let is_strip = |p: &Value| {
         p.get("type").and_then(|v| v.as_str()) == Some("Strip")
             && p.get("content").and_then(|v| v.as_str()) == Some(" ")
@@ -188,7 +519,7 @@ fn detect_decode_strip(cfg: &Value) -> bool {
 }
 
 /// 0 = none, 1 = NFC, 2 = NFD, 3 = NFKC, 4 = NFKD.
-fn detect_norm_form(cfg: &Value) -> u8 {
+fn detect_norm_form(norm: &Value) -> u8 {
     let code = |s: &str| match s {
         "NFC" => 1,
         "NFD" => 2,
@@ -196,10 +527,9 @@ fn detect_norm_form(cfg: &Value) -> u8 {
         "NFKD" => 4,
         _ => 0,
     };
-    let norm = match cfg.get("normalizer") {
-        Some(n) => n,
-        None => return 0,
-    };
+    if norm.is_null() {
+        return 0;
+    }
     if let Some(s) = norm.get("type").and_then(|v| v.as_str()) {
         let c = code(s);
         if c != 0 {
@@ -229,8 +559,7 @@ fn detect_norm_form(cfg: &Value) -> u8 {
 /// StripAccents, Strip, a non-metaspace Replace, Precompiled, BertNormalizer, …)
 /// rewrites the text in a way we'd silently ignore, mistokenizing every input it
 /// touches — so we reject the model at load instead of lying about its output.
-fn unsupported_normalizer_stage(cfg: &Value) -> Option<String> {
-    let norm = cfg.get("normalizer")?;
+fn unsupported_normalizer_stage(norm: &Value) -> Option<String> {
     if norm.is_null() {
         return None;
     }
@@ -541,6 +870,8 @@ struct Tokenizer {
     // result list is filled with INCREF'd pointers instead of allocating a fresh
     // PyLong per token — the dominant cost of returning list[int].
     int_table: OnceLock<Vec<Py<PyAny>>>,
+    // Compact metadata for AutoTokenizer so Python skips re-parsing tokenizer.json.
+    auto_meta: AutoMeta,
 }
 
 /// Compact 24-byte pipeline record (down from 40B; chunk byte spans are
@@ -1687,19 +2018,22 @@ impl Tokenizer {
 
 
     /// Build the whole-chunk table: for every vocab token whose bytes are a
-    /// plausible pre-token (1..=15 bytes), run this tokenizer's own per-chunk
-    /// encoder on those bytes and keep the ones that come out as ONE token. The
-    /// table therefore only ever records `f(bytes)` for the runtime's `f` — it
-    /// cannot disagree with the merge path. Parallel; a few ms for 200k vocab.
+    /// plausible pre-token (1..=15 bytes), verify whether those bytes encode to
+    /// ONE token under this tokenizer's exact BPE rules.
+    ///
+    /// For monotonic ByteLevel BPE (`byte_fast && monotonic && ignore_lookup.is_none()`),
+    /// we prove self-encoding directly on the merge DAG in parallel (~3.7 boundary-spine
+    /// probes per token instead of full BPE merges): token `tg = (t1, t2)` at rank `r`
+    /// self-encodes iff `t1` and `t2` self-encode, `bytes(t1) ++ bytes(t2) == bytes(tg)`,
+    /// `map.lookup_rank(t1, t2) == r`, and walking the right spine of `t1` & left spine
+    /// of `t2` bottom-up in exact canonical rank order finds no preempting cross-boundary
+    /// merge (`< lu` against left-spine merges, `<= rv` against right-spine merges).
+    /// Any token not proven by the fast DAG check falls back to exact `self.emit`,
+    /// guaranteeing 100% identical output for every possible vocabulary.
     fn build_chunk_table(&mut self) {
-        let ids: Vec<u32> = (0..self.byte_span.len() as u32)
-            .filter(|&id| {
-                let l = self.byte_span[id as usize].1 as usize;
-                l >= 1 && l <= chunk_table::MAX_KEY
-            })
-            .collect();
         let this = &*self;
-        let one = |s: &mut Scratch, id: u32| -> Option<(&[u8], u32)> {
+        let n_vocab = this.byte_span.len();
+        let emit_one = |s: &mut Scratch, id: u32| -> Option<(&[u8], u32)> {
             let (off, len) = this.byte_span[id as usize];
             let b = &this.byte_arena[off as usize..(off + len) as usize];
             s.out.clear();
@@ -1709,21 +2043,193 @@ impl Tokenizer {
             }
             Some((b, s.out[0]))
         };
-        let pairs: Vec<(&[u8], u32)> = if parallel_ok() {
-            ids.par_iter()
-                .with_min_len(512)
-                .map_init(Scratch::default, |s, &id| one(s, id))
-                .flatten()
-                .collect()
+
+        let pairs: Vec<(&[u8], u32)> = if this.byte_fast && this.monotonic && this.ignore_lookup.is_none() {
+            const LEAF: u32 = u32::MAX;
+            const AMBIG: u32 = u32::MAX - 1;
+            let mut prod: Vec<(u32, u32, u32)> = vec![(0, 0, LEAF); n_vocab];
+            for (r, &(t1, t2, tg)) in this.raw_merges.iter().enumerate() {
+                if (t1 as usize) < n_vocab && (t2 as usize) < n_vocab && (tg as usize) < n_vocab {
+                    let slot = &mut prod[tg as usize];
+                    if slot.2 == LEAF {
+                        *slot = (t1, t2, r as u32);
+                    } else {
+                        slot.2 = AMBIG;
+                    }
+                }
+            }
+            let prod_ref = &prod;
+            let verify_merge = |tg: u32| -> bool {
+                let (t1, t2, r) = prod_ref[tg as usize];
+                if r >= AMBIG {
+                    return false;
+                }
+                let (o1, l1) = this.byte_span[t1 as usize];
+                let (o2, l2) = this.byte_span[t2 as usize];
+                let (og, lg) = this.byte_span[tg as usize];
+                if l1 == 0 || l2 == 0 || l1 + l2 != lg || (lg as usize) > chunk_table::MAX_KEY {
+                    return false;
+                }
+                let a = &this.byte_arena;
+                if a[o1 as usize..(o1 + l1) as usize] != a[og as usize..(og + l1) as usize]
+                    || a[o2 as usize..(o2 + l2) as usize]
+                        != a[(og + l1) as usize..(og + lg) as usize]
+                {
+                    return false;
+                }
+                let root_r = this.map.lookup_rank(t1, t2);
+                if root_r != r || this.map.target(root_r) != tg {
+                    return false;
+                }
+                // Collect right spine of t1 and left spine of t2 top-down (depth <= 15).
+                let mut u_tok = [0u32; 16];
+                let mut u_nxt = [0u32; 16];
+                let mut nu = 0usize;
+                let mut cur = t1;
+                let mut nxt_r = r;
+                loop {
+                    if nu >= 16 {
+                        return false;
+                    }
+                    u_tok[nu] = cur;
+                    u_nxt[nu] = nxt_r;
+                    nu += 1;
+                    let (_, rc, cr) = prod_ref[cur as usize];
+                    if cr == LEAF {
+                        break;
+                    }
+                    if cr == AMBIG || cr >= nxt_r {
+                        return false;
+                    }
+                    cur = rc;
+                    nxt_r = cr;
+                }
+                let mut v_tok = [0u32; 16];
+                let mut v_nxt = [0u32; 16];
+                let mut nv = 0usize;
+                let mut cur = t2;
+                let mut nxt_r = r;
+                loop {
+                    if nv >= 16 {
+                        return false;
+                    }
+                    v_tok[nv] = cur;
+                    v_nxt[nv] = nxt_r;
+                    nv += 1;
+                    let (lc, _, cr) = prod_ref[cur as usize];
+                    if cr == LEAF {
+                        break;
+                    }
+                    if cr == AMBIG || cr >= nxt_r {
+                        return false;
+                    }
+                    cur = lc;
+                    nxt_r = cr;
+                }
+                // Walk boundary bottom-up in exact canonical rank order (leftmost wins ties).
+                let mut i = nu - 1;
+                let mut j = nv - 1;
+                while (i | j) != 0 {
+                    let lu = u_nxt[i];
+                    let rv = v_nxt[j];
+                    let mr = this.map.lookup_rank(u_tok[i], v_tok[j]);
+                    if lu <= rv {
+                        if mr < lu {
+                            return false;
+                        }
+                        i -= 1;
+                    } else {
+                        if mr <= rv {
+                            return false;
+                        }
+                        j -= 1;
+                    }
+                }
+                true
+            };
+
+            let local_ok: Vec<bool> = if parallel_ok() {
+                (0..n_vocab as u32)
+                    .into_par_iter()
+                    .with_min_len(1024)
+                    .map(verify_merge)
+                    .collect()
+            } else {
+                (0..n_vocab as u32).map(verify_merge).collect()
+            };
+
+            // Topological propagation in ascending merge-rank order (valid by `monotonic`).
+            let mut self_enc = vec![false; n_vocab];
+            for b in 0..256 {
+                if this.singleton[b] >= 0 {
+                    let sid = this.singleton_u32[b] as usize;
+                    if sid < n_vocab && this.byte_span[sid].1 == 1 {
+                        self_enc[sid] = true;
+                    }
+                }
+            }
+            for &(t1, t2, tg) in &this.raw_merges {
+                let tgi = tg as usize;
+                if tgi < n_vocab && local_ok[tgi] && self_enc[t1 as usize] && self_enc[t2 as usize] {
+                    self_enc[tgi] = true;
+                }
+            }
+
+            let mut pairs: Vec<(&[u8], u32)> = Vec::with_capacity(n_vocab);
+            let mut fallback_ids: Vec<u32> = Vec::new();
+            for id in 0..n_vocab as u32 {
+                let (off, len) = this.byte_span[id as usize];
+                if len >= 1 && (len as usize) <= chunk_table::MAX_KEY {
+                    if self_enc[id as usize] {
+                        pairs.push((&this.byte_arena[off as usize..(off + len) as usize], id));
+                    } else {
+                        fallback_ids.push(id);
+                    }
+                }
+            }
+            if !fallback_ids.is_empty() {
+                if parallel_ok() && fallback_ids.len() >= 1024 {
+                    let extra: Vec<(&[u8], u32)> = fallback_ids
+                        .par_iter()
+                        .with_min_len(256)
+                        .map_init(Scratch::default, |s, &id| emit_one(s, id))
+                        .flatten()
+                        .collect();
+                    pairs.extend(extra);
+                } else {
+                    let mut s = Scratch::default();
+                    for id in fallback_ids {
+                        if let Some(p) = emit_one(&mut s, id) {
+                            pairs.push(p);
+                        }
+                    }
+                }
+            }
+            pairs
         } else {
-            let mut s = Scratch::default();
-            ids.iter().filter_map(|&id| one(&mut s, id)).collect()
+            let ids: Vec<u32> = (0..n_vocab as u32)
+                .filter(|&id| {
+                    let l = this.byte_span[id as usize].1 as usize;
+                    l >= 1 && l <= chunk_table::MAX_KEY
+                })
+                .collect();
+            if parallel_ok() {
+                ids.par_iter()
+                    .with_min_len(512)
+                    .map_init(Scratch::default, |s, &id| emit_one(s, id))
+                    .flatten()
+                    .collect()
+            } else {
+                let mut s = Scratch::default();
+                ids.iter().filter_map(|&id| emit_one(&mut s, id)).collect()
+            }
         };
         let table = chunk_table::ChunkTable::build(&pairs);
         // Demand-paged active working-set SharedTable: keep `self.learned`
         // initially empty (512 KiB) so it projects a 200K multilingual vocab
-        // down to the exact L2-resident active working set of the user's text,
-        // backed by `self.chunk_table` with zero BPE merges on first touch.
+        // down to the exact L2-resident active working set of the user's text
+        // (ablated +5-7% faster than blind low-ID pre-seeding). Call `warmup()`
+        // with representative domain text to pre-populate for production.
         drop(pairs);
         self.chunk_table = table;
     }
@@ -3767,13 +4273,16 @@ impl Tokenizer {
     fn new(path: &str) -> PyResult<Self> {
         let data = std::fs::read_to_string(path)
             .map_err(|e| PyValueError::new_err(format!("cannot read {path}: {e}")))?;
-        let cfg: Value = serde_json::from_str(&data)
+        let raw: RawTokenizerJson<'_> = serde_json::from_str(&data)
             .map_err(|e| PyValueError::new_err(format!("bad JSON: {e}")))?;
-        let model = cfg.get("model").ok_or_else(|| PyValueError::new_err("no model"))?;
+        let model = raw.model.ok_or_else(|| PyValueError::new_err("no model"))?;
+        let norm_val = raw.normalizer.as_ref().unwrap_or(&Value::Null);
+        let pre = raw.pre_tokenizer.as_ref().unwrap_or(&Value::Null);
+        let dec_val = raw.decoder.as_ref().unwrap_or(&Value::Null);
 
         // Fail closed on any normalizer stage we don't actually apply, rather
         // than silently ignoring it and mistokenizing (e.g. a Lowercase model).
-        if let Some(t) = unsupported_normalizer_stage(&cfg) {
+        if let Some(t) = unsupported_normalizer_stage(norm_val) {
             return Err(PyValueError::new_err(format!(
                 "unsupported normalizer stage {t:?}: this model rewrites text in a \
                  way tuetoken does not reproduce (only NFC/NFD/NFKC/NFKD and \
@@ -3781,11 +4290,16 @@ impl Tokenizer {
             )));
         }
 
-        let byte_fallback = model.get("byte_fallback").and_then(|v| v.as_bool()).unwrap_or(false);
-        let meta_mode = detect_meta_mode(&cfg);
-        let norm_form = detect_norm_form(&cfg);
-        let decode_strip_space = detect_decode_strip(&cfg);
-        let pre = cfg.get("pre_tokenizer").unwrap_or(&Value::Null);
+        let byte_fallback = model.byte_fallback;
+        let meta_mode = detect_meta_mode(pre, norm_val);
+        let norm_form = detect_norm_form(norm_val);
+        let decode_strip_space = detect_decode_strip(dec_val);
+        let prepend_scheme_str = detect_prepend_scheme_str(pre, norm_val);
+        let post_processor_json = raw
+            .post_processor
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::to_string(v).ok());
 
         let compile_split = |pats: &[String]| -> PyResult<Vec<fancy_regex::Regex>> {
             let mut res = Vec::with_capacity(pats.len());
@@ -3838,88 +4352,89 @@ impl Tokenizer {
                 }
             }
         };
-        let ignore_merges = model.get("ignore_merges").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ignore_merges = model.ignore_merges;
 
-        let c2b = bytes_to_unicode_c2b();
-        let vocab_obj = model
-            .get("vocab")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| PyValueError::new_err("no vocab"))?;
-        let mut vocab: FxHashMap<String, u32> = FxHashMap::default();
-        let mut max_id = 0u32;
-        for (k, v) in vocab_obj {
-            let id = v.as_u64().unwrap_or(0) as u32;
-            vocab.insert(k.clone(), id);
-            if id > max_id {
-                max_id = id;
-            }
-        }
-        let mut vocab_size = (max_id as usize) + 1;
+        let c2b = bytes_to_unicode_table();
+        let vocab = model.vocab.ok_or_else(|| PyValueError::new_err("no vocab"))?;
+        let mut vocab_size = (model.max_id as usize) + 1;
 
-        // added_tokens may extend the id space
-        if let Some(arr) = cfg.get("added_tokens").and_then(|v| v.as_array()) {
+        // Collect added_tokens metadata + extend id space
+        let mut added_meta: Vec<(String, u32, bool, bool, bool)> = Vec::new();
+        if let Some(arr) = raw.added_tokens {
+            added_meta.reserve(arr.len());
             for at in arr {
-                if let Some(id) = at.get("id").and_then(|v| v.as_u64()) {
+                if let Some(id) = at.id {
                     vocab_size = vocab_size.max(id as usize + 1);
+                    if let Some(content) = at.content {
+                        added_meta.push((content, id as u32, at.special, at.lstrip, at.rstrip));
+                    }
                 }
             }
         }
 
-        let mut token_to_bytes: Vec<Vec<u8>> = vec![Vec::new(); vocab_size];
-        // A single-byte token is "canonical" iff its string is exactly the
-        // byte-level alphabet char for that byte (e.g. 'Ġ' for 0x20). A stray raw
-        // char (e.g. ' ', which UTF-8s to 0x20) is unreachable once input is
-        // byte-level encoded, so it must not shadow the canonical token below.
+        // Snapshot common special-token ids from `vocab` so AutoTokenizer never
+        // needs to re-parse the 12+ MB tokenizer.json in Python on construction.
+        const KNOWN_TOKS: &[&str] = &[
+            "<pad>", "[PAD]", "<|pad|>", "<|endoftext|>", "<s>", "</s>",
+            "[CLS]", "[SEP]", "<unk>", "[UNK]", "<mask>", "[MASK]",
+            "<|begin_of_text|>", "<|end_of_text|>", "<|im_start|>", "<|im_end|>",
+        ];
+        let mut known_token_ids: Vec<(String, u32)> = Vec::new();
+        for &kt in KNOWN_TOKS {
+            if let Some(&id) = vocab.get(kt) {
+                known_token_ids.push((kt.to_string(), id));
+            }
+        }
+
+        // Stream decoded token bytes directly into ONE contiguous byte_arena
+        // (eliminating 200K Vec<u8> heap allocations and SipHash lookups).
+        let mut byte_arena: Vec<u8> = Vec::with_capacity(vocab.len() * 8);
+        let mut byte_span: Vec<(u32, u32)> = vec![(0, 0); vocab_size];
         let mut canonical = vec![false; vocab_size];
-        // byte_fallback: codepoint -> token id for single-character vocab tokens.
         let mut char_ascii = [-1i32; 128];
         let mut char_map: FxHashMap<u32, u32> = FxHashMap::default();
         for (k, &id) in &vocab {
-            token_to_bytes[id as usize] = if byte_fallback {
-                decode_byte_fallback(k)
+            let ks = k.as_str();
+            let start = byte_arena.len() as u32;
+            if byte_fallback {
+                decode_byte_fallback_into(ks, &mut byte_arena);
             } else {
-                decode_bytelevel(k, &c2b)
-            };
-            let mut chs = k.chars();
-            match (chs.next(), chs.next()) {
-                (Some(c), None) => {
-                    // single-character token
-                    if byte_fallback {
-                        let cp = c as u32;
-                        if cp < 128 {
-                            char_ascii[cp as usize] = id as i32;
-                        } else {
-                            char_map.insert(cp, id);
-                        }
+                decode_bytelevel_into(ks, &c2b, &mut byte_arena);
+            }
+            let len = byte_arena.len() as u32 - start;
+            byte_span[id as usize] = (start, len);
+            let mut chs = ks.chars();
+            if let (Some(c), None) = (chs.next(), chs.next()) {
+                if byte_fallback {
+                    let cp = c as u32;
+                    if cp < 128 {
+                        char_ascii[cp as usize] = id as i32;
                     } else {
-                        canonical[id as usize] = c2b.contains_key(&c);
+                        char_map.insert(cp, id);
                     }
+                } else {
+                    let cp = c as usize;
+                    canonical[id as usize] = cp < 324 && c2b[cp] != u16::MAX;
                 }
-                _ => {}
             }
         }
-        if let Some(arr) = cfg.get("added_tokens").and_then(|v| v.as_array()) {
-            for at in arr {
-                if let (Some(content), Some(id)) = (
-                    at.get("content").and_then(|v| v.as_str()),
-                    at.get("id").and_then(|v| v.as_u64()),
-                ) {
-                    let id = id as usize;
-                    if id < vocab_size && token_to_bytes[id].is_empty() {
-                        token_to_bytes[id] = content.as_bytes().to_vec();
-                    }
-                }
+        drop(vocab);
+        for (content, id, _, _, _) in &added_meta {
+            let id = *id as usize;
+            if id < vocab_size && byte_span[id].1 == 0 {
+                let start = byte_arena.len() as u32;
+                byte_arena.extend_from_slice(content.as_bytes());
+                byte_span[id] = (start, content.len() as u32);
             }
         }
 
         let mut singleton = [-1i32; 256];
         let mut singleton_canon = [false; 256];
         for id in 0..vocab_size {
-            let b = &token_to_bytes[id];
-            if b.len() == 1 {
-                let bv = b[0] as usize;
+            let (off, len) = byte_span[id];
+            if len == 1 {
+                let bv = byte_arena[off as usize] as usize;
                 let canon = canonical[id];
-                // prefer canonical; among equal canonicity prefer the smaller id
                 if singleton[bv] < 0
                     || (canon && !singleton_canon[bv])
                     || (canon == singleton_canon[bv] && (id as i32) < singleton[bv])
@@ -3930,29 +4445,7 @@ impl Tokenizer {
             }
         }
 
-        let mut merges: Vec<(u32, u32, u32)> = Vec::new();
-        if let Some(arr) = model.get("merges").and_then(|v| v.as_array()) {
-            for m in arr {
-                let pair = if let Some(a) = m.as_array() {
-                    match (a.get(0).and_then(|x| x.as_str()), a.get(1).and_then(|x| x.as_str())) {
-                        (Some(x), Some(y)) => Some((x.to_string(), y.to_string())),
-                        _ => None,
-                    }
-                } else if let Some(s) = m.as_str() {
-                    s.find(' ').map(|sp| (s[..sp].to_string(), s[sp + 1..].to_string()))
-                } else {
-                    None
-                };
-                if let Some((t1s, t2s)) = pair {
-                    let merged = format!("{t1s}{t2s}");
-                    if let (Some(&t1), Some(&t2), Some(&tg)) =
-                        (vocab.get(&t1s), vocab.get(&t2s), vocab.get(&merged))
-                    {
-                        merges.push((t1, t2, tg));
-                    }
-                }
-            }
-        }
+        let merges = model.merges;
         let mut map = bpe::MergeMap::new(&merges);
 
         // Monotonicity: a vocab is "monotonic" when every token is fully produced
@@ -3983,24 +4476,16 @@ impl Tokenizer {
         let ignore_lookup = if ignore_merges {
             let mut m: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
             for id in 0..vocab_size {
-                let b = &token_to_bytes[id];
-                if !b.is_empty() {
-                    m.entry(b.clone().into_boxed_slice()).or_insert(id as u32);
+                let (off, len) = byte_span[id];
+                if len > 0 {
+                    let b = &byte_arena[off as usize..(off + len) as usize];
+                    m.entry(b.to_vec().into_boxed_slice()).or_insert(id as u32);
                 }
             }
             Some(m)
         } else {
             None
         };
-
-        // Flatten token_to_bytes into a contiguous arena for fast decode.
-        let total: usize = token_to_bytes.iter().map(|b| b.len()).sum();
-        let mut byte_arena: Vec<u8> = Vec::with_capacity(total);
-        let mut byte_span: Vec<(u32, u32)> = Vec::with_capacity(token_to_bytes.len());
-        for b in &token_to_bytes {
-            byte_span.push((byte_arena.len() as u32, b.len() as u32));
-            byte_arena.extend_from_slice(b);
-        }
 
         let mut singleton_u32 = [0u32; 256];
         for b in 0..256 {
@@ -4044,9 +4529,77 @@ impl Tokenizer {
             long_table: chunk_table::SharedLongTable::new(DEFAULT_CACHE_MIB / 4),
             spill: chunk_table::SpillMap::new((DEFAULT_CACHE_MIB << 20) / 4),
             int_table: OnceLock::new(),
+            auto_meta: AutoMeta {
+                added_tokens: added_meta,
+                post_processor_json,
+                prepend_scheme: prepend_scheme_str,
+                known_token_ids,
+            },
         };
         tk.build_chunk_table();
         Ok(tk)
+    }
+
+    /// Compact AutoTokenizer metadata parsed during `Tokenizer::new` so Python
+    /// avoids re-parsing the full tokenizer.json on construction.
+    fn _auto_meta(&self) -> (Vec<(String, u32, bool, bool, bool)>, Option<String>, String, Vec<(String, u32)>) {
+        (
+            self.auto_meta.added_tokens.clone(),
+            self.auto_meta.post_processor_json.clone(),
+            self.auto_meta.prepend_scheme.clone(),
+            self.auto_meta.known_token_ids.clone(),
+        )
+    }
+
+    /// Optional warmup to eliminate cold-start latency before serving/encoding.
+    ///
+    /// - `warmup()` (no `texts`): pre-builds the cached Python int table and
+    ///   warms the rayon thread pool.
+    /// - `warmup(texts, num_threads=0)`: runs a fast parallel learning pass over
+    ///   representative domain text(s) (`str`, `bytes`, or an iterable of them)
+    ///   without allocating output token buffers, populating the shared chunk
+    ///   tables so production calls start at full warm throughput (~3-5x faster).
+    ///
+    /// Returns the number of cached entries in the shared table.
+    #[pyo3(signature = (texts = None, num_threads = 0))]
+    fn warmup(
+        &self,
+        py: Python<'_>,
+        texts: Option<&Bound<'_, PyAny>>,
+        num_threads: usize,
+    ) -> PyResult<usize> {
+        let _ = self.ints(py);
+        if num_threads > 1 {
+            let _ = fixed_pool(num_threads);
+        }
+        if let Some(obj) = texts {
+            let items: Vec<TextArg> = if obj.is_instance_of::<pyo3::types::PyString>()
+                || obj.is_instance_of::<pyo3::types::PyBytes>()
+                || obj.is_instance_of::<pyo3::types::PyByteArray>()
+            {
+                vec![obj.extract()?]
+            } else {
+                obj.extract()?
+            };
+            if !items.is_empty() {
+                let stream_wide = self.stream_wide_ok(None);
+                let wide = if stream_wide {
+                    WideCopies::default()
+                } else {
+                    wide_args(py, &items, num_threads)?
+                };
+                let res = py.detach(|| {
+                    self.encode_batch_sep_t::<u32>(&items, &wide, stream_wide, num_threads, false, None)
+                });
+                if let Err(err) = res {
+                    match err {
+                        Ok(b) => return Err(bad_input_to_pyerr(py, &items, b)),
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        Ok(self.learned.len())
     }
 
     /// Memory cap (MiB) of this tokenizer's shared learned-chunk cache: chunks
@@ -4094,8 +4647,13 @@ impl Tokenizer {
     /// Load by HuggingFace repo id (downloads `tokenizer.json`). One-liner like
     /// HF's `from_pretrained`. Requires `huggingface_hub`.
     #[staticmethod]
-    #[pyo3(signature = (repo_id, revision = None))]
-    fn from_pretrained(py: Python<'_>, repo_id: &str, revision: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (repo_id, revision = None, warmup = None))]
+    fn from_pretrained(
+        py: Python<'_>,
+        repo_id: &str,
+        revision: Option<&str>,
+        warmup: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let hub = py.import("huggingface_hub").map_err(|_| {
             PyValueError::new_err(
                 "from_pretrained requires huggingface_hub (pip install huggingface_hub)",
@@ -4108,18 +4666,39 @@ impl Tokenizer {
         let path: String = hub
             .call_method("hf_hub_download", (repo_id, "tokenizer.json"), Some(&kwargs))?
             .extract()?;
-        Self::new(&path)
+        let tk = Self::new(&path)?;
+        if let Some(w) = warmup {
+            if w.is_instance_of::<pyo3::types::PyBool>() {
+                if w.extract::<bool>()? {
+                    tk.warmup(py, None, 0)?;
+                }
+            } else if !w.is_none() {
+                tk.warmup(py, Some(w), 0)?;
+            }
+        }
+        Ok(tk)
     }
 
     /// Load an OpenAI tiktoken encoding by name (e.g. "cl100k_base", "o200k_base").
     /// Downloads the rank file and builds a tokenizer.json (cached).
     #[staticmethod]
-    fn from_tiktoken(py: Python<'_>, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (name, warmup = None))]
+    fn from_tiktoken(py: Python<'_>, name: &str, warmup: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
         let helper = py.import("tuetoken._tiktoken")?;
         let path: String = helper
             .call_method1("get_cached_tokenizer_path", (name,))?
             .extract()?;
-        Self::new(&path)
+        let tk = Self::new(&path)?;
+        if let Some(w) = warmup {
+            if w.is_instance_of::<pyo3::types::PyBool>() {
+                if w.extract::<bool>()? {
+                    tk.warmup(py, None, 0)?;
+                }
+            } else if !w.is_none() {
+                tk.warmup(py, Some(w), 0)?;
+            }
+        }
+        Ok(tk)
     }
 
     fn encode_ordinary<'py>(&self, py: Python<'py>, text: &str) -> Bound<'py, PyList> {
@@ -5600,5 +6179,106 @@ mod perf {
             assert_eq!(ucs2_to_utf8_append(&src, &mut err_buf), Err(off));
             assert_eq!(err_buf, b"keep");
         }
+    }
+
+    #[test]
+    fn merge_tree_chunk_table_matches_bruteforce() {
+        // Adversarial synthetic ByteLevel BPE covering:
+        // - "aa" + "a" = "aaa" (leftmost wins, self-encodes)
+        // - "a" + "aa" = "aaa2" (preempted by leftmost "aa", encodes to "aaa" not "aaa2")
+        // - "aa" + "aa" = "aaaa" (equal-rank tie on left/right spines, self-encodes)
+        // - "ab" + "cd" = "abcd" where "bc" has lower rank (cross-boundary preemption!)
+        // - "xy" + "zw" = "xyzw" where "yz" has higher rank (no preemption, self-encodes)
+        // - duplicate 1-byte token + unmerged multi-byte token
+        let c2b = bytes_to_unicode_table();
+        let mut b2c = ['\0'; 256];
+        for (cp, &b) in c2b.iter().enumerate() {
+            if b != u16::MAX {
+                b2c[b as usize] = char::from_u32(cp as u32).unwrap();
+            }
+        }
+        let enc_bl = |s: &[u8]| -> String { s.iter().map(|&b| b2c[b as usize]).collect() };
+
+        let mut vocab = serde_json::Map::new();
+        for b in 0u8..=255 {
+            vocab.insert(enc_bl(&[b]), serde_json::json!(b as u32));
+        }
+        let extra: &[&[u8]] = &[
+            b"aa",   // 256
+            b"bc",   // 257 (lower rank than ab/cd -> preempts ab+cd!)
+            b"ab",   // 258
+            b"cd",   // 259
+            b"abcd", // 260 (from ab+cd, MUST NOT self-encode to 260 because bc fires first!)
+            b"aaa",  // 261 (from aa+a, self-encodes!)
+            b"aaaa", // 262 (from aa+aa, self-encodes!)
+            b"xy",   // 263
+            b"zw",   // 264
+            b"yz",   // 265 (higher rank than xy/zw -> does NOT preempt xy+zw!)
+            b"xyzw", // 266 (from xy+zw, self-encodes!)
+            b"a2",   // 267 (from a+aa -> actually test "b"+"aa" vs "a"+"aa" via another pair)
+            b"bb",   // 268
+            b"bbb",  // 269 (from b+bb -> PREEMPTED by leftmost b+b -> bb+b, does NOT self-encode!)
+            b"unmerged_tok", // 270 (no merge produces it -> encodes to singletons)
+        ];
+        for (i, &tok) in extra.iter().enumerate() {
+            vocab.insert(enc_bl(tok), serde_json::json!(256 + i));
+        }
+        let merges: Vec<String> = vec![
+            (b"a".as_slice(), b"a".as_slice()),    // -> 256 "aa"
+            (b"b", b"c"),                          // -> 257 "bc"
+            (b"a", b"b"),                          // -> 258 "ab"
+            (b"c", b"d"),                          // -> 259 "cd"
+            (b"ab", b"cd"),                        // -> 260 "abcd" (preempted by bc!)
+            (b"aa", b"a"),                         // -> 261 "aaa" (valid: leftmost wins)
+            (b"aa", b"aa"),                        // -> 262 "aaaa" (valid: equal-rank spine tie)
+            (b"x", b"y"),                          // -> 263 "xy"
+            (b"z", b"w"),                          // -> 264 "zw"
+            (b"y", b"z"),                          // -> 265 "yz" (higher rank than xy, zw)
+            (b"xy", b"zw"),                        // -> 266 "xyzw" (valid!)
+            (b"b", b"b"),                          // -> 268 "bb"
+            (b"b", b"bb"),                         // -> 269 "bbb" (preempted by leftmost b+b!)
+        ]
+        .into_iter()
+        .map(|(a, b)| format!("{} {}", enc_bl(a), enc_bl(b)))
+        .collect();
+
+        let doc = serde_json::json!({
+            "version": "1.0",
+            "model": { "type": "BPE", "vocab": vocab, "merges": merges },
+            "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "use_regex": true },
+            "decoder": { "type": "ByteLevel" },
+            "added_tokens": []
+        });
+        let tmp = std::env::temp_dir().join(format!("tuetoken_mergetree_{}.json", std::process::id()));
+        std::fs::write(&tmp, doc.to_string()).unwrap();
+        let tk = Tokenizer::new(tmp.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(tk.byte_fast && tk.monotonic);
+        // Verify EVERY vocab token in chunk_table matches exact merge_bytes_into!
+        let mut s = Scratch::default();
+        for id in 0..tk.byte_span.len() as u32 {
+            let (off, len) = tk.byte_span[id as usize];
+            if len >= 1 && (len as usize) <= chunk_table::MAX_KEY {
+                let b = &tk.byte_arena[off as usize..(off + len) as usize];
+                s.out.clear();
+                tk.process_chunk(b, &mut s, Merge::Scan);
+                let want = if s.out.len() == 1 { Some(s.out[0]) } else { None };
+                let (lo, hi) = chunk_table::pack(b);
+                let got = tk.chunk_table.get(lo, hi);
+                assert_eq!(got, want, "mismatch on id={id} bytes={:?}", std::str::from_utf8(b));
+            }
+        }
+        // Spot-check the tricky cases explicitly:
+        let lookup = |b: &[u8]| {
+            let (lo, hi) = chunk_table::pack(b);
+            tk.chunk_table.get(lo, hi)
+        };
+        assert_eq!(lookup(b"abcd"), None);       // preempted by "bc" -> [a, bc, d]
+        assert_eq!(lookup(b"aaa"), Some(261));   // leftmost aa+a succeeds
+        assert_eq!(lookup(b"aaaa"), Some(262));  // equal-rank aa+aa succeeds
+        assert_eq!(lookup(b"xyzw"), Some(266));  // yz has higher rank -> xy+zw succeeds
+        assert_eq!(lookup(b"bbb"), None);        // b+bb preempted by leftmost b+b -> [bb, b]
+        assert_eq!(lookup(b"unmerged_tok"), None);
     }
 }

@@ -568,12 +568,43 @@ def test_bytes_inputs():
     return ok, tot
 
 
+def test_warmup_and_fast_startup():
+    """warmup() + warmup= kwarg populate shared chunk tables with zero parity drift."""
+    print("=== warmup & fast startup ===")
+    ok = tot = 0
+    sample = make_corpus()
+    for enc in ["gpt2", "cl100k_base"]:
+        base = tuetoken.Tokenizer.from_tiktoken(enc)
+        want = base.encode_ordinary(sample)
+        # Tokenizer.warmup() (no texts) + warmup(sample)
+        t1 = tuetoken.Tokenizer.from_tiktoken(enc, warmup=True)
+        tot += 1; ok += t1.encode_ordinary(sample) == want
+        n1 = t1.warmup(sample)
+        tot += 1; ok += n1 > 0 and t1.encode_ordinary(sample) == want
+        # Tokenizer.from_tiktoken(..., warmup=[bytes, str])
+        t2 = tuetoken.Tokenizer.from_tiktoken(enc, warmup=[sample.encode(), "Hello world!"])
+        tot += 1; ok += t2.learned_entries > 0 and t2.encode_ordinary(sample) == want
+    # Test AutoTokenizer.from_file with real cached tiktoken json
+    from tuetoken import _tiktoken as _tt
+    tj = _tt.get_cached_tokenizer_path("cl100k_base")
+    a = tuetoken.AutoTokenizer.from_file(tj, warmup=sample)
+    tot += 1; ok += a._id_to_token_cache is None  # lazy: did NOT re-parse tokenizer.json!
+    tot += 1; ok += a.encode(sample, add_special_tokens=False) == tuetoken.Tokenizer(tj).encode_ordinary(sample)
+    tot += 1; ok += a.warmup([sample, sample.encode()]) > 0
+    # Accessing get_vocab lazily loads the full vocab dict on demand
+    v = a.get_vocab()
+    tot += 1; ok += len(v) >= 100000 and a._id_to_token_cache is not None
+    _line("warmup & fast startup", ok, tot)
+    assert ok == tot, f"warmup: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
         test_hf_models(), test_failclosed(), test_normalization(),
         test_new_features(), test_rank_inversion(), test_auto(),
-        test_kimi_tiktoken_model(), test_bytes_inputs(),
+        test_kimi_tiktoken_model(), test_bytes_inputs(), test_warmup_and_fast_startup(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

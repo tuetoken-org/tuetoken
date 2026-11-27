@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # feature, set in pyproject [tool.maturin]); leaving it off lets `cargo test`
 # link libpython normally instead of failing on missing symbols.
 pyo3 = { version = "0.28" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1"
 rustc-hash = "2"

@@ -37,58 +37,35 @@ class _ChatDict(dict):
 
 class AutoTokenizer:
     # ---- construction -------------------------------------------------------
-    def __init__(self, tokenizer_json, config=None):
-        with open(tokenizer_json, encoding="utf-8") as f:
-            tj = json.load(f)
+    def __init__(self, tokenizer_json, config=None, warmup=None):
+        self._tokenizer_json = tokenizer_json
         self._core = _Core(tokenizer_json)
         self._cfg = config or {}
 
-        # id <-> token-string maps (vocab + added tokens), for convert_*_to_*.
-        model = tj.get("model", {})
-        self._id_to_token = {}
-        vocab = model.get("vocab", {})
-        if isinstance(vocab, dict):
-            for tok, i in vocab.items():
-                self._id_to_token[int(i)] = tok
-        self._added = tj.get("added_tokens", [])
+        # Fast metadata extracted during the single Rust parse (avoids re-parsing
+        # the full 12+ MB tokenizer.json in Python; full id<->token dicts are
+        # built lazily only if get_vocab/convert_*_to_* are called).
+        added_rows, post_json, prepend_scheme, known_ids = self._core._auto_meta()
+        self._id_to_token_cache = None
+        self._token_to_id_cache = None
+        self._added = [
+            {"content": c, "id": int(i), "special": sp, "lstrip": ls, "rstrip": rs}
+            for (c, i, sp, ls, rs) in added_rows
+        ]
         self._added_content_to_id = {}
         self._special_ids = set()
-        for a in self._added:
-            i = int(a["id"])
-            self._id_to_token[i] = a["content"]
-            self._added_content_to_id[a["content"]] = i
-            if a.get("special", False):
-                self._special_ids.add(i)
-        self._token_to_id = {t: i for i, t in self._id_to_token.items()}
+        self._fast_id_to_token = {}
+        self._fast_token_to_id = {t: int(i) for (t, i) in known_ids}
+        for c, i, sp, _, _ in added_rows:
+            ii = int(i)
+            self._fast_id_to_token[ii] = c
+            self._fast_token_to_id[c] = ii
+            self._added_content_to_id[c] = ii
+            if sp:
+                self._special_ids.add(ii)
 
-        self._post = tj.get("post_processor")
-
-        # SentencePiece metaspace prepend scheme, for splicing fragments around
-        # special tokens correctly: "always" prepends ▁ to every fragment, "first"
-        # only to the first fragment of the whole sequence, "none" never.
-        pre = tj.get("pre_tokenizer") or {}
-        def _find_ms(p):
-            if p.get("type") == "Metaspace":
-                return p
-            if p.get("type") == "Sequence":
-                for x in p.get("pretokenizers", []):
-                    if x.get("type") == "Metaspace":
-                        return x
-            return None
-        ms = _find_ms(pre)
-        norm = tj.get("normalizer") or {}
-        nstages = norm.get("normalizers", []) if norm.get("type") == "Sequence" else ([norm] if norm else [])
-        has_prepend_norm = any(s.get("type") == "Prepend" and s.get("prepend") == "▁" for s in nstages)
-        if ms is not None:
-            self._prepend_scheme = ms.get("prepend_scheme", "always")
-        elif has_prepend_norm:
-            self._prepend_scheme = "always"
-        else:
-            self._prepend_scheme = "none"
-        # NOTE: models with `legacy: true` SentencePiece (e.g. Yi-1.5, a Replace-only
-        # normalizer with no Prepend) apply a dummy-prefix that isn't in tokenizer.json;
-        # we match the tokenizer.json (== the raw `tokenizers` fast tokenizer) but not
-        # transformers' legacy path for those.
+        self._post = json.loads(post_json) if post_json else None
+        self._prepend_scheme = prepend_scheme
 
         # special tokens / chat template / limits from tokenizer_config.json
         c = self._cfg
@@ -111,7 +88,7 @@ class AutoTokenizer:
         # pad-token surfaces by content (convention, not model name).
         if self.pad_token is None:
             for cand in ("<pad>", "[PAD]", "<|pad|>", "<|endoftext|>"):
-                if cand in self._token_to_id:
+                if cand in self._fast_token_to_id:
                     self.pad_token = cand
                     break
 
@@ -134,19 +111,58 @@ class AutoTokenizer:
             [bool(a.get("rstrip", False)) for a in self._added],
             scheme,
         )
+        if warmup is True:
+            self.warmup()
+        elif warmup:
+            self.warmup(warmup)
+
+    def _ensure_vocab_maps(self):
+        if self._id_to_token_cache is not None:
+            return
+        with open(self._tokenizer_json, encoding="utf-8") as f:
+            tj = json.load(f)
+        id2t = {}
+        vocab = tj.get("model", {}).get("vocab", {})
+        if isinstance(vocab, dict):
+            for tok, i in vocab.items():
+                id2t[int(i)] = tok
+        for a in self._added:
+            id2t[int(a["id"])] = a["content"]
+        self._id_to_token_cache = id2t
+        self._token_to_id_cache = {t: i for i, t in id2t.items()}
+
+    @property
+    def _id_to_token(self):
+        self._ensure_vocab_maps()
+        return self._id_to_token_cache
+
+    @property
+    def _token_to_id(self):
+        self._ensure_vocab_maps()
+        return self._token_to_id_cache
+
+    def warmup(self, texts=None, num_threads=0):
+        """Pre-warm thread pools, Python int table, and (when `texts` is given)
+        populate the shared chunk cache for representative domain text(s).
+
+        Passing a small sample (~0.5-5 MB) of your target corpus warms the
+        cache in a few milliseconds so production requests start at full warm
+        throughput (3-5x faster than cold BPE). Returns cached entry count.
+        """
+        return self._core.warmup(texts, num_threads)
 
     @classmethod
-    def from_file(cls, tokenizer_json, config=None):
+    def from_file(cls, tokenizer_json, config=None, warmup=None):
         cfg = None
         if isinstance(config, str):
             with open(config, encoding="utf-8") as f:
                 cfg = json.load(f)
         elif isinstance(config, dict):
             cfg = config
-        return cls(tokenizer_json, cfg)
+        return cls(tokenizer_json, cfg, warmup=warmup)
 
     @classmethod
-    def from_tiktoken_model(cls, source, pattern, special_tokens=None, revision=None):
+    def from_tiktoken_model(cls, source, pattern, special_tokens=None, revision=None, warmup=None):
         """Load a tiktoken-format model (ships a `tiktoken.model` rank file + a
         custom split regex, e.g. Kimi-K2) that has no `tokenizer.json`.
 
@@ -174,10 +190,10 @@ class AutoTokenizer:
                         cfg.update(json.load(f))
                 except Exception:
                     pass
-        return cls(tj_path, cfg)
+        return cls(tj_path, cfg, warmup=warmup)
 
     @classmethod
-    def from_pretrained(cls, repo_id, revision=None, **_):
+    def from_pretrained(cls, repo_id, revision=None, warmup=None, **_):
         from huggingface_hub import hf_hub_download
         kw = {"revision": revision} if revision else {}
         try:
@@ -191,7 +207,7 @@ class AutoTokenizer:
             from . import _tiktoken as _tt
             pattern = _tt.tiktoken_pattern_from_repo(repo_id, revision)
             if pattern is not None:
-                return cls.from_tiktoken_model(repo_id, pattern=pattern, revision=revision)
+                return cls.from_tiktoken_model(repo_id, pattern=pattern, revision=revision, warmup=warmup)
             # Not auto-recoverable: actionable error if it IS tiktoken-format, else
             # re-raise the original download failure.
             try:
@@ -212,7 +228,7 @@ class AutoTokenizer:
                     cfg.update(json.load(f))
             except Exception:
                 pass
-        return cls(tj, cfg)
+        return cls(tj, cfg, warmup=warmup)
 
     # ---- token <-> id helpers ----------------------------------------------
     def get_vocab(self):
@@ -226,7 +242,12 @@ class AutoTokenizer:
         return self._core.n_vocab
 
     def _id(self, tok):
-        return self._token_to_id.get(tok) if tok is not None else None
+        if tok is None:
+            return None
+        tid = self._fast_token_to_id.get(tok)
+        if tid is not None:
+            return tid
+        return self._token_to_id.get(tok)
 
     @property
     def bos_token_id(self):
@@ -250,7 +271,7 @@ class AutoTokenizer:
 
     @property
     def all_special_tokens(self):
-        return [self._id_to_token[i] for i in sorted(self._special_ids)]
+        return [self._fast_id_to_token[i] for i in sorted(self._special_ids)]
 
     def convert_ids_to_tokens(self, ids, skip_special_tokens=False):
         if isinstance(ids, int):
@@ -289,7 +310,7 @@ class AutoTokenizer:
                 st = p.get("special_tokens") or {}
                 if name in st and st[name].get("ids"):
                     return list(st[name]["ids"])
-        tid = self._token_to_id.get(name)
+        tid = self._id(name)
         return [tid] if tid is not None else []
 
     def _apply_post(self, ids_a, ids_b=None):
@@ -323,16 +344,16 @@ class AutoTokenizer:
             if t == "RobertaProcessing":
                 cls = self._special_id_for(p.get("cls", ["<s>"])[0] if isinstance(p.get("cls"), list) else "<s>")
                 sep = self._special_id_for(p.get("sep", ["</s>"])[0] if isinstance(p.get("sep"), list) else "</s>")
-                cls = cls[:1] or [self._token_to_id.get("<s>")]
-                sep = sep[:1] or [self._token_to_id.get("</s>")]
+                cls = cls[:1] or [self._id("<s>")]
+                sep = sep[:1] or [self._id("</s>")]
                 if ids_b is None:
                     ids = cls + ids_a + sep
                 else:
                     ids = cls + ids_a + sep + sep + ids_b + sep
                 return ids, [0] * len(ids)
             if t == "BertProcessing":
-                clsid = self._token_to_id.get("[CLS]")
-                sepid = self._token_to_id.get("[SEP]")
+                clsid = self._id("[CLS]")
+                sepid = self._id("[SEP]")
                 if ids_b is None:
                     ids = [clsid] + ids_a + [sepid]
                     return ids, [0] * len(ids)
