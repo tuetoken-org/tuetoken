@@ -3048,7 +3048,7 @@ impl Tokenizer {
             let e = e_u32 as usize;
             let len = e - a;
             if len.wrapping_sub(1) < chunk_table::MAX_KEY {
-                let (klo, khi) = chunk_table::pack_wide(bp.add(a), len);
+                let (klo, khi) = chunk_table::pack_wide_bmi2(bp.add(a), len);
                 let p = view.slot_addr(chunk_table::hash(klo, khi));
                 chunk_table::prefetch(p as *const u8);
                 (*out).write(PipeRec { lo: klo, hi: khi, p });
@@ -5604,7 +5604,7 @@ impl Tokenizer {
         let byte_fast = !byte_fallback
             && ignore_lookup.is_none()
             && singleton_eow.is_none()
-            && map.init_byte_tables(&singleton);
+            && map.init_byte_tables(&singleton, &merges, monotonic);
 
         let mut tk = Tokenizer {
             kind,

@@ -587,6 +587,76 @@ impl Simd for Avx512 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+static RAMP64: [u8; 64] = {
+    let mut a = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        a[i] = i as u8;
+        i += 1;
+    }
+    a
+};
+
+/// AVX-512BW+VL+VBMI2 (Zen 4 / Ice Lake+): compresses all 64 chunk-end byte
+/// positions in ONE `vpcompressb` instruction + ONE `popcnt`, then widens only
+/// the actual `cnt` positions with disjoint 64-byte stores (zero overlapping
+/// store-to-load forwarding stalls, 2-4x fewer stores per block).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct Avx512Vbmi2;
+
+#[cfg(target_arch = "x86_64")]
+impl Simd for Avx512Vbmi2 {
+    type Vec64 = std::arch::x86_64::__m512i;
+
+    #[inline(always)]
+    unsafe fn load64(p: *const u8) -> Self::Vec64 {
+        Avx512::load64(p)
+    }
+
+    #[inline(always)]
+    unsafe fn load_tail(p: *const u8, k: usize) -> Self::Vec64 {
+        Avx512::load_tail(p, k)
+    }
+
+    #[inline(always)]
+    unsafe fn classify_vec(v: Self::Vec64) -> Classes {
+        Avx512::classify_vec(v)
+    }
+
+    #[inline(always)]
+    unsafe fn resolve_latin1_vec(v: Self::Vec64, valid: u64, m: &mut Classes) -> (u64, u64, bool) {
+        Avx512::resolve_latin1_vec(v, valid, m)
+    }
+
+    #[inline(always)]
+    unsafe fn extract_ends(trusted: u64, base: usize, op: *mut u32, k: usize) -> usize {
+        use std::arch::x86_64::*;
+        let ramp = _mm512_loadu_si512(RAMP64.as_ptr() as *const _);
+        let comp = _mm512_maskz_compress_epi8(trusted, ramp);
+        let cnt = trusted.count_ones() as usize;
+        let vbase = _mm512_set1_epi32(base as i32);
+        let dst = op.add(k);
+        // Unconditional 32-lane disjoint store covers ~99.5% of blocks (both
+        // English/code and German) with zero 50/50 `cnt > 16` misprediction,
+        // and fits safely inside SCAN_SLACK=80.
+        let lo0 = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(comp));
+        let lo1 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32::<1>(comp));
+        _mm512_storeu_si512(dst as *mut _, _mm512_add_epi32(lo0, vbase));
+        _mm512_storeu_si512(dst.add(16) as *mut _, _mm512_add_epi32(lo1, vbase));
+        if cnt > 32 {
+            let lo2 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32::<2>(comp));
+            _mm512_storeu_si512(dst.add(32) as *mut _, _mm512_add_epi32(lo2, vbase));
+            if cnt > 48 {
+                let lo3 = _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32::<3>(comp));
+                _mm512_storeu_si512(dst.add(48) as *mut _, _mm512_add_epi32(lo3, vbase));
+            }
+        }
+        k + cnt
+    }
+}
+
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[derive(Clone, Copy)]
 struct Scalar;
@@ -640,7 +710,7 @@ fn x86_tier() -> u8 {
         && std::is_x86_feature_detected!("lzcnt")
         && std::is_x86_feature_detected!("popcnt")
     {
-        3
+        if std::is_x86_feature_detected!("avx512vbmi2") { 4 } else { 3 }
     } else if std::is_x86_feature_detected!("avx2")
         && std::is_x86_feature_detected!("bmi1")
         && std::is_x86_feature_detected!("bmi2")
@@ -702,7 +772,7 @@ pub fn classify(b: &[u8], base: usize) -> Classes {
             classify_with::<Avx2>(b, base)
         }
         match x86_tier() {
-            3 => unsafe { c512(b, base) },
+            3 | 4 => unsafe { c512(b, base) },
             2 => unsafe { c256(b, base) },
             _ => unsafe { classify_with::<Sse2>(b, base) },
         }
@@ -916,33 +986,58 @@ fn digit_starts(m: &Classes, flags: u32, k: u32, prefix_sp: bool) -> (u64, u64) 
     }
 }
 
+#[cold]
+#[inline(never)]
+fn digit_starts_ascii_general(d: u64, runs: u64, cd: bool, k: u32) -> (u64, u64) {
+    let bad = d & !d.wrapping_add(1) & (cd as u64).wrapping_neg();
+    let mut dm = d;
+    for t in 1..k {
+        dm &= d << t;
+    }
+    let mut st = runs;
+    let first_extra = (runs << k) & dm;
+    if first_extra != 0 {
+        st |= first_extra;
+        dm &= dm << k;
+        let mut sh = k << 1;
+        while sh < 64 {
+            st |= (st << sh) & dm;
+            dm &= dm << sh;
+            sh <<= 1;
+        }
+    }
+    (st & !bad, bad)
+}
+
 /// Pure-ASCII digit-group starts (no `m.na` / `c.na`, `prefix_sp == false`).
+/// Unrolls `k == 3` (o200k, cl100k, Llama-3, DeepSeek, MiniMax) and moves
+/// rare general `k` out-of-line so LLVM never emits vectorized `1..k` loop
+/// bloat inside the hot 64-byte scanner.
 #[inline(always)]
-fn digit_starts_ascii(d: u64, cd: bool, k: u32) -> (u64, u64) {
+fn digit_starts_ascii<const K: u32>(d: u64, cd: bool, runtime_k: u32) -> (u64, u64) {
+    let k = if K == u32::MAX { runtime_k } else { K };
     let runs = d & !p1(d, cd);
     match k {
         0 => (runs, 0),
         1 => (d, 0),
-        k => {
+        3 => {
             let bad = d & !d.wrapping_add(1) & (cd as u64).wrapping_neg();
-            let mut dm = d;
-            for t in 1..k {
-                dm &= d << t;
-            }
+            let dm = d & (d << 1) & (d << 2);
             let mut st = runs;
-            let first_extra = (runs << k) & dm;
+            let first_extra = (runs << 3) & dm;
             if first_extra != 0 {
                 st |= first_extra;
-                dm &= dm << k;
-                let mut sh = k << 1;
-                while sh < 64 {
-                    st |= (st << sh) & dm;
-                    dm &= dm << sh;
-                    sh <<= 1;
-                }
+                let dm2 = dm & (dm << 3);
+                st |= (st << 6) & dm2;
+                let dm4 = dm2 & (dm2 << 6);
+                st |= (st << 12) & dm4;
+                let dm8 = dm4 & (dm4 << 12);
+                st |= (st << 24) & dm8;
+                st |= (st << 48) & (dm8 & (dm8 << 24));
             }
             (st & !bad, bad)
         }
+        k => digit_starts_ascii_general(d, runs, cd, k),
     }
 }
 
@@ -1071,12 +1166,20 @@ fn span_bad(bad: &mut u64, bad_next: &mut u64, i: usize, end: usize) {
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn generic_fast<const FULL: bool>(b: &[u8], base: usize, max_digits: u32, flags: u32, m: &Classes, valid: u64, cont: u64) -> Option<(u64, u64, u32)> {
+fn generic_fast<const FULL: bool, const K: u32>(
+    b: &[u8],
+    base: usize,
+    max_digits: u32,
+    flags: u32,
+    m: &Classes,
+    valid: u64,
+    cont: u64,
+) -> Option<(u64, u64, u32)> {
     let o = if FULL { !(m.l | m.d | m.ws) } else { !(m.l | m.d | m.ws) & valid };
     let o_before = p1f(o, flags, 0);
     let ostart = o & !o_before & !p1f(m.sp, flags, 1);
     let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart, flags, 8)));
-    let (dstart, dbad) = digit_starts_ascii(m.d, fbit(flags, F_D), max_digits);
+    let (dstart, dbad) = digit_starts_ascii::<K>(m.d, fbit(flags, F_D), max_digits);
     let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m, o_before, fbit(flags, F_WS));
     let mut starts = ostart | lstart | dstart | wsstart | (((flags >> 14) & 1) as u64);
     let mut bad = cont_ws | (m.ws & ((next_na as u64) << 63)) | dbad | wsbad;
@@ -1171,23 +1274,23 @@ fn generic_slow(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut S
 }
 
 #[inline(always)]
-unsafe fn generic_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
+unsafe fn generic_block<S: Simd, const K: u32>(avail: &[u8], doc_len: usize, base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
     let doc = &avail[..doc_len];
     if base + 64 < doc_len {
         let v = S::load64(avail.as_ptr().add(base));
         let m = S::classify_vec(v);
         if (flags & F_SLOW) == 0 {
-            if m.na == 0 {
-                if let Some((s, bad, nf)) = generic_fast::<true>(doc, base, max_digits, flags, &m, u64::MAX, 0) {
+            let mut rm = m;
+            let mut cont = 0u64;
+            let mut ok = true;
+            if rm.na != 0 {
+                let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
+                ok = utf8_ok && rm.na == 0 && punct == 0;
+                cont = c;
+            }
+            if ok {
+                if let Some((s, bad, nf)) = generic_fast::<true, K>(doc, base, max_digits, flags, &rm, u64::MAX, cont) {
                     return (s, bad, nf, true);
-                }
-            } else {
-                let mut rm = m;
-                let (cont, punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                if utf8_ok && rm.na == 0 && punct == 0 {
-                    if let Some((s, bad, nf)) = generic_fast::<true>(doc, base, max_digits, flags, &rm, u64::MAX, cont) {
-                        return (s, bad, nf, true);
-                    }
                 }
             }
         }
@@ -1196,17 +1299,17 @@ unsafe fn generic_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, max_
     }
     let (v, m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
     if (flags & F_SLOW) == 0 {
-        if m.na == 0 {
-            if let Some((s, bad, nf)) = generic_fast::<false>(doc, base, max_digits, flags, &m, valid, 0) {
+        let mut rm = m;
+        let mut cont = 0u64;
+        let mut ok = true;
+        if rm.na != 0 {
+            let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
+            ok = utf8_ok && rm.na == 0 && punct == 0;
+            cont = c;
+        }
+        if ok {
+            if let Some((s, bad, nf)) = generic_fast::<false, K>(doc, base, max_digits, flags, &rm, valid, cont) {
                 return (s, bad, nf, true);
-            }
-        } else {
-            let mut rm = m;
-            let (cont, punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            if utf8_ok && rm.na == 0 && punct == 0 {
-                if let Some((s, bad, nf)) = generic_fast::<false>(doc, base, max_digits, flags, &rm, valid, cont) {
-                    return (s, bad, nf, true);
-                }
             }
         }
     }
@@ -1220,7 +1323,7 @@ unsafe fn generic_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, max_
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn camel_fast<const FULL: bool>(
+fn camel_fast<const FULL: bool, const C_MODE: u8, const K: u32>(
     b: &[u8],
     base: usize,
     contractions: bool,
@@ -1230,6 +1333,11 @@ fn camel_fast<const FULL: bool>(
     valid: u64,
     cont: u64,
 ) -> Option<(u64, u64, u32)> {
+    let contr = match C_MODE {
+        1 => true,
+        0 => false,
+        _ => contractions,
+    };
     let o = if FULL { !(m.l | m.d | m.ws) } else { !(m.l | m.d | m.ws) & valid };
     let lw = m.l & !m.up;
     let o_before = p1f(o, flags, 0);
@@ -1237,14 +1345,14 @@ fn camel_fast<const FULL: bool>(
     let seed = m.sl & p1(abs_nl, (flags & (F_ABS_NL | F_ABS_SL)) != 0);
     let abs_sl = (m.sl.wrapping_add(seed) ^ m.sl) & m.sl;
     let mut ostart = (o & !o_before & !p1f(m.sp, flags, 1) & !abs_sl) | (o & !m.sl & p1f(abs_sl, flags, 10));
-    let (dstart, dbad) = digit_starts_ascii(m.d, fbit(flags, F_D), max_digits);
+    let (dstart, dbad) = digit_starts_ascii::<K>(m.d, fbit(flags, F_D), max_digits);
     let mut bad = cont_ws | (m.ws & ((next_na as u64) << 63)) | dbad | wsbad;
     let ws_unk = m.ws & bad;
     let useed = (m.sl & p1f(ws_unk, flags, 11)) | (m.sl & (((flags >> 12) & 1) as u64));
     let sl_unk = (m.sl.wrapping_add(useed) ^ m.sl) & m.sl;
     bad |= sl_unk | (p1f(sl_unk, flags, 12) & !m.sl);
     let (mut suppress, mut forced_in, mut contr_end) = (0u64, 0u64, 0u64);
-    if contractions {
+    if contr {
         let mut qs = m.q & p1f(m.l, flags, 5);
         let c_bad3 = ((flags >> BAD3_SHIFT) & 7) as u64;
         while qs != 0 {
@@ -1408,23 +1516,23 @@ fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, flags:
 }
 
 #[inline(always)]
-unsafe fn camel_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, contractions: bool, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
+unsafe fn camel_block<S: Simd, const C_MODE: u8, const K: u32>(avail: &[u8], doc_len: usize, base: usize, contractions: bool, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
     let doc = &avail[..doc_len];
     if base + 64 < doc_len {
         let v = S::load64(avail.as_ptr().add(base));
         let m = S::classify_vec(v);
         if (flags & F_SLOW) == 0 {
-            if m.na == 0 {
-                if let Some((s, bad, nf)) = camel_fast::<true>(doc, base, contractions, max_digits, flags, &m, u64::MAX, 0) {
+            let mut rm = m;
+            let mut cont = 0u64;
+            let mut ok = true;
+            if rm.na != 0 {
+                let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
+                ok = utf8_ok && rm.na == 0 && punct == 0;
+                cont = c;
+            }
+            if ok {
+                if let Some((s, bad, nf)) = camel_fast::<true, C_MODE, K>(doc, base, contractions, max_digits, flags, &rm, u64::MAX, cont) {
                     return (s, bad, nf, true);
-                }
-            } else {
-                let mut rm = m;
-                let (cont, punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                if utf8_ok && rm.na == 0 && punct == 0 {
-                    if let Some((s, bad, nf)) = camel_fast::<true>(doc, base, contractions, max_digits, flags, &rm, u64::MAX, cont) {
-                        return (s, bad, nf, true);
-                    }
                 }
             }
         }
@@ -1433,17 +1541,17 @@ unsafe fn camel_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, contra
     }
     let (v, m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
     if (flags & F_SLOW) == 0 {
-        if m.na == 0 {
-            if let Some((s, bad, nf)) = camel_fast::<false>(doc, base, contractions, max_digits, flags, &m, valid, 0) {
+        let mut rm = m;
+        let mut cont = 0u64;
+        let mut ok = true;
+        if rm.na != 0 {
+            let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
+            ok = utf8_ok && rm.na == 0 && punct == 0;
+            cont = c;
+        }
+        if ok {
+            if let Some((s, bad, nf)) = camel_fast::<false, C_MODE, K>(doc, base, contractions, max_digits, flags, &rm, valid, cont) {
                 return (s, bad, nf, true);
-            }
-        } else {
-            let mut rm = m;
-            let (cont, punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            if utf8_ok && rm.na == 0 && punct == 0 {
-                if let Some((s, bad, nf)) = camel_fast::<false>(doc, base, contractions, max_digits, flags, &rm, valid, cont) {
-                    return (s, bad, nf, true);
-                }
             }
         }
     }
@@ -1456,12 +1564,24 @@ unsafe fn camel_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, contra
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn word_fast<const FULL: bool>(b: &[u8], base: usize, indiv: bool, flags: u32, m: &Classes, valid: u64) -> Option<(u64, u64, u32)> {
+fn word_fast<const FULL: bool, const I_MODE: u8>(
+    b: &[u8],
+    base: usize,
+    indiv: bool,
+    flags: u32,
+    m: &Classes,
+    valid: u64,
+) -> Option<(u64, u64, u32)> {
+    let ind = match I_MODE {
+        1 => true,
+        0 => false,
+        _ => indiv,
+    };
     let o = if FULL { !(m.l | m.d | m.ws) } else { !(m.l | m.d | m.ws) & valid };
     let sp_before = p1f(m.sp, flags, 1);
     let ostart = o & !p1f(o, flags, 0) & !sp_before;
     let lstart = m.l & !p1f(m.l, flags, 5) & !sp_before;
-    let dstart = if indiv { m.d } else { m.d & !p1f(m.d, flags, 2) & !sp_before };
+    let dstart = if ind { m.d } else { m.d & !p1f(m.d, flags, 2) & !sp_before };
     let mut starts = ostart | lstart | dstart;
     let mut qc = m.q & ostart;
     let mut suppress = 0u64;
@@ -1496,7 +1616,7 @@ fn word_fast<const FULL: bool>(b: &[u8], base: usize, indiv: bool, flags: u32, m
         if inv == 0 { u64::MAX } else { !(u64::MAX >> inv.leading_zeros()) }
     };
     let good = lr & !wsbad;
-    let no_digit_rule = if indiv { !(m.d >> 1) } else { u64::MAX };
+    let no_digit_rule = if ind { !(m.d >> 1) } else { u64::MAX };
     let lim_shift = if FULL { u64::MAX >> 1 } else { valid >> 1 };
     starts |= (m.ws & !long) | (r & good) | (last & good & lim_shift & no_digit_rule) | (((flags >> 14) & 1) as u64);
     starts &= !suppress;
@@ -1515,23 +1635,21 @@ fn word_fast<const FULL: bool>(b: &[u8], base: usize, indiv: bool, flags: u32, m
 }
 
 #[inline(always)]
-unsafe fn word_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, indiv: bool, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
+unsafe fn word_block<S: Simd, const I_MODE: u8>(avail: &[u8], doc_len: usize, base: usize, indiv: bool, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
     let doc = &avail[..doc_len];
     if base + 64 < doc_len {
         let v = S::load64(avail.as_ptr().add(base));
         let m = S::classify_vec(v);
         if (flags & F_SLOW) == 0 {
-            if m.na == 0 {
-                if let Some((s, bad, nf)) = word_fast::<true>(doc, base, indiv, flags, &m, u64::MAX) {
-                    return (s, bad, nf, true);
-                }
-            } else {
-                let mut rm = m;
+            let mut rm = m;
+            let mut ok = true;
+            if rm.na != 0 {
                 let (_, _, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                if utf8_ok && rm.na == 0 {
-                    if let Some((s, bad, nf)) = word_fast::<true>(doc, base, indiv, flags, &rm, u64::MAX) {
-                        return (s, bad, nf, true);
-                    }
+                ok = utf8_ok && rm.na == 0;
+            }
+            if ok {
+                if let Some((s, bad, nf)) = word_fast::<true, I_MODE>(doc, base, indiv, flags, &rm, u64::MAX) {
+                    return (s, bad, nf, true);
                 }
             }
         }
@@ -1540,17 +1658,15 @@ unsafe fn word_block<S: Simd>(avail: &[u8], doc_len: usize, base: usize, indiv: 
     }
     let (v, m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
     if (flags & F_SLOW) == 0 {
-        if m.na == 0 {
-            if let Some((s, bad, nf)) = word_fast::<false>(doc, base, indiv, flags, &m, valid) {
-                return (s, bad, nf, true);
-            }
-        } else {
-            let mut rm = m;
+        let mut rm = m;
+        let mut ok = true;
+        if rm.na != 0 {
             let (_, _, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            if utf8_ok && rm.na == 0 {
-                if let Some((s, bad, nf)) = word_fast::<false>(doc, base, indiv, flags, &rm, valid) {
-                    return (s, bad, nf, true);
-                }
+            ok = utf8_ok && rm.na == 0;
+        }
+        if ok {
+            if let Some((s, bad, nf)) = word_fast::<false, I_MODE>(doc, base, indiv, flags, &rm, valid) {
+                return (s, bad, nf, true);
             }
         }
     }
@@ -1566,7 +1682,7 @@ fn word_slow(b: &[u8], base: usize, indiv: bool, flags: u32, slow: &mut SlowCarr
         let mut r = m;
         resolve_na::<false>(b, base, &mut r);
         if r.na == 0 {
-            if let Some(out) = word_fast::<true>(b, base, indiv, flags, &r, u64::MAX) {
+            if let Some(out) = word_fast::<true, 2>(b, base, indiv, flags, &r, u64::MAX) {
                 return out;
             }
         }
@@ -1649,9 +1765,9 @@ pub fn block(kind: Pretok, b: &[u8], base: usize, c: Carry) -> Block {
 #[inline(always)]
 unsafe fn block_with<S: Simd>(kind: Pretok, b: &[u8], base: usize, flags: &mut u32, slow: &mut SlowCarry) -> (u64, u64) {
     let (s, bad, out_flags, _) = match kind {
-        Pretok::Generic { max_digits, .. } => generic_block::<S>(b, b.len(), base, max_digits, *flags, slow),
-        Pretok::CamelCase { contractions, max_digits } => camel_block::<S>(b, b.len(), base, contractions, max_digits, *flags, slow),
-        Pretok::Word(indiv) => word_block::<S>(b, b.len(), base, indiv, *flags, slow),
+        Pretok::Generic { max_digits, .. } => generic_block::<S, { u32::MAX }>(b, b.len(), base, max_digits, *flags, slow),
+        Pretok::CamelCase { contractions, max_digits } => camel_block::<S, 2, { u32::MAX }>(b, b.len(), base, contractions, max_digits, *flags, slow),
+        Pretok::Word(indiv) => word_block::<S, 2>(b, b.len(), base, indiv, *flags, slow),
     };
     *flags = out_flags;
     (s, bad)
@@ -1672,7 +1788,7 @@ pub fn block_m(kind: Pretok, b: &[u8], base: usize, c: &mut Carry) -> (u64, u64)
     #[cfg(target_arch = "x86_64")]
     {
         match x86_tier() {
-            3 => match kind {
+            3 | 4 => match kind {
                 Pretok::Generic { max_digits, .. } => unsafe { generic_m_avx512(b, base, max_digits, c) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { camel_m_avx512(b, base, contractions, max_digits, c) },
                 Pretok::Word(indiv) => unsafe { word_m_avx512(b, base, indiv, c) },
@@ -1696,21 +1812,21 @@ pub fn block_m(kind: Pretok, b: &[u8], base: usize, c: &mut Carry) -> (u64, u64)
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn word_m_neon(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = unsafe { word_block::<Neon>(b, b.len(), base, indiv, c.flags, &mut c.slow) };
+    let (s, bad, nf, _) = unsafe { word_block::<Neon, 2>(b, b.len(), base, indiv, c.flags, &mut c.slow) };
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn generic_m_neon(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = unsafe { generic_block::<Neon>(b, b.len(), base, max_digits, c.flags, &mut c.slow) };
+    let (s, bad, nf, _) = unsafe { generic_block::<Neon, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow) };
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn camel_m_neon(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = unsafe { camel_block::<Neon>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow) };
+    let (s, bad, nf, _) = unsafe { camel_block::<Neon, 2, { u32::MAX }>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow) };
     c.flags = nf;
     (s, bad)
 }
@@ -1718,21 +1834,21 @@ fn camel_m_neon(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn word_m_avx512(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = word_block::<Avx512>(b, b.len(), base, indiv, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = word_block::<Avx512, 2>(b, b.len(), base, indiv, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn generic_m_avx512(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = generic_block::<Avx512>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = generic_block::<Avx512, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn camel_m_avx512(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = camel_block::<Avx512>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = camel_block::<Avx512, 2, { u32::MAX }>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
@@ -1740,21 +1856,21 @@ unsafe fn camel_m_avx512(b: &[u8], base: usize, contractions: bool, max_digits: 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn word_m_avx2(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = word_block::<Avx2>(b, b.len(), base, indiv, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = word_block::<Avx2, 2>(b, b.len(), base, indiv, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn generic_m_avx2(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = generic_block::<Avx2>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = generic_block::<Avx2, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn camel_m_avx2(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = camel_block::<Avx2>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = camel_block::<Avx2, 2, { u32::MAX }>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
@@ -1762,21 +1878,21 @@ unsafe fn camel_m_avx2(b: &[u8], base: usize, contractions: bool, max_digits: u3
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn word_m_sse2(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = word_block::<Sse2>(b, b.len(), base, indiv, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = word_block::<Sse2, 2>(b, b.len(), base, indiv, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn generic_m_sse2(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = generic_block::<Sse2>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = generic_block::<Sse2, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 unsafe fn camel_m_sse2(b: &[u8], base: usize, contractions: bool, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = camel_block::<Sse2>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow);
+    let (s, bad, nf, _) = camel_block::<Sse2, 2, { u32::MAX }>(b, b.len(), base, contractions, max_digits, c.flags, &mut c.slow);
     c.flags = nf;
     (s, bad)
 }
@@ -1890,7 +2006,7 @@ pub fn chunks_batched(kind: Pretok, b: &[u8], start: usize, stop: usize, fb: imp
             chunks_batched_with::<Avx2>(kind, b, start, stop, fb)
         }
         match x86_tier() {
-            3 => unsafe { run512(kind, b, start, stop, fb) },
+            3 | 4 => unsafe { run512(kind, b, start, stop, fb) },
             2 => unsafe { run256(kind, b, start, stop, fb) },
             _ => unsafe { chunks_batched_with::<Sse2>(kind, b, start, stop, fb) },
         }
@@ -1964,6 +2080,136 @@ fn validate_dirty_span(b: &[u8], lo: usize, hi: usize) -> bool {
     simdutf8::basic::from_utf8(&b[lo..hi]).is_ok()
 }
 
+/// Result of the outlined `bad != 0` block handler.
+enum BadOutcome {
+    Advance64,
+    Realigned,
+    Full,
+}
+
+/// Out-of-line handler for blocks with `bad != 0` (non-ASCII runs, multi-block
+/// whitespace indentation, or digit-alignment boundaries). Kept out of `fill_loop`
+/// so LLVM allocates the entire hot clean-block path in registers with minimal
+/// stack spilling.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_bad_body<S: Simd>(
+    scan: &mut Scan,
+    kind: Pretok,
+    b: &[u8],
+    stop: usize,
+    lim: usize,
+    op: *mut u32,
+    limit: usize,
+    pos: &mut usize,
+    base: &mut usize,
+    flags: &mut u32,
+    k: &mut usize,
+    trusted: u64,
+    bad: u64,
+) -> BadOutcome {
+    loop {
+        if *pos >= lim {
+            if *pos > lim && scan.dirty_lo_p1 == 0 {
+                scan.dirty_lo_p1 = lim + 1;
+            }
+            *base = *pos;
+            *flags = F_FORCED0;
+            return BadOutcome::Realigned;
+        }
+        let above = if *pos < *base {
+            u64::MAX
+        } else {
+            u64::MAX.checked_shl((*pos - *base + 1) as u32).unwrap_or(0)
+        };
+        let cand = trusted & above;
+        let badm = bad & above;
+        if badm == 0 {
+            if cand != 0 {
+                *k = S::extract_ends(cand, *base, op, *k);
+                *pos = *base + 63 - cand.leading_zeros() as usize;
+            }
+            if lim == stop && *pos < stop {
+                *op.add(*k) = stop as u32;
+                *k += 1;
+                *pos = stop;
+            }
+            return BadOutcome::Advance64;
+        }
+        // Extract all clean chunks strictly before the first bad bit via SIMD.
+        let fb = badm.trailing_zeros();
+        let clean_pre = cand & ((1u64 << fb) - 1);
+        if clean_pre != 0 {
+            *k = S::extract_ends(clean_pre, *base, op, *k);
+            *pos = *base + 63 - clean_pre.leading_zeros() as usize;
+        }
+        let end = next_chunk_end(kind, b, *pos);
+        *op.add(*k) = end as u32;
+        *k += 1;
+        *pos = end;
+        if *k >= limit + SCAN_SLACK - 1 {
+            if *pos > lim && scan.dirty_lo_p1 == 0 {
+                scan.dirty_lo_p1 = lim + 1;
+            }
+            scan.pos = *pos;
+            scan.base = *pos;
+            scan.carry.flags = F_FORCED0;
+            return BadOutcome::Full;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_bad_neon(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, lim: usize, op: *mut u32, limit: usize, pos: &mut usize, base: &mut usize, flags: &mut u32, k: &mut usize, trusted: u64, bad: u64) -> BadOutcome {
+    fill_bad_body::<Neon>(scan, kind, b, stop, lim, op, limit, pos, base, flags, k, trusted, bad)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_bad_avx512_vbmi2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, lim: usize, op: *mut u32, limit: usize, pos: &mut usize, base: &mut usize, flags: &mut u32, k: &mut usize, trusted: u64, bad: u64) -> BadOutcome {
+    fill_bad_body::<Avx512Vbmi2>(scan, kind, b, stop, lim, op, limit, pos, base, flags, k, trusted, bad)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_bad_avx512(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, lim: usize, op: *mut u32, limit: usize, pos: &mut usize, base: &mut usize, flags: &mut u32, k: &mut usize, trusted: u64, bad: u64) -> BadOutcome {
+    fill_bad_body::<Avx512>(scan, kind, b, stop, lim, op, limit, pos, base, flags, k, trusted, bad)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_bad_avx2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, lim: usize, op: *mut u32, limit: usize, pos: &mut usize, base: &mut usize, flags: &mut u32, k: &mut usize, trusted: u64, bad: u64) -> BadOutcome {
+    fill_bad_body::<Avx2>(scan, kind, b, stop, lim, op, limit, pos, base, flags, k, trusted, bad)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_bad_sse2(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, lim: usize, op: *mut u32, limit: usize, pos: &mut usize, base: &mut usize, flags: &mut u32, k: &mut usize, trusted: u64, bad: u64) -> BadOutcome {
+    fill_bad_body::<Sse2>(scan, kind, b, stop, lim, op, limit, pos, base, flags, k, trusted, bad)
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_bad_scalar(scan: &mut Scan, kind: Pretok, b: &[u8], stop: usize, lim: usize, op: *mut u32, limit: usize, pos: &mut usize, base: &mut usize, flags: &mut u32, k: &mut usize, trusted: u64, bad: u64) -> BadOutcome {
+    fill_bad_body::<Scalar>(scan, kind, b, stop, lim, op, limit, pos, base, flags, k, trusted, bad)
+}
+
 /// Grammar-specialized inner loop for `Scan::fill` / `Scan::fill_in`. Because
 /// `step` is monomorphized per `(Simd, Pretok)`, the fast rules + SIMD
 /// classifier inline directly into the loop with `Carry` kept in registers.
@@ -1979,6 +2225,22 @@ fn validate_dirty_span(b: &[u8], lo: usize, hi: usize) -> bool {
 /// contiguous run of unvalidated blocks `[dirty_lo..base)` also starts and ends
 /// on exact UTF-8 boundaries and can be validated surgically (typically 64B)
 /// without re-scanning the surrounding clean document!
+type BadHandler = unsafe fn(
+    &mut Scan,
+    Pretok,
+    &[u8],
+    usize,
+    usize,
+    *mut u32,
+    usize,
+    &mut usize,
+    &mut usize,
+    &mut u32,
+    &mut usize,
+    u64,
+    u64,
+) -> BadOutcome;
+
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn fill_loop<S: Simd>(
@@ -1991,10 +2253,10 @@ unsafe fn fill_loop<S: Simd>(
     mut k: usize,
     limit: usize,
     mut step: impl FnMut(&[u8], usize, usize, u32, &mut SlowCarry) -> (u64, u64, u32, bool),
+    handle_bad: BadHandler,
 ) -> usize {
     let b = &avail[..doc_len];
     let (mut pos, mut base, mut flags) = (scan.pos, scan.base, scan.carry.flags);
-    let slow = &mut scan.carry.slow;
     let op = out.as_mut_ptr();
     while pos < stop && k < limit {
         if base + 64 <= pos {
@@ -2004,7 +2266,7 @@ unsafe fn fill_loop<S: Simd>(
             base = pos;
             flags = F_FORCED0;
         }
-        let (starts, bad, next_flags, utf8_ok) = step(avail, doc_len, base, flags, slow);
+        let (starts, bad, next_flags, utf8_ok) = step(avail, doc_len, base, flags, &mut scan.carry.slow);
         if !utf8_ok {
             if scan.dirty_lo_p1 == 0 {
                 scan.dirty_lo_p1 = base + 1;
@@ -2032,55 +2294,10 @@ unsafe fn fill_loop<S: Simd>(
                 pos = stop;
             }
         } else {
-            let mut realigned = false;
-            loop {
-                if pos >= lim {
-                    if pos > lim && scan.dirty_lo_p1 == 0 {
-                        scan.dirty_lo_p1 = lim + 1;
-                    }
-                    base = pos;
-                    flags = F_FORCED0;
-                    realigned = true;
-                    break;
-                }
-                let above = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
-                let cand = trusted & above;
-                let badm = bad & above;
-                if badm == 0 {
-                    if cand != 0 {
-                        k = S::extract_ends(cand, base, op, k);
-                        pos = base + 63 - cand.leading_zeros() as usize;
-                    }
-                    if lim == stop && pos < stop {
-                        *op.add(k) = stop as u32;
-                        k += 1;
-                        pos = stop;
-                    }
-                    break;
-                }
-                // Extract all clean chunks strictly before the first bad bit via SIMD.
-                let fb = badm.trailing_zeros();
-                let clean_pre = cand & ((1u64 << fb) - 1);
-                if clean_pre != 0 {
-                    k = S::extract_ends(clean_pre, base, op, k);
-                    pos = base + 63 - clean_pre.leading_zeros() as usize;
-                }
-                let end = next_chunk_end(kind, b, pos);
-                *op.add(k) = end as u32;
-                k += 1;
-                pos = end;
-                if k >= limit + SCAN_SLACK - 1 {
-                    if pos > lim && scan.dirty_lo_p1 == 0 {
-                        scan.dirty_lo_p1 = lim + 1;
-                    }
-                    scan.pos = pos;
-                    scan.base = pos;
-                    scan.carry.flags = F_FORCED0;
-                    return k;
-                }
-            }
-            if realigned {
-                continue;
+            match handle_bad(scan, kind, b, stop, lim, op, limit, &mut pos, &mut base, &mut flags, &mut k, trusted, bad) {
+                BadOutcome::Advance64 => {}
+                BadOutcome::Realigned => continue,
+                BadOutcome::Full => return k,
             }
         }
         base += 64;
@@ -2094,77 +2311,96 @@ unsafe fn fill_loop<S: Simd>(
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn fill_word_neon(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Neon>(a, dl, base, indiv, f, s)) }
+fn fill_word_neon<const I_MODE: u8>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
+    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Neon, I_MODE>(a, dl, base, indiv, f, s), handle_bad_neon) }
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn fill_generic_neon(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Neon>(a, dl, base, max_digits, f, s)) }
+fn fill_generic_neon<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Neon, K>(a, dl, base, max_digits, f, s), handle_bad_neon) }
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn fill_camel_neon(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Neon>(a, dl, base, contractions, max_digits, f, s)) }
+fn fill_camel_neon<const C_MODE: u8, const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Neon, C_MODE, K>(a, dl, base, contractions, max_digits, f, s), handle_bad_neon) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_word_avx512_vbmi2<const I_MODE: u8>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512Vbmi2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Avx512Vbmi2, I_MODE>(a, dl, base, indiv, f, s), handle_bad_avx512_vbmi2)
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_generic_avx512_vbmi2<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512Vbmi2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512Vbmi2, K>(a, dl, base, max_digits, f, s), handle_bad_avx512_vbmi2)
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,lzcnt,popcnt")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_camel_avx512_vbmi2<const C_MODE: u8, const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512Vbmi2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Avx512Vbmi2, C_MODE, K>(a, dl, base, contractions, max_digits, f, s), handle_bad_avx512_vbmi2)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_word_avx512(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Avx512>(a, dl, base, indiv, f, s))
+unsafe fn fill_word_avx512<const I_MODE: u8>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Avx512, I_MODE>(a, dl, base, indiv, f, s), handle_bad_avx512)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_generic_avx512(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512>(a, dl, base, max_digits, f, s))
+unsafe fn fill_generic_avx512<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512, K>(a, dl, base, max_digits, f, s), handle_bad_avx512)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_camel_avx512(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Avx512>(a, dl, base, contractions, max_digits, f, s))
+unsafe fn fill_camel_avx512<const C_MODE: u8, const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Avx512, C_MODE, K>(a, dl, base, contractions, max_digits, f, s), handle_bad_avx512)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_word_avx2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Avx2>(a, dl, base, indiv, f, s))
+unsafe fn fill_word_avx2<const I_MODE: u8>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Avx2, I_MODE>(a, dl, base, indiv, f, s), handle_bad_avx2)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_generic_avx2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx2>(a, dl, base, max_digits, f, s))
+unsafe fn fill_generic_avx2<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx2, K>(a, dl, base, max_digits, f, s), handle_bad_avx2)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_camel_avx2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Avx2>(a, dl, base, contractions, max_digits, f, s))
+unsafe fn fill_camel_avx2<const C_MODE: u8, const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Avx2, C_MODE, K>(a, dl, base, contractions, max_digits, f, s), handle_bad_avx2)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn fill_word_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, indiv: bool, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Sse2>(a, dl, base, indiv, f, s))
+    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Sse2, 2>(a, dl, base, indiv, f, s), handle_bad_sse2)
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn fill_generic_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Sse2>(a, dl, base, max_digits, f, s))
+    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Sse2, { u32::MAX }>(a, dl, base, max_digits, f, s), handle_bad_sse2)
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn fill_camel_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, contractions: bool, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Sse2>(a, dl, base, contractions, max_digits, f, s))
+    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Sse2, 2, { u32::MAX }>(a, dl, base, contractions, max_digits, f, s), handle_bad_sse2)
 }
 
 impl Scan {
@@ -2226,21 +2462,42 @@ impl Scan {
         debug_assert!(stop <= doc_len && doc_len <= avail.len());
         #[cfg(target_arch = "aarch64")]
         return match kind {
-            Pretok::Word(indiv) => fill_word_neon(self, kind, avail, doc_len, stop, indiv, out, k, limit),
-            Pretok::Generic { max_digits, .. } => fill_generic_neon(self, kind, avail, doc_len, stop, max_digits, out, k, limit),
-            Pretok::CamelCase { contractions, max_digits } => fill_camel_neon(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit),
+            Pretok::Word(false) => fill_word_neon::<0>(self, kind, avail, doc_len, stop, false, out, k, limit),
+            Pretok::Word(true) => fill_word_neon::<1>(self, kind, avail, doc_len, stop, true, out, k, limit),
+            Pretok::Generic { max_digits: 3, .. } => fill_generic_neon::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit),
+            Pretok::Generic { max_digits: 1, .. } => fill_generic_neon::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit),
+            Pretok::Generic { max_digits, .. } => fill_generic_neon::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit),
+            Pretok::CamelCase { contractions: true, max_digits: 3 } => fill_camel_neon::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit),
+            Pretok::CamelCase { contractions, max_digits } => fill_camel_neon::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit),
         };
         #[cfg(target_arch = "x86_64")]
         return match x86_tier() {
+            4 => match kind {
+                Pretok::Word(false) => unsafe { fill_word_avx512_vbmi2::<0>(self, kind, avail, doc_len, stop, false, out, k, limit) },
+                Pretok::Word(true) => unsafe { fill_word_avx512_vbmi2::<1>(self, kind, avail, doc_len, stop, true, out, k, limit) },
+                Pretok::Generic { max_digits: 3, .. } => unsafe { fill_generic_avx512_vbmi2::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
+                Pretok::Generic { max_digits: 1, .. } => unsafe { fill_generic_avx512_vbmi2::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx512_vbmi2::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::CamelCase { contractions: true, max_digits: 3 } => unsafe { fill_camel_avx512_vbmi2::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit) },
+                Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx512_vbmi2::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
+            },
             3 => match kind {
-                Pretok::Word(indiv) => unsafe { fill_word_avx512(self, kind, avail, doc_len, stop, indiv, out, k, limit) },
-                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx512(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
-                Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx512(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
+                Pretok::Word(false) => unsafe { fill_word_avx512::<0>(self, kind, avail, doc_len, stop, false, out, k, limit) },
+                Pretok::Word(true) => unsafe { fill_word_avx512::<1>(self, kind, avail, doc_len, stop, true, out, k, limit) },
+                Pretok::Generic { max_digits: 3, .. } => unsafe { fill_generic_avx512::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
+                Pretok::Generic { max_digits: 1, .. } => unsafe { fill_generic_avx512::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx512::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::CamelCase { contractions: true, max_digits: 3 } => unsafe { fill_camel_avx512::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit) },
+                Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx512::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
             },
             2 => match kind {
-                Pretok::Word(indiv) => unsafe { fill_word_avx2(self, kind, avail, doc_len, stop, indiv, out, k, limit) },
-                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx2(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
-                Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx2(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
+                Pretok::Word(false) => unsafe { fill_word_avx2::<0>(self, kind, avail, doc_len, stop, false, out, k, limit) },
+                Pretok::Word(true) => unsafe { fill_word_avx2::<1>(self, kind, avail, doc_len, stop, true, out, k, limit) },
+                Pretok::Generic { max_digits: 3, .. } => unsafe { fill_generic_avx2::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
+                Pretok::Generic { max_digits: 1, .. } => unsafe { fill_generic_avx2::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx2::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::CamelCase { contractions: true, max_digits: 3 } => unsafe { fill_camel_avx2::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit) },
+                Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx2::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
             },
             _ => match kind {
                 Pretok::Word(indiv) => unsafe { fill_word_sse2(self, kind, avail, doc_len, stop, indiv, out, k, limit) },
@@ -2250,9 +2507,9 @@ impl Scan {
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         match kind {
-            Pretok::Word(indiv) => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Scalar>(a, dl, base, indiv, f, s)) },
-            Pretok::Generic { max_digits, .. } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Scalar>(a, dl, base, max_digits, f, s)) },
-            Pretok::CamelCase { contractions, max_digits } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Scalar>(a, dl, base, contractions, max_digits, f, s)) },
+            Pretok::Word(indiv) => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Scalar, 2>(a, dl, base, indiv, f, s), handle_bad_scalar) },
+            Pretok::Generic { max_digits, .. } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Scalar, { u32::MAX }>(a, dl, base, max_digits, f, s), handle_bad_scalar) },
+            Pretok::CamelCase { contractions, max_digits } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Scalar, 2, { u32::MAX }>(a, dl, base, contractions, max_digits, f, s), handle_bad_scalar) },
         }
     }
 }

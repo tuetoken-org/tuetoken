@@ -18,7 +18,7 @@ out = tok.apply_chat_template(messages, add_generation_prompt=True)   # {"input_
 
 Detection is 100% config-driven (the model's `tokenizer.json`, never its name), so
 the same code works across families: Llama, Qwen, Mistral/Mixtral, DeepSeek, Gemma,
-Phi, GPT-OSS, GLM, Kimi, and more.
+Phi, GPT-OSS, GLM, Kimi, Whisper, and more.
 
 ## Install
 
@@ -46,6 +46,8 @@ maturin develop --release
 | Batch of documents to `list[list[int]]` | 5-6x | 10-13x |
 | Decode (p50) | 2x | 7x |
 | `AutoTokenizer`: `tok(texts)` / chat template | | 12x / 8.6x |
+| Whisper (`whisper-large-v3-turbo`, M4 Max): encode batch / padded `np` | | **31-46x** / **180x** |
+| Whisper (`whisper-large-v3-turbo`, M4 Max): decode / `decode_with_timestamps` | | **32-51x** / **151x** |
 
 Token ids are identical across all three libraries. Every number uses text the
 tokenizer has not seen before, and corpus runs start a fresh process (no warm
@@ -75,7 +77,38 @@ tok.bos_token_id ; tok.eos_token ; tok.pad_token_id ; tok.vocab_size
 ```
 
 This matches `transformers.AutoTokenizer` token-for-token across byte-level models
-(Llama, Qwen, DeepSeek, …) and SentencePiece models (Mistral, Phi-3, CodeLlama, …).
+(Llama, Qwen, DeepSeek, …), SentencePiece models (Mistral, Phi-3, CodeLlama, …),
+and OpenAI Whisper models (`whisper-tiny` through `whisper-large-v3-turbo`,
+`distil-whisper`, and legacy `vocab.json`+`merges.txt` checkpoints).
+
+### Whisper ASR tokenization
+
+Whisper models ship 1,609 `<|...|>` added tokens (languages, tasks, and 1,501
+timestamp tokens `<|0.00|>`..`<|30.00|>`). tuetoken accelerates both encoding
+(SIMD `<|` prefilter bypassing Aho-Corasick on plain text + SIMD BPE) and
+decoding (all-Rust special-token filtering, `<|startofprev|>` prompt stripping,
+and multi-segment `decode_with_timestamps=True` rollover accumulation), with
+full `WhisperTokenizerFast` parity (`set_prefix_tokens`, `prefix_tokens`,
+`get_decoder_prompt_ids`, `get_prompt_ids`, `timestamp_ids`, `output_offsets`,
+`normalize`, `basic_normalize`):
+
+```python
+from tuetoken import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("openai/whisper-large-v3-turbo", language="spanish", task="transcribe")
+batch = tok(utterances, padding=True, return_tensors="np")
+texts = tok.batch_decode(token_ids, skip_special_tokens=True, decode_with_timestamps=True)
+```
+
+| `openai/whisper-large-v3-turbo` | Apple M4 Max (vs 🤗 `WhisperTokenizerFast`) | Ubuntu Zen 4 x86_64 (vs bare 🤗 `tokenizers` Rust) |
+|---|---:|---:|
+| Encode 1K utterances (batch) | **31.4x** (0.43 ms vs 13.57 ms) | **37.8x** (0.44 ms vs 16.79 ms) |
+| Encode 1K timestamped utterances (batch) | **41.4x** (0.62 ms vs 25.73 ms) | **44.9x** (0.67 ms vs 30.28 ms) |
+| Encode 10K utterances (padded `np`, 1 MB) | **180.1x** (1.21 ms vs 217.23 ms) | **61.7x** (2.47 ms vs 152.52 ms) |
+| Encode single long transcript (102 KB) | **74.1x** (0.19 ms vs 14.23 ms) | **100.0x** (0.21 ms vs 21.07 ms) |
+| Decode 1K sequences (`skip_special_tokens=True`) | **32.0x** (0.36 ms vs 11.43 ms) | **9.2x** (0.40 ms vs 3.71 ms) |
+| Decode 1K sequences (`decode_with_timestamps=True`) | **151.3x** (0.42 ms vs 64.01 ms) | **7.8x** (0.56 ms vs 4.37 ms) |
+| Decode 10K sequences (`skip_special_tokens=True`) | **51.2x** (1.39 ms vs 71.32 ms) | **9.5x** (2.28 ms vs 21.75 ms) |
 
 ## OpenAI / tiktoken encodings
 
@@ -138,8 +171,8 @@ of up to a quarter of that): `enc.set_cache_limit_mb(512)`, `enc.cache_limit_mb`
 
 ## Coverage
 
-tuetoken works with essentially every modern LLM tokenizer: ByteLevel BPE (Llama,
-Qwen, DeepSeek, Mistral/Mixtral, GPT-OSS, GLM, Phi, OLMo, Yi, …), SentencePiece
+tuetoken works with essentially every modern LLM and ASR BPE tokenizer: ByteLevel BPE (Llama,
+Qwen, DeepSeek, Mistral/Mixtral, GPT-OSS, GLM, Phi, OLMo, Yi, Whisper, …), SentencePiece
 (Llama-2, Mistral, Phi-3, CodeLlama, Gemma, …), and OpenAI/tiktoken encodings. We
 extend coverage constantly; if a tokenizer you need isn't supported yet, please open
 an issue.
