@@ -1260,11 +1260,11 @@ macro_rules! merge_bytes_ll_body {
             active &= !((1u64 << r) | (1u64 << bi) | lmask);
             let mlr = $map.lr_bits_unchecked(merged);
             *lr.add(bi) = mlr;
-            if mlr != 0 {
+            let (rl, rr_val) = if mlr != 0 {
                 // Sentinel lr[MAX_SMALL] == 0 (when bi == 0) and lr[n] == 0 (when rr == n).
                 let do_l = ((mlr >> 1) & *lr.add(l) & 1) != 0;
                 let do_r = (mlr & (*lr.add(rr) >> 1) & 1) != 0;
-                let (rl, rr_val) = if do_l && do_r {
+                if do_l && do_r {
                     let tl = *tok.add(l);
                     let tr = *tok.add(rr);
                     if (merged | tl | tr) < DENSE_N {
@@ -1347,41 +1347,55 @@ macro_rules! merge_bytes_ll_body {
                     (u32::MAX, rr_v)
                 } else {
                     (u32::MAX, u32::MAX)
-                };
-                if rl != u32::MAX {
-                    *rnk.add(l) = (rl << 6) | (l as u32);
-                    active |= 1u64 << l;
                 }
-                if rr_val != u32::MAX {
-                    *rnk.add(bi) = (rr_val << 6) | (bi as u32);
-                    active |= 1u64 << bi;
+            } else {
+                (u32::MAX, u32::MAX)
+            };
+            // OOO latency-hiding: reduce untouched `active` BEFORE storing the
+            // newly probed `rnk[l]`/`rnk[bi]`. Zero data dependency on `(rl, rr_val)`
+            // lets the OOO core hide the min-scan behind L2/L3 dense/bloom/bucket
+            // loads, eliminates STLF stalls, and scans 1-2 fewer active bits!
+            let mut m = active;
+            best = if m != 0 {
+                let i0 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let mut b0 = *rnk.add(i0);
+                if m != 0 {
+                    let i1 = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let mut b1 = *rnk.add(i1);
+                    while m != 0 {
+                        let ia = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        b0 = b0.min(*rnk.add(ia));
+                        if m == 0 {
+                            break;
+                        }
+                        let ib = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        b1 = b1.min(*rnk.add(ib));
+                    }
+                    b0.min(b1)
+                } else {
+                    b0
                 }
+            } else {
+                u32::MAX
+            };
+            if rl != u32::MAX {
+                let p = (rl << 6) | (l as u32);
+                *rnk.add(l) = p;
+                active |= 1u64 << l;
+                best = best.min(p);
+            }
+            if rr_val != u32::MAX {
+                let p = (rr_val << 6) | (bi as u32);
+                *rnk.add(bi) = p;
+                active |= 1u64 << bi;
+                best = best.min(p);
             }
             if active == 0 {
                 break;
-            }
-            let mut m = active;
-            let i0 = m.trailing_zeros() as usize;
-            m &= m - 1;
-            let mut b0 = *rnk.add(i0);
-            if m != 0 {
-                let i1 = m.trailing_zeros() as usize;
-                m &= m - 1;
-                let mut b1 = *rnk.add(i1);
-                while m != 0 {
-                    let ia = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    b0 = b0.min(*rnk.add(ia));
-                    if m == 0 {
-                        break;
-                    }
-                    let ib = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    b1 = b1.min(*rnk.add(ib));
-                }
-                best = b0.min(b1);
-            } else {
-                best = b0;
             }
         }
         $out.reserve(n);
