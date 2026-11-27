@@ -3852,7 +3852,7 @@ impl Tokenizer {
         mut a: usize,
         mut out: *mut std::mem::MaybeUninit<PipeRec>,
         view: chunk_table::View<'_, 3>,
-        lview: chunk_table::LongView<'_>,
+        lview: &chunk_table::LongView<'_>,
     ) -> usize {
         let n = bytes.len();
         let bp = bytes.as_ptr();
@@ -3869,14 +3869,14 @@ impl Tokenizer {
                 chunk_table::prefetch(p as *const u8);
                 (*out).write(PipeRec { lo: klo, hi: khi, p });
             } else {
-                let v = Self::fill_rec_long(bytes, a, len, lview);
+                let v = Self::fill_rec_long(bytes, a, len, *lview);
                 (*out).write(v);
             }
             out = out.add(1);
             a = e;
         }
         if j < ends.len() {
-            return Self::fill_recs_tail(bytes, ends.get_unchecked(j..), a, out, view, lview);
+            return Self::fill_recs_tail(bytes, ends.get_unchecked(j..), a, out, view, *lview);
         }
         a
     }
@@ -3902,10 +3902,10 @@ impl Tokenizer {
         #[cfg(target_arch = "x86_64")]
         {
             if has_avx2_bmi1() {
-                return unsafe { Self::fill_recs_bmi2(bytes, sl, a, out, view, lview) };
+                return unsafe { Self::fill_recs_bmi2(bytes, sl, a, out, view, &lview) };
             }
         }
-        Self::fill_recs_generic(bytes, sl, a, out, view, lview)
+        Self::fill_recs_generic(bytes, sl, a, out, view, &lview)
     }
 
     #[inline(never)]
@@ -3915,7 +3915,7 @@ impl Tokenizer {
         mut a: usize,
         mut out: *mut std::mem::MaybeUninit<PipeRec>,
         view: chunk_table::View<'_, 3>,
-        lview: chunk_table::LongView<'_>,
+        lview: &chunk_table::LongView<'_>,
     ) -> usize {
         let n = bytes.len();
         let bp = bytes.as_ptr();
@@ -3932,14 +3932,14 @@ impl Tokenizer {
                 chunk_table::prefetch(p as *const u8);
                 unsafe { (*out).write(PipeRec { lo: klo, hi: khi, p }) };
             } else {
-                let v = Self::fill_rec_long(bytes, a, len, lview);
+                let v = Self::fill_rec_long(bytes, a, len, *lview);
                 unsafe { (*out).write(v) };
             }
             out = unsafe { out.add(1) };
             a = e;
         }
         if j < ends.len() {
-            return Self::fill_recs_tail(bytes, &ends[j..], a, out, view, lview);
+            return Self::fill_recs_tail(bytes, &ends[j..], a, out, view, *lview);
         }
         a
     }

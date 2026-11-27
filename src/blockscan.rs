@@ -289,23 +289,56 @@ impl Simd for Neon {
         let k = |c: u8| vdupq_n_u8(c);
         let c3 = Self::tomask(x.map(|v| vceqq_u8(v, k(0xC3)))) & (valid >> 1);
         let c3_pair = c3 | (c3 << 1);
-        if m.na != c3_pair || (c3 & (c3 << 1)) != 0 {
+        if m.na == c3_pair {
+            if (c3 & (c3 << 1)) != 0 {
+                return (0, 0, false);
+            }
+            let foll = c3 << 1;
+            if (Self::tomask(x.map(|v| vcgtq_u8(v, k(0xBF)))) & foll) != 0 {
+                return (0, 0, false);
+            }
+            let md = Self::tomask(x.map(|v| vorrq_u8(vceqq_u8(v, k(0x97)), vceqq_u8(v, k(0xB7))))) & foll;
+            let punct = md | (md >> 1);
+            let letters = c3_pair & !punct;
+            let up_f = Self::tomask(x.map(|v| vcleq_u8(v, k(0x9E)))) & foll & !md;
+            let upper = up_f | (up_f >> 1);
+            m.l |= letters;
+            m.up |= upper;
+            m.na = 0;
+            return (foll, punct, true);
+        }
+        // Also resolve 3-byte UTF-8 typographic punctuation `E2 80 (90..=A7 | B0..=BE)`
+        // (em/en dashes, curly quotes, ellipsis, bullets — >75% of English non-ASCII).
+        let e2 = Self::tomask(x.map(|v| vceqq_u8(v, k(0xE2)))) & (valid >> 2);
+        let b80 = Self::tomask(x.map(|v| vceqq_u8(v, k(0x80))));
+        let d_ok = Self::tomask(x.map(|v| {
+            vorrq_u8(
+                vcltq_u8(vsubq_u8(v, k(0x90)), k(24)),
+                vcltq_u8(vsubq_u8(v, k(0xB0)), k(15)),
+            )
+        }));
+        let e2_ok = e2 & (b80 >> 1) & (d_ok >> 2);
+        let e2_span = e2_ok | (e2_ok << 1) | (e2_ok << 2);
+        if (c3_pair & e2_span) != 0 || m.na != (c3_pair | e2_span) || (c3 & (c3 << 1)) != 0 {
             return (0, 0, false);
         }
         let foll = c3 << 1;
-        // Every follower byte is already >= 0x80 (since m.na == c3_pair); require <= 0xBF for valid UTF-8.
-        if (Self::tomask(x.map(|v| vcgtq_u8(v, k(0xBF)))) & foll) != 0 {
-            return (0, 0, false);
+        if foll != 0 {
+            if (Self::tomask(x.map(|v| vcgtq_u8(v, k(0xBF)))) & foll) != 0 {
+                return (0, 0, false);
+            }
+            let md = Self::tomask(x.map(|v| vorrq_u8(vceqq_u8(v, k(0x97)), vceqq_u8(v, k(0xB7))))) & foll;
+            let c3_punct = md | (md >> 1);
+            let letters = c3_pair & !c3_punct;
+            let up_f = Self::tomask(x.map(|v| vcleq_u8(v, k(0x9E)))) & foll & !md;
+            let upper = up_f | (up_f >> 1);
+            m.l |= letters;
+            m.up |= upper;
+            m.na = 0;
+            return (foll | (e2_ok << 1) | (e2_ok << 2), c3_punct | e2_span, true);
         }
-        let md = Self::tomask(x.map(|v| vorrq_u8(vceqq_u8(v, k(0x97)), vceqq_u8(v, k(0xB7))))) & foll;
-        let punct = md | (md >> 1);
-        let letters = c3_pair & !punct;
-        let up_f = Self::tomask(x.map(|v| vcleq_u8(v, k(0x9E)))) & foll & !md;
-        let upper = up_f | (up_f >> 1);
-        m.l |= letters;
-        m.up |= upper;
         m.na = 0;
-        (foll, punct, true)
+        ((e2_ok << 1) | (e2_ok << 2), e2_span, true)
     }
 }
 
@@ -468,27 +501,65 @@ impl Simd for Avx2 {
         };
         let c3 = tomask(_mm256_cmpeq_epi8(x0, k(0xC3)), _mm256_cmpeq_epi8(x1, k(0xC3))) & (valid >> 1);
         let c3_pair = c3 | (c3 << 1);
-        if m.na != c3_pair || (c3 & (c3 << 1)) != 0 {
+        if m.na == c3_pair {
+            if (c3 & (c3 << 1)) != 0 {
+                return (0, 0, false);
+            }
+            let foll = c3 << 1;
+            let kbf = k(0xBF);
+            if (tomask(_mm256_cmpgt_epi8(x0, kbf), _mm256_cmpgt_epi8(x1, kbf)) & foll) != 0 {
+                return (0, 0, false);
+            }
+            let md = tomask(
+                _mm256_or_si256(_mm256_cmpeq_epi8(x0, k(0x97)), _mm256_cmpeq_epi8(x0, k(0xB7))),
+                _mm256_or_si256(_mm256_cmpeq_epi8(x1, k(0x97)), _mm256_cmpeq_epi8(x1, k(0xB7))),
+            ) & foll;
+            let punct = md | (md >> 1);
+            let letters = c3_pair & !punct;
+            let k9f = k(0x9F);
+            let up_f = tomask(_mm256_cmpgt_epi8(k9f, x0), _mm256_cmpgt_epi8(k9f, x1)) & foll & !md;
+            let upper = up_f | (up_f >> 1);
+            m.l |= letters;
+            m.up |= upper;
+            m.na = 0;
+            return (foll, punct, true);
+        }
+        let e2 = tomask(_mm256_cmpeq_epi8(x0, k(0xE2)), _mm256_cmpeq_epi8(x1, k(0xE2))) & (valid >> 2);
+        let b80 = tomask(_mm256_cmpeq_epi8(x0, k(0x80)), _mm256_cmpeq_epi8(x1, k(0x80)));
+        // Signed i8: 0x90..=0xA7 is -112..=-89; 0xB0..=0xBE is -80..=-66.
+        let r_e2 = |v: __m256i| {
+            let r1 = _mm256_and_si256(_mm256_cmpgt_epi8(v, k(0x8F)), _mm256_cmpgt_epi8(k(0xA8), v));
+            let r2 = _mm256_and_si256(_mm256_cmpgt_epi8(v, k(0xAF)), _mm256_cmpgt_epi8(k(0xBF), v));
+            _mm256_or_si256(r1, r2)
+        };
+        let d_ok = tomask(r_e2(x0), r_e2(x1));
+        let e2_ok = e2 & (b80 >> 1) & (d_ok >> 2);
+        let e2_span = e2_ok | (e2_ok << 1) | (e2_ok << 2);
+        if (c3_pair & e2_span) != 0 || m.na != (c3_pair | e2_span) || (c3 & (c3 << 1)) != 0 {
             return (0, 0, false);
         }
         let foll = c3 << 1;
-        let kbf = k(0xBF);
-        if (tomask(_mm256_cmpgt_epi8(x0, kbf), _mm256_cmpgt_epi8(x1, kbf)) & foll) != 0 {
-            return (0, 0, false);
+        if foll != 0 {
+            let kbf = k(0xBF);
+            if (tomask(_mm256_cmpgt_epi8(x0, kbf), _mm256_cmpgt_epi8(x1, kbf)) & foll) != 0 {
+                return (0, 0, false);
+            }
+            let md = tomask(
+                _mm256_or_si256(_mm256_cmpeq_epi8(x0, k(0x97)), _mm256_cmpeq_epi8(x0, k(0xB7))),
+                _mm256_or_si256(_mm256_cmpeq_epi8(x1, k(0x97)), _mm256_cmpeq_epi8(x1, k(0xB7))),
+            ) & foll;
+            let c3_punct = md | (md >> 1);
+            let letters = c3_pair & !c3_punct;
+            let k9f = k(0x9F);
+            let up_f = tomask(_mm256_cmpgt_epi8(k9f, x0), _mm256_cmpgt_epi8(k9f, x1)) & foll & !md;
+            let upper = up_f | (up_f >> 1);
+            m.l |= letters;
+            m.up |= upper;
+            m.na = 0;
+            return (foll | (e2_ok << 1) | (e2_ok << 2), c3_punct | e2_span, true);
         }
-        let md = tomask(
-            _mm256_or_si256(_mm256_cmpeq_epi8(x0, k(0x97)), _mm256_cmpeq_epi8(x0, k(0xB7))),
-            _mm256_or_si256(_mm256_cmpeq_epi8(x1, k(0x97)), _mm256_cmpeq_epi8(x1, k(0xB7))),
-        ) & foll;
-        let punct = md | (md >> 1);
-        let letters = c3_pair & !punct;
-        let k9f = k(0x9F);
-        let up_f = tomask(_mm256_cmpgt_epi8(k9f, x0), _mm256_cmpgt_epi8(k9f, x1)) & foll & !md;
-        let upper = up_f | (up_f >> 1);
-        m.l |= letters;
-        m.up |= upper;
         m.na = 0;
-        (foll, punct, true)
+        ((e2_ok << 1) | (e2_ok << 2), e2_span, true)
     }
 
     #[inline(always)]
@@ -541,22 +612,50 @@ impl Simd for Avx512 {
         let k = |c: u8| _mm512_set1_epi8(c as i8);
         let c3 = _mm512_cmpeq_epi8_mask(v, k(0xC3)) & (valid >> 1);
         let c3_pair = c3 | (c3 << 1);
-        if m.na != c3_pair || (c3 & (c3 << 1)) != 0 {
+        if m.na == c3_pair {
+            if (c3 & (c3 << 1)) != 0 {
+                return (0, 0, false);
+            }
+            let foll = c3 << 1;
+            if (_mm512_cmpgt_epu8_mask(v, k(0xBF)) & foll) != 0 {
+                return (0, 0, false);
+            }
+            let md = (_mm512_cmpeq_epi8_mask(v, k(0x97)) | _mm512_cmpeq_epi8_mask(v, k(0xB7))) & foll;
+            let punct = md | (md >> 1);
+            let letters = c3_pair & !punct;
+            let up_f = _mm512_cmple_epu8_mask(v, k(0x9E)) & foll & !md;
+            let upper = up_f | (up_f >> 1);
+            m.l |= letters;
+            m.up |= upper;
+            m.na = 0;
+            return (foll, punct, true);
+        }
+        let e2 = _mm512_cmpeq_epi8_mask(v, k(0xE2)) & (valid >> 2);
+        let b80 = _mm512_cmpeq_epi8_mask(v, k(0x80));
+        let d_ok = _mm512_cmplt_epu8_mask(_mm512_sub_epi8(v, k(0x90)), k(24))
+            | _mm512_cmplt_epu8_mask(_mm512_sub_epi8(v, k(0xB0)), k(15));
+        let e2_ok = e2 & (b80 >> 1) & (d_ok >> 2);
+        let e2_span = e2_ok | (e2_ok << 1) | (e2_ok << 2);
+        if (c3_pair & e2_span) != 0 || m.na != (c3_pair | e2_span) || (c3 & (c3 << 1)) != 0 {
             return (0, 0, false);
         }
         let foll = c3 << 1;
-        if (_mm512_cmpgt_epu8_mask(v, k(0xBF)) & foll) != 0 {
-            return (0, 0, false);
+        if foll != 0 {
+            if (_mm512_cmpgt_epu8_mask(v, k(0xBF)) & foll) != 0 {
+                return (0, 0, false);
+            }
+            let md = (_mm512_cmpeq_epi8_mask(v, k(0x97)) | _mm512_cmpeq_epi8_mask(v, k(0xB7))) & foll;
+            let c3_punct = md | (md >> 1);
+            let letters = c3_pair & !c3_punct;
+            let up_f = _mm512_cmple_epu8_mask(v, k(0x9E)) & foll & !md;
+            let upper = up_f | (up_f >> 1);
+            m.l |= letters;
+            m.up |= upper;
+            m.na = 0;
+            return (foll | (e2_ok << 1) | (e2_ok << 2), c3_punct | e2_span, true);
         }
-        let md = (_mm512_cmpeq_epi8_mask(v, k(0x97)) | _mm512_cmpeq_epi8_mask(v, k(0xB7))) & foll;
-        let punct = md | (md >> 1);
-        let letters = c3_pair & !punct;
-        let up_f = _mm512_cmple_epu8_mask(v, k(0x9E)) & foll & !md;
-        let upper = up_f | (up_f >> 1);
-        m.l |= letters;
-        m.up |= upper;
         m.na = 0;
-        (foll, punct, true)
+        ((e2_ok << 1) | (e2_ok << 2), e2_span, true)
     }
 
     #[inline(always)]
@@ -1178,7 +1277,13 @@ fn generic_fast<const FULL: bool, const K: u32>(
     let o = if FULL { !(m.l | m.d | m.ws) } else { !(m.l | m.d | m.ws) & valid };
     let o_before = p1f(o, flags, 0);
     let ostart = o & !o_before & !p1f(m.sp, flags, 1);
-    let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart, flags, 8)));
+    let ostart_c = if cont != 0 {
+        let a = ostart | ((ostart << 1) & cont);
+        a | ((a << 1) & cont)
+    } else {
+        ostart
+    };
+    let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart_c, flags, 8)));
     let (dstart, dbad) = digit_starts_ascii::<K>(m.d, fbit(flags, F_D), max_digits);
     let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m, o_before, fbit(flags, F_WS));
     let mut starts = ostart | lstart | dstart | wsstart | (((flags >> 14) & 1) as u64);
@@ -1199,8 +1304,14 @@ fn generic_fast<const FULL: bool, const K: u32>(
             }
         }
     }
-    bad |= m.l & o_before & p1f(bad, flags, 18);
-    bad |= (bad << 1) & cont;
+    if cont != 0 {
+        let bad_c = bad | ((bad << 1) & cont);
+        let bad_c = bad_c | ((bad_c << 1) & cont);
+        bad |= m.l & o_before & p1f(bad_c, flags, 18);
+        bad |= ((bad << 1) & cont) | ((bad << 2) & cont & (cont << 1));
+    } else {
+        bad |= m.l & o_before & p1f(bad, flags, 18);
+    }
     if !FULL {
         starts &= valid;
         bad &= valid;
@@ -1210,7 +1321,7 @@ fn generic_fast<const FULL: bool, const K: u32>(
         | top_bit(m.d, 2)
         | top_bit(m.nl, 3)
         | top_bit(m.ws, 4)
-        | top_bit(ostart, 8)
+        | top_bit(ostart_c, 8)
         | (((bad >> 61) as u32) << BAD3_SHIFT);
     Some((starts, bad, out_flags))
 }
@@ -1284,8 +1395,8 @@ unsafe fn generic_block<S: Simd, const K: u32>(avail: &[u8], doc_len: usize, bas
             let mut cont = 0u64;
             let mut ok = true;
             if rm.na != 0 {
-                let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                ok = utf8_ok && rm.na == 0 && punct == 0;
+                let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
+                ok = utf8_ok && rm.na == 0;
                 cont = c;
             }
             if ok {
@@ -1303,8 +1414,8 @@ unsafe fn generic_block<S: Simd, const K: u32>(avail: &[u8], doc_len: usize, bas
         let mut cont = 0u64;
         let mut ok = true;
         if rm.na != 0 {
-            let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            ok = utf8_ok && rm.na == 0 && punct == 0;
+            let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
+            ok = utf8_ok && rm.na == 0;
             cont = c;
         }
         if ok {
@@ -1386,11 +1497,23 @@ fn camel_fast<const FULL: bool, const C_MODE: u8, const K: u32>(
         }
     }
     ostart &= !suppress;
+    let ostart_c = if cont != 0 {
+        let a = ostart | ((ostart << 1) & cont);
+        a | ((a << 1) & cont)
+    } else {
+        ostart
+    };
     let lstart = m.l
-        & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart, flags, 8)) | (m.up & p1f(lw, flags, 6)));
+        & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart_c, flags, 8)) | (m.up & p1f(lw, flags, 6)));
     let mut starts = ((ostart | lstart | dstart | wsstart) & !suppress) | (((flags >> 14) & 1) as u64) | forced_in;
-    bad |= m.l & o_before & p1f(bad, flags, 18);
-    bad |= (bad << 1) & cont;
+    if cont != 0 {
+        let bad_c = bad | ((bad << 1) & cont);
+        let bad_c = bad_c | ((bad_c << 1) & cont);
+        bad |= m.l & o_before & p1f(bad_c, flags, 18);
+        bad |= ((bad << 1) & cont) | ((bad << 2) & cont & (cont << 1));
+    } else {
+        bad |= m.l & o_before & p1f(bad, flags, 18);
+    }
     if !FULL {
         starts &= valid;
         bad &= valid;
@@ -1402,7 +1525,7 @@ fn camel_fast<const FULL: bool, const C_MODE: u8, const K: u32>(
         | top_bit(m.ws, 4)
         | top_bit(m.l, 5)
         | top_bit(lw, 6)
-        | top_bit(ostart, 8)
+        | top_bit(ostart_c, 8)
         | top_bit(abs_nl, 9)
         | top_bit(abs_sl, 10)
         | top_bit(ws_unk, 11)
@@ -1526,8 +1649,8 @@ unsafe fn camel_block<S: Simd, const C_MODE: u8, const K: u32>(avail: &[u8], doc
             let mut cont = 0u64;
             let mut ok = true;
             if rm.na != 0 {
-                let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                ok = utf8_ok && rm.na == 0 && punct == 0;
+                let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
+                ok = utf8_ok && rm.na == 0;
                 cont = c;
             }
             if ok {
@@ -1545,8 +1668,8 @@ unsafe fn camel_block<S: Simd, const C_MODE: u8, const K: u32>(avail: &[u8], doc
         let mut cont = 0u64;
         let mut ok = true;
         if rm.na != 0 {
-            let (c, punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            ok = utf8_ok && rm.na == 0 && punct == 0;
+            let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
+            ok = utf8_ok && rm.na == 0;
             cont = c;
         }
         if ok {
@@ -2283,7 +2406,8 @@ unsafe fn fill_loop<S: Simd>(
         let above0 = if pos < base { u64::MAX } else { u64::MAX.checked_shl((pos - base + 1) as u32).unwrap_or(0) };
         let trusted = starts & !bad & lim_mask & above0;
         let bad = bad & lim_mask;
-        if bad & above0 == 0 {
+        let badm = bad & above0;
+        if badm == 0 {
             k = S::extract_ends(trusted, base, op, k);
             if trusted != 0 {
                 pos = base + 63 - trusted.leading_zeros() as usize;
@@ -2294,6 +2418,20 @@ unsafe fn fill_loop<S: Simd>(
                 pos = stop;
             }
         } else {
+            // Fast in-loop boundary realignment for clean blocks (`utf8_ok`):
+            // every `bad` bit in a fast-path block is a 64B-edge crossing
+            // (trailing indentation, digit run, contraction, or next_na).
+            // Realigning `base = pos` inside the SIMD loop eliminates the
+            // out-of-line `handle_bad` call, `vzeroupper`, and ZMM reloads.
+            let fb = badm.trailing_zeros();
+            let clean_pre = trusted & ((1u64 << fb) - 1);
+            if utf8_ok && (clean_pre & !1) != 0 {
+                k = S::extract_ends(clean_pre, base, op, k);
+                pos = base + 63 - clean_pre.leading_zeros() as usize;
+                base = pos;
+                flags = F_FORCED0;
+                continue;
+            }
             match handle_bad(scan, kind, b, stop, lim, op, limit, &mut pos, &mut base, &mut flags, &mut k, trusted, bad) {
                 BadOutcome::Advance64 => {}
                 BadOutcome::Realigned => continue,
