@@ -1872,7 +1872,18 @@ pub struct Scan {
     pos: usize,
     base: usize,
     carry: Carry,
-    needs_utf8: bool,
+    /// `0` when clean; `lo + 1` when a contiguous unvalidated span starting at
+    /// byte offset `lo` is open. Stored in `Scan` (zero extra registers in
+    /// `fill_loop`) so clean blocks add only a single zero-check.
+    dirty_lo_p1: usize,
+    check_utf8: bool,
+    bad_utf8: bool,
+}
+
+#[cold]
+#[inline(never)]
+fn validate_dirty_span(b: &[u8], lo: usize, hi: usize) -> bool {
+    simdutf8::basic::from_utf8(&b[lo..hi]).is_ok()
 }
 
 /// Grammar-specialized inner loop for `Scan::fill` / `Scan::fill_in`. Because
@@ -1883,6 +1894,13 @@ pub struct Scan {
 /// unmasked 64-byte SIMD loads on document tails in `encode_sep_macro`), while
 /// all grammar rules, look-ahead, and `next_chunk_end` stay strictly within
 /// `avail[..doc_len]` and stop at `stop <= doc_len`.
+///
+/// Exact UTF-8 Boundary Theorem: every `utf8_ok == true` block consists solely
+/// of ASCII bytes and complete in-block `0xC3 (0x80..=0xBF)` pairs, so it
+/// starts and ends on exact UTF-8 character boundaries. Therefore every
+/// contiguous run of unvalidated blocks `[dirty_lo..base)` also starts and ends
+/// on exact UTF-8 boundaries and can be validated surgically (typically 64B)
+/// without re-scanning the surrounding clean document!
 #[inline(always)]
 unsafe fn fill_loop<S: Simd>(
     scan: &mut Scan,
@@ -1901,15 +1919,22 @@ unsafe fn fill_loop<S: Simd>(
     let op = out.as_mut_ptr();
     while pos < stop && k < limit {
         if base + 64 <= pos {
-            if pos > base + 64 {
-                scan.needs_utf8 = true;
+            if pos > base + 64 && scan.dirty_lo_p1 == 0 {
+                scan.dirty_lo_p1 = base + 64 + 1;
             }
             base = pos;
             flags = F_FORCED0;
         }
         let (starts, bad, next_flags, utf8_ok) = step(avail, doc_len, base, flags, slow);
         if !utf8_ok {
-            scan.needs_utf8 = true;
+            if scan.dirty_lo_p1 == 0 {
+                scan.dirty_lo_p1 = base + 1;
+            }
+        } else if scan.dirty_lo_p1 != 0 {
+            if scan.check_utf8 && !scan.bad_utf8 && !validate_dirty_span(b, scan.dirty_lo_p1 - 1, base) {
+                scan.bad_utf8 = true;
+            }
+            scan.dirty_lo_p1 = 0;
         }
         flags = next_flags;
         let lim = (base + 64).min(stop);
@@ -1931,8 +1956,8 @@ unsafe fn fill_loop<S: Simd>(
             let mut realigned = false;
             loop {
                 if pos >= lim {
-                    if pos > lim {
-                        scan.needs_utf8 = true;
+                    if pos > lim && scan.dirty_lo_p1 == 0 {
+                        scan.dirty_lo_p1 = lim + 1;
                     }
                     base = pos;
                     flags = F_FORCED0;
@@ -1966,8 +1991,8 @@ unsafe fn fill_loop<S: Simd>(
                 k += 1;
                 pos = end;
                 if k >= limit + SCAN_SLACK - 1 {
-                    if pos > lim {
-                        scan.needs_utf8 = true;
+                    if pos > lim && scan.dirty_lo_p1 == 0 {
+                        scan.dirty_lo_p1 = lim + 1;
                     }
                     scan.pos = pos;
                     scan.base = pos;
@@ -2053,15 +2078,43 @@ unsafe fn fill_camel_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: 
 
 impl Scan {
     pub fn new(start: usize) -> Self {
-        Scan { pos: start, base: start, carry: Carry::forced_start(), needs_utf8: false }
+        Self::new_checked(start, false)
     }
 
-    /// True if any byte in `[start..stop)` was not proven valid UTF-8 (pure ASCII
-    /// or valid `0xC3 (0x80..=0xBF)` Latin-1) during scanning and therefore needs
-    /// `simdutf8` verification.
     #[inline(always)]
-    pub fn needs_utf8(&self, _stop: usize) -> bool {
-        self.needs_utf8
+    pub fn new_checked(start: usize, check_utf8: bool) -> Self {
+        Scan {
+            pos: start,
+            base: start,
+            carry: Carry::forced_start(),
+            dirty_lo_p1: 0,
+            check_utf8,
+            bad_utf8: false,
+        }
+    }
+
+    /// Finalize surgical fused UTF-8 validation after scanning to `stop`:
+    /// returns `true` iff `[start..stop)` is valid UTF-8. Clean blocks (pure ASCII
+    /// or valid `0xC3 (0x80..=0xBF)` Latin-1) cost zero extra validation; only
+    /// contiguous unvalidated runs (typically 64B around a curly quote or emoji)
+    /// are checked via `simdutf8`.
+    #[inline(always)]
+    pub fn finish_utf8(&mut self, doc: &[u8], stop: usize) -> bool {
+        if !self.check_utf8 {
+            return true;
+        }
+        if self.bad_utf8 {
+            return false;
+        }
+        if self.dirty_lo_p1 != 0 {
+            let lo = self.dirty_lo_p1 - 1;
+            self.dirty_lo_p1 = 0;
+            if !validate_dirty_span(doc, lo, stop) {
+                self.bad_utf8 = true;
+                return false;
+            }
+        }
+        true
     }
 
     /// Append ends to `out[k..]` until `k >= limit` (checked per block) or
@@ -2339,8 +2392,9 @@ mod tests {
                 assert_eq!(got, want, "fill_in isolation failed for {kind:?}");
             }
         }
-        // 2. Adversarial invalid UTF-8 must ALWAYS set `needs_utf8(len) == true`.
-        let bad_cases: &[&[u8]] = &[
+        // 2. Adversarial invalid UTF-8 must ALWAYS fail `finish_utf8` and valid UTF-8
+        //    (including straddling 2/3/4-byte sequences across 64B edges) must ALWAYS pass.
+        let cases: &[&[u8]] = &[
             b"\xFF",
             b"\x80",
             b"\xC3",
@@ -2351,14 +2405,18 @@ mod tests {
             b"hello \xC3\xFF world",
             b"\xC0\x80",
             b"\xED\xA0\x80", // UTF-16 surrogate
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xC3\xA4", // split 0xC3 at 63
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xC3\xA4", // valid split 0xC3 at 63
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xE2\x80\x99 tail text here", // valid split 3B at 63
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xE2\x80\x7F tail text here", // invalid split 3B at 63
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xF0\x9F\x98\x80 after emoji ascii", // valid split 4B at 62
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xF0\x9F\x98\xFF after bad emoji", // invalid split 4B at 62
         ];
-        for &raw in bad_cases {
+        for &raw in cases {
             let is_valid = std::str::from_utf8(raw).is_ok();
             let mut avail = raw.to_vec();
             avail.extend_from_slice(b" padding padding padding padding padding padding padding padding");
             for &kind in &[KINDS[2], KINDS[4], KINDS[8]] {
-                let mut sc = Scan::new(0);
+                let mut sc = Scan::new_checked(0, true);
                 let mut out = vec![0u32; 256 + SCAN_SLACK];
                 loop {
                     let k = sc.fill_in(kind, &avail, raw.len(), raw.len(), &mut out, 0, 256);
@@ -2366,32 +2424,38 @@ mod tests {
                         break;
                     }
                 }
-                if !is_valid {
-                    assert!(sc.needs_utf8(raw.len()), "missed invalid UTF-8 {raw:?} on {kind:?}");
-                }
+                assert_eq!(sc.finish_utf8(raw, raw.len()), is_valid, "utf8 mismatch for {raw:?} on {kind:?}");
             }
         }
-        // 3. Random corruptions at arbitrary offsets (0..130) must never evade needs_utf8.
-        for _ in 0..5000 {
-            let len = 1 + (lcg(&mut seed) as usize % 130);
+        // 3. Random valid & invalid byte strings (len 1..200) must match std::str::from_utf8 100%.
+        for _ in 0..8000 {
+            let len = 1 + (lcg(&mut seed) as usize % 200);
             let mut buf = vec![b'a'; len];
-            // Sprinkle valid ASCII / Latin-1 + 1 random byte >= 0x80
-            let pos = (lcg(&mut seed) as usize) % len;
-            buf[pos] = 0x80 | ((lcg(&mut seed) & 0x7F) as u8);
-            if pos + 1 < len && (lcg(&mut seed) & 1) == 0 {
-                buf[pos + 1] = 0x80 | ((lcg(&mut seed) & 0x7F) as u8);
-            }
-            if std::str::from_utf8(&buf).is_err() {
-                let mut sc = Scan::new(0);
-                let mut out = vec![0u32; 256 + SCAN_SLACK];
-                loop {
-                    let k = sc.fill_in(KINDS[4], &buf, buf.len(), buf.len(), &mut out, 0, 256);
-                    if k == 0 {
-                        break;
-                    }
+            let nmut = 1 + (lcg(&mut seed) as usize % 4);
+            for _ in 0..nmut {
+                let pos = (lcg(&mut seed) as usize) % len;
+                let mode = lcg(&mut seed) % 4;
+                if mode == 0 && pos + 2 < len {
+                    buf[pos] = 0xE2;
+                    buf[pos + 1] = 0x80;
+                    buf[pos + 2] = 0x99;
+                } else if mode == 1 && pos + 1 < len {
+                    buf[pos] = 0xC3;
+                    buf[pos + 1] = 0xA4;
+                } else {
+                    buf[pos] = 0x80 | ((lcg(&mut seed) & 0x7F) as u8);
                 }
-                assert!(sc.needs_utf8(buf.len()), "missed random invalid UTF-8 len={len} pos={pos}");
             }
+            let want_ok = std::str::from_utf8(&buf).is_ok();
+            let mut sc = Scan::new_checked(0, true);
+            let mut out = vec![0u32; 256 + SCAN_SLACK];
+            loop {
+                let k = sc.fill_in(KINDS[4], &buf, buf.len(), buf.len(), &mut out, 0, 256);
+                if k == 0 {
+                    break;
+                }
+            }
+            assert_eq!(sc.finish_utf8(&buf, buf.len()), want_ok, "random utf8 mismatch len={len}");
         }
     }
 }

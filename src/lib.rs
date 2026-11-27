@@ -2350,7 +2350,7 @@ impl Tokenizer {
                 counts[ii] += (s.out.len() - before) as u32;
                 continue;
             }
-            let mut scan = blockscan::Scan::new(start);
+            let mut scan = blockscan::Scan::new_checked(start, !trusted[doc as usize]);
             let mut a = start;
             loop {
                 if cnt == 0 {
@@ -2371,7 +2371,7 @@ impl Tokenizer {
                     segs.clear();
                 }
             }
-            if !trusted[doc as usize] && scan.needs_utf8(stop) && simdutf8::basic::from_utf8(&d[a0..b0]).is_err() {
+            if !scan.finish_utf8(d, stop) {
                 bad_bytes(doc);
             }
         }
@@ -2853,7 +2853,7 @@ impl Tokenizer {
                         doc_counts[di] += s.out.len() - before;
                     }
                 } else {
-                    let mut scan = blockscan::Scan::new(0);
+                    let mut scan = blockscan::Scan::new_checked(0, !trusted);
                     let mut a = 0usize;
                     loop {
                         if cnt == 0 {
@@ -2877,7 +2877,7 @@ impl Tokenizer {
                             segs.clear();
                         }
                     }
-                    if !trusted && scan.needs_utf8(doc_len) && simdutf8::basic::from_utf8(doc).is_err() {
+                    if !scan.finish_utf8(doc, doc_len) {
                         if bad_local.is_none() {
                             bad_local = Some(di);
                         }
