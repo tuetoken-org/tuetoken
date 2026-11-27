@@ -2083,7 +2083,7 @@ impl Tokenizer {
     /// `a`): key, home-slot address (prefetched) per chunk; returns the last
     /// end. Straight-line wide loads for `<= 15B` chunks; `16..=31B` chunks
     /// prefetch their `SharedLongTable` 64B slot out-of-line.
-    #[inline(always)]
+    #[inline(never)]
     fn fill_recs(
         &self,
         bytes: &[u8],
@@ -2167,16 +2167,19 @@ impl Tokenizer {
         let mut w = s.out.len();
         let mut dst = s.out.as_mut_ptr();
         for (k, r) in buf.iter().enumerate() {
-            let mut empty_slot = false;
-            if r.p != 0 {
+            let empty_slot = if r.p != 0 {
                 // SAFETY: capacity >= w + 6 * remaining entries (reserved).
-                let c = unsafe { view.emit_inline_at(r.lo, r.hi, r.p, dst.add(w)) };
-                if c.wrapping_sub(1) < 6 {
-                    w += c;
-                    continue;
+                match unsafe { view.emit_inline_at(r.lo, r.hi, r.p, dst.add(w)) } {
+                    chunk_table::InlineHit::Hit(c) => {
+                        w += c;
+                        continue;
+                    }
+                    chunk_table::InlineHit::Empty => true,
+                    chunk_table::InlineHit::Spilled => false,
                 }
-                empty_slot = c == 0;
-            }
+            } else {
+                false
+            };
             // SAFETY: [0, w) initialized.
             unsafe { s.out.set_len(w) };
             let a = if k == 0 { first_a } else { ends[k - 1] as usize };
@@ -2211,15 +2214,18 @@ impl Tokenizer {
         let mut w = s.out.len();
         let mut dst = s.out.as_mut_ptr();
         for (k, r) in buf.iter().enumerate() {
-            let mut empty_slot = false;
-            if r.p != 0 {
-                let c = unsafe { view.emit_inline_at(r.lo, r.hi, r.p, dst.add(w)) };
-                if c.wrapping_sub(1) < 6 {
-                    w += c;
-                    continue;
+            let empty_slot = if r.p != 0 {
+                match unsafe { view.emit_inline_at(r.lo, r.hi, r.p, dst.add(w)) } {
+                    chunk_table::InlineHit::Hit(c) => {
+                        w += c;
+                        continue;
+                    }
+                    chunk_table::InlineHit::Empty => true,
+                    chunk_table::InlineHit::Spilled => false,
                 }
-                empty_slot = c == 0;
-            }
+            } else {
+                false
+            };
             unsafe { s.out.set_len(w) };
             let (a, e) = spans[k];
             if empty_slot {

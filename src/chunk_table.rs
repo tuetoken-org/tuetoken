@@ -755,7 +755,6 @@ struct PaddedCount(AtomicUsize);
 struct STable<const W: usize> {
     ptr: *mut SSlot<W>,
     len: usize,
-    mask: usize,
     shift: u32,
     count: PaddedCount,
 }
@@ -763,7 +762,7 @@ struct STable<const W: usize> {
 impl<const W: usize> STable<W> {
     fn layout(n: usize) -> std::alloc::Layout {
         let sz = std::mem::size_of::<SSlot<W>>();
-        let bytes = sz * n;
+        let bytes = sz * (n + PROBE_MAX);
         // 64B minimum alignment for cache-line pairing; on Linux, align >=2 MiB
         // tables to 2 MiB so `MADV_HUGEPAGE` actually backs them with 2 MiB THP
         // (unaligned glibc mmap + 16B header yields 0 KiB AnonHugePages!).
@@ -778,14 +777,15 @@ impl<const W: usize> STable<W> {
         let n = 1usize << bits;
         let layout = Self::layout(n);
         // SAFETY: non-zero size; all-zero bytes are a valid SSlot (atomics of
-        // 0 = empty). Freed in Drop with the same layout.
+        // 0 = empty). Extra PROBE_MAX tail slots eliminate wrap-around checks
+        // in every probe loop. Freed in Drop with the same layout.
         let ptr = unsafe { alloc_zeroed_huge(layout) } as *mut SSlot<W>;
-        Box::new(STable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
+        Box::new(STable { ptr, len: n, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
     }
 
     #[inline(always)]
     fn slot(&self, i: usize) -> &SSlot<W> {
-        // SAFETY: callers pass i <= mask < len; the allocation lives as long as self.
+        // SAFETY: callers pass i < len + PROBE_MAX; the allocation lives as long as self.
         unsafe { &*self.ptr.add(i) }
     }
 
@@ -804,8 +804,14 @@ impl<const W: usize> Drop for STable<W> {
 const PROBE_MAX: usize = 32;
 /// Token count `SharedTable::get` reports for an entry stored in the SpillMap.
 pub const SPILLED: usize = 63;
-/// Return code of `View::emit_inline_at` when key is spilled/in-flight (vs 0 = empty slot).
-pub const INLINE_SPILLED: usize = 7;
+/// Outcome of `View::emit_inline_at` so `flush_recs` branches directly from
+/// Probe-0 / Probe-1+ hits to `w += n; continue;` without a redundant `cmp < 6`.
+#[derive(Clone, Copy)]
+pub enum InlineHit {
+    Hit(usize),
+    Empty,
+    Spilled,
+}
 const SHARED_MIN_BITS: u32 = 14;
 
 /// Inserts a thread batches before publishing them to a table's count.
@@ -814,11 +820,11 @@ thread_local! {
     static PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// See [`SharedTable::view`].
+/// See [`SharedTable::view`]. Zero-wrap: `STable` allocates `+ PROBE_MAX` tail
+/// slots so `View` fits in 2 words (`base`, `shift`) with no `end` pointer.
 #[derive(Clone, Copy)]
 pub struct View<'a, const W: usize> {
     base: *const SSlot<W>,
-    end: *const SSlot<W>,
     shift: u32,
     _t: std::marker::PhantomData<&'a ()>,
 }
@@ -909,11 +915,11 @@ impl View<'_, 3> {
     ///   minimal L1d load port pressure and zero loop overhead).
     /// - 1..=3 tokens (`m & 3 == 2`): ONE 128-bit load + ONE 128-bit store.
     /// - 4..=6 tokens (`m & 3 == 3`): 20-bit bit-packed unpack from same 32B slot.
-    /// Returns token count `1..=6` on hit, `0` on empty slot, or `INLINE_SPILLED`.
+    /// Returns `InlineHit::Hit(1..=6)` on hit, `InlineHit::Empty` on empty slot, or `InlineHit::Spilled`.
     ///
     /// SAFETY: `dst` must have capacity for at least 6 `u32`s.
     #[inline(always)]
-    pub unsafe fn emit_inline_at(&self, lo: u64, hi: u64, addr: u64, dst: *mut u32) -> usize {
+    pub unsafe fn emit_inline_at(&self, lo: u64, hi: u64, addr: u64, dst: *mut u32) -> InlineHit {
         const {
             assert!(std::mem::offset_of!(SSlot<3>, toks) == 16);
             assert!(std::mem::size_of::<SSlot<3>>() == 32);
@@ -927,44 +933,40 @@ impl View<'_, 3> {
             if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
                 let t = ((p as *const u8).add(16) as *const [u32; 4]).read();
                 (dst as *mut [u32; 4]).write_unaligned(t);
-                return (m >> 2) as usize;
+                return InlineHit::Hit((m >> 2) as usize);
             }
             if m == 0 {
-                return 0;
+                return InlineHit::Empty;
             }
             if l == lo && g == hi {
                 if (m & 3) == 3 {
-                    return unpack_packed6(p, m, dst);
+                    return InlineHit::Hit(unpack_packed6(p, m, dst));
                 }
-                return INLINE_SPILLED;
+                return InlineHit::Spilled;
             }
         }
-        // Probe 1..PROBE_MAX: linear probing (for even home slots, Probe 1 shares
-        // the same 64-byte cache line already prefetched by Probe 0).
+        // Probe 1..PROBE_MAX: zero-wrap linear probing into `+ PROBE_MAX` tail.
         for _ in 1..PROBE_MAX {
             p = p.add(1);
-            if p == self.end {
-                p = self.base;
-            }
             let s = &*p;
             let m = Self::load_meta(s);
             let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
             if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
                 let t = ((p as *const u8).add(16) as *const [u32; 4]).read();
                 (dst as *mut [u32; 4]).write_unaligned(t);
-                return (m >> 2) as usize;
+                return InlineHit::Hit((m >> 2) as usize);
             }
             if m == 0 {
-                return 0;
+                return InlineHit::Empty;
             }
             if l == lo && g == hi {
                 if (m & 3) == 3 {
-                    return unpack_packed6(p, m, dst);
+                    return InlineHit::Hit(unpack_packed6(p, m, dst));
                 }
-                return INLINE_SPILLED;
+                return InlineHit::Spilled;
             }
         }
-        INLINE_SPILLED
+        InlineHit::Spilled
     }
 }
 
@@ -1012,9 +1014,9 @@ impl<const W: usize> GrowJob<W> {
                 break;
             }
             let s_lo = si * self.stripe;
-            let s_hi = (s_lo + self.stripe).min(old_t.len);
-            let d_lo = s_lo << self.diff;
-            let d_hi = s_hi << self.diff;
+            let s_hi = (s_lo + self.stripe).min(old_t.len + PROBE_MAX);
+            let d_lo = s_lo.min(old_t.len) << self.diff;
+            let d_hi = s_hi.min(old_t.len) << self.diff;
             for i in s_lo..s_hi {
                 let s = old_t.slot(i);
                 let mut m = s.meta.load(Ordering::Acquire);
@@ -1128,7 +1130,6 @@ impl<const W: usize> SharedTable<W> {
         let t = self.table();
         View {
             base: t.ptr as *const SSlot<W>,
-            end: unsafe { (t.ptr as *const SSlot<W>).add(t.len) },
             shift: t.shift,
             _t: std::marker::PhantomData,
         }
@@ -1138,9 +1139,9 @@ impl<const W: usize> SharedTable<W> {
     #[inline(always)]
     pub fn get(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; W], usize)> {
         let t = self.table();
-        let mut i = (h >> t.shift) as usize;
-        for _ in 0..PROBE_MAX {
-            let s = t.slot(i);
+        let home = (h >> t.shift) as usize;
+        for step in 0..PROBE_MAX {
+            let s = t.slot(home + step);
             let m = s.meta.load(Ordering::Acquire);
             if m == 0 {
                 return None;
@@ -1152,7 +1153,6 @@ impl<const W: usize> SharedTable<W> {
                 }
                 return Some((v, (m >> 2) as usize));
             }
-            i = (i + 1) & t.mask;
         }
         None
     }
@@ -1206,9 +1206,9 @@ impl<const W: usize> SharedTable<W> {
             self.wait_or_help_grow();
         }
         let t = self.table();
-        let mut i = (h >> t.shift) as usize;
-        for _ in 0..PROBE_MAX {
-            let s = t.slot(i);
+        let home = (h >> t.shift) as usize;
+        for step in 0..PROBE_MAX {
+            let s = t.slot(home + step);
             let mut m = s.meta.load(Ordering::Acquire);
             if m == 0 {
                 match s.meta.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
@@ -1241,7 +1241,6 @@ impl<const W: usize> SharedTable<W> {
             if m >= 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
                 return;
             }
-            i = (i + 1) & t.mask;
         }
     }
 
@@ -1276,7 +1275,7 @@ impl<const W: usize> SharedTable<W> {
         let newp = Box::into_raw(STable::<W>::new(bits));
         let diff = bits - old.bits();
         let stripe = 4096usize.min(old.len).max(1);
-        let n_stripes = old.len.div_ceil(stripe);
+        let n_stripes = (old.len + PROBE_MAX).div_ceil(stripe);
         let jobp = Box::into_raw(Box::new(GrowJob {
             old: old as *const STable<W>,
             new: newp,
@@ -1300,9 +1299,9 @@ impl<const W: usize> SharedTable<W> {
         let mut total = job.copied.load(Ordering::Relaxed);
         let ov = std::mem::take(&mut *job.overflow.lock().unwrap_or_else(|e| e.into_inner()));
         for (lo, hi, tv, m, h) in ov {
-            let mut j = (h >> new.shift) as usize;
-            loop {
-                let d = new.slot(j);
+            let home = (h >> new.shift) as usize;
+            for step in 0..PROBE_MAX {
+                let d = new.slot(home + step);
                 if d.meta.load(Ordering::Relaxed) == 0 {
                     d.lo.store(lo, Ordering::Relaxed);
                     d.hi.store(hi, Ordering::Relaxed);
@@ -1313,7 +1312,6 @@ impl<const W: usize> SharedTable<W> {
                     total += 1;
                     break;
                 }
-                j = (j + 1) & new.mask;
             }
         }
         new.count.0.store(total, Ordering::Relaxed);
@@ -1336,9 +1334,9 @@ impl SharedTable<3> {
     #[inline(always)]
     pub fn get_6(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; 6], usize)> {
         let t = self.table();
-        let mut i = (h >> t.shift) as usize;
-        for _ in 0..PROBE_MAX {
-            let s = t.slot(i);
+        let home = (h >> t.shift) as usize;
+        for step in 0..PROBE_MAX {
+            let s = t.slot(home + step);
             let m = View::load_meta(s);
             if m == 0 {
                 return None;
@@ -1356,7 +1354,6 @@ impl SharedTable<3> {
                     return Some((v, c));
                 }
             }
-            i = (i + 1) & t.mask;
         }
         None
     }
@@ -1481,7 +1478,11 @@ mod shared_tests {
             assert_eq!((gn, &got[..gn]), (cnt, want.as_slice()));
             let view = t.view();
             let mut out = [0u32; 8];
-            let vc = unsafe { view.emit_inline_at(lo, hi, view.slot_addr(h), out.as_mut_ptr()) };
+            let InlineHit::Hit(vc) =
+                (unsafe { view.emit_inline_at(lo, hi, view.slot_addr(h), out.as_mut_ptr()) })
+            else {
+                panic!("expected InlineHit::Hit");
+            };
             assert_eq!((vc, &out[..vc]), (cnt, want.as_slice()));
         }
         // 7 tokens -> spilled
