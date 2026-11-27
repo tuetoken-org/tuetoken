@@ -54,6 +54,11 @@ tokenizer has not seen before, and corpus runs start a fresh process (no warm
 caches). Reproduce with `python tools/bench/bench.py corpus.txt && python tools/bench/plot.py`
 (raw numbers in `tools/bench/results.json`).
 
+New in 0.1.9:
+- **OpenAI Whisper ASR support**: full `WhisperTokenizerFast` parity (`whisper-tiny` through `whisper-large-v3-turbo`, `distil-whisper`, and legacy `vocab.json`+`merges.txt`), with SIMD `<|` special-token prefiltering and all-Rust decode / `decode_with_timestamps` (31-180x faster than 🤗 `transformers`).
+- **Universal HF normalizer & pre-tokenizer pipeline**: composable Rust support for modern Hugging Face tokenizers plus Mistral `tekken.json` and legacy BPE checkpoints.
+- **Core throughput & startup**: 4.5-4.8x faster tokenizer startup (+ `warmup()` API), `FastBatch` zero-plan short-document engine, exact 2D-shielded byte-pair BPE pre-collapse, SIMD-bucketed `MergeMap` with 2 MiB THP, AVX-512 VBMI2 `blockscan`, and BMI2 `bzhi` key packing.
+
 New in 0.1.8: a batch of non-ASCII `str` (most real text) is converted to UTF-8 on all
 cores instead of by Python on one thread, so lists of strings are 2-2.5x faster than in
 0.1.7 (1 GB of OpenWebText documents in one call: 1.7 -> 4.1 GB/s), with identical output.
