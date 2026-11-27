@@ -840,6 +840,212 @@ def test_review_regressions():
     return ok, tot
 
 
+def test_whisper():
+    """Whisper tokenizer parity vs HF WhisperTokenizerFast across all Whisper
+    generations (tiny, tiny.en, large-v2, large-v3, large-v3-turbo, distil-large-v3),
+    plus legacy vocab.json+merges.txt-only Whisper repos."""
+    print("=== whisper models (parity, timestamps, prefixes, prompts, offsets, legacy) ===")
+    import json
+    import shutil
+    import tempfile
+    from transformers import WhisperTokenizerFast
+    from huggingface_hub import hf_hub_download
+    from tuetoken import _formats as _fmt
+
+    repos = [
+        "openai/whisper-tiny",
+        "openai/whisper-tiny.en",
+        "openai/whisper-large-v2",
+        "openai/whisper-large-v3",
+        "openai/whisper-large-v3-turbo",
+        "distil-whisper/distil-large-v3",
+    ]
+    samples = [
+        "",
+        "Hello, world!",
+        " The quick brown fox jumps over the lazy dog 12345.",
+        "Bonjour! Ça va bien? 日本語のテストと한국어とالعربية 🚀",
+        "<|startoftranscript|><|notimestamps|> Hello world.<|endoftext|>",
+        "<|0.00|> Hello world.<|2.50|><|2.50|> Second phrase.<|5.00|>",
+        "text with < single angle and <|not_a_token|> literal",
+    ]
+    ok = tot = 0
+    for repo in repos:
+        try:
+            hf = WhisperTokenizerFast.from_pretrained(repo, local_files_only=True)
+        except Exception:
+            continue
+        at = tuetoken.AutoTokenizer.from_pretrained(repo)
+        n_ok = n_tot = 0
+
+        # Metadata & properties
+        n_tot += 1
+        n_ok += int(
+            at._is_whisper
+            and at.vocab_size == len(hf)
+            and at.bos_token_id == hf.bos_token_id
+            and at.eos_token_id == hf.eos_token_id
+            and at.pad_token_id == hf.pad_token_id
+            and at.all_special_ids == sorted(hf.all_special_ids)
+            and at.prefix_tokens == hf.prefix_tokens
+            and at.timestamp_ids() == hf.timestamp_ids()
+        )
+
+        # Single encode (sp=False / sp=True) and batch __call__
+        for s in samples:
+            for sp in (False, True):
+                n_tot += 1
+                n_ok += int(at.encode(s, add_special_tokens=sp) == hf.encode(s, add_special_tokens=sp))
+        for sp in (False, True):
+            n_tot += 1
+            n_ok += int(at(samples, add_special_tokens=sp)["input_ids"] == hf(samples, add_special_tokens=sp)["input_ids"])
+
+        # Decode matrix: standard, timestamped, multi-segment >30s rollovers, prompt strip
+        ts0 = at._whisper_ts_begin
+        sot = at._id("<|startoftranscript|>")
+        sop = at._id("<|startofprev|>")
+        eot = at.eos_token_id
+        hello = at.encode(" Hello world.", add_special_tokens=False)
+        seg2 = at.encode(" Next segment!", add_special_tokens=False)
+        prompt_body = at.encode(" prior context", add_special_tokens=False)
+
+        dec_cases = [
+            at.encode("Hello, world! 日本語", add_special_tokens=True),
+            [sot, ts0 + 0, *hello, ts0 + 125, ts0 + 125, *seg2, ts0 + 250, eot],
+            # Single-ending >30s rollover (+30.00s)
+            [sot, ts0 + 0, *hello, ts0 + 1450, ts0 + 50, *seg2, ts0 + 250, eot],
+            # Consecutive boundary rollover (rewind second ending timestamp, +20.00s)
+            [sot, ts0 + 0, *hello, ts0 + 1000, ts0 + 1000, ts0 + 250, *seg2, ts0 + 500, eot],
+            # Prompt + transcript + timestamps
+            [sop, *prompt_body, sot, ts0 + 0, *hello, ts0 + 200, eot],
+            # Prompt without <|startoftranscript|>
+            [sop, *prompt_body],
+        ]
+        for ids in dec_cases:
+            for skip in (False, True):
+                for ts_flag in (False, True):
+                    n_tot += 1
+                    n_ok += int(
+                        at.decode(ids, skip_special_tokens=skip, decode_with_timestamps=ts_flag)
+                        == hf.decode(ids, skip_special_tokens=skip, decode_with_timestamps=ts_flag)
+                    )
+        # batch_decode (small serial + >32K-token parallel path!)
+        for skip in (False, True):
+            for ts_flag in (False, True):
+                n_tot += 1
+                n_ok += int(
+                    at.batch_decode(dec_cases, skip_special_tokens=skip, decode_with_timestamps=ts_flag)
+                    == hf.batch_decode(dec_cases, skip_special_tokens=skip, decode_with_timestamps=ts_flag)
+                )
+        big_batch = dec_cases * 500  # > 32K tokens -> exercises parallel decode_batch path
+        n_tot += 1
+        n_ok += int(
+            at.batch_decode(big_batch, skip_special_tokens=True, decode_with_timestamps=True)
+            == at.batch_decode(dec_cases, skip_special_tokens=True, decode_with_timestamps=True) * 500
+        )
+
+        # output_offsets parity
+        for ids in dec_cases[1:5]:
+            n_tot += 1
+            n_ok += int(
+                at.decode(ids, skip_special_tokens=True, output_offsets=True)
+                == hf.decode(ids, skip_special_tokens=True, output_offsets=True)
+            )
+
+        # Normalization parity
+        norm_ids = at.encode("Mr. Smith's 21st café (applause)!", add_special_tokens=True)
+        for kw in (
+            dict(skip_special_tokens=True, basic_normalize=True),
+            dict(skip_special_tokens=True, basic_normalize=True, remove_diacritics=True),
+            dict(skip_special_tokens=True, normalize=True),
+        ):
+            n_tot += 1
+            n_ok += int(at.decode(norm_ids, **kw) == hf.decode(norm_ids, **kw))
+
+        # get_prompt_ids parity + disallowed special check
+        n_tot += 1
+        n_ok += int(at.get_prompt_ids("previous context").tolist() == hf.get_prompt_ids("previous context").tolist())
+        try:
+            at.get_prompt_ids("bad <|endoftext|> prompt")
+            raised = False
+        except ValueError:
+            raised = True
+        n_tot += 1; n_ok += int(raised)
+
+        # set_prefix_tokens & get_decoder_prompt_ids (multilingual models only)
+        if not repo.endswith(".en"):
+            for lang, task, pred_ts in [
+                ("spanish", "transcribe", False),
+                ("fr", "translate", True),
+                ("mandarin", "transcribe", False),
+            ]:
+                hf.set_prefix_tokens(language=lang, task=task, predict_timestamps=pred_ts)
+                at.set_prefix_tokens(language=lang, task=task, predict_timestamps=pred_ts)
+                n_tot += 1
+                n_ok += int(
+                    at.prefix_tokens == hf.prefix_tokens
+                    and at.encode("Hello world!", add_special_tokens=True)
+                    == hf.encode("Hello world!", add_special_tokens=True)
+                )
+            n_tot += 1
+            n_ok += int(
+                at.get_decoder_prompt_ids(language="german", task="transcribe", no_timestamps=False)
+                == hf.get_decoder_prompt_ids(language="german", task="transcribe", no_timestamps=False)
+            )
+
+        ok += n_ok; tot += n_tot
+        _line(repo, n_ok, n_tot)
+
+    # Legacy Whisper repo test (vocab.json + merges.txt + added_tokens.json + tokenizer_config.json, NO tokenizer.json)
+    tj_src = None
+    try:
+        tj_src = hf_hub_download("openai/whisper-tiny", "tokenizer.json", local_files_only=True)
+        cfg_src = hf_hub_download("openai/whisper-tiny", "tokenizer_config.json", local_files_only=True)
+        hf_ref = WhisperTokenizerFast.from_pretrained("openai/whisper-tiny", local_files_only=True)
+    except Exception:
+        tj_src = None
+    if tj_src is not None:
+        tj_data = json.load(open(tj_src, encoding="utf-8"))
+        tmpdir = tempfile.mkdtemp(prefix="tuetoken_legacy_whisper_")
+        try:
+            with open(os.path.join(tmpdir, "vocab.json"), "w", encoding="utf-8") as f:
+                json.dump(tj_data["model"]["vocab"], f)
+            with open(os.path.join(tmpdir, "merges.txt"), "w", encoding="utf-8") as f:
+                f.write("#version: 0.2\n")
+                for m in tj_data["model"]["merges"]:
+                    f.write((m if isinstance(m, str) else " ".join(m)) + "\n")
+            added_map = {a["content"]: a["id"] for a in tj_data["added_tokens"]}
+            with open(os.path.join(tmpdir, "added_tokens.json"), "w", encoding="utf-8") as f:
+                json.dump(added_map, f)
+            shutil.copy(cfg_src, os.path.join(tmpdir, "tokenizer_config.json"))
+
+            res = _fmt.try_load_legacy_bpe_repo(tmpdir)
+            assert res is not None, "legacy Whisper loader returned None"
+            leg_tj, leg_cfg = res
+            leg_at = tuetoken.AutoTokenizer(leg_tj, leg_cfg)
+            n_ok = n_tot = 0
+            for s in samples:
+                for sp in (False, True):
+                    n_tot += 1
+                    n_ok += int(leg_at.encode(s, add_special_tokens=sp) == hf_ref.encode(s, add_special_tokens=sp))
+            ts0 = leg_at._whisper_ts_begin
+            ids = [leg_at._id("<|startoftranscript|>"), ts0, *leg_at.encode(" Hi!", add_special_tokens=False), ts0 + 50, leg_at.eos_token_id]
+            for skip in (False, True):
+                for ts_flag in (False, True):
+                    n_tot += 1
+                    n_ok += int(
+                        leg_at.decode(ids, skip_special_tokens=skip, decode_with_timestamps=ts_flag)
+                        == hf_ref.decode(ids, skip_special_tokens=skip, decode_with_timestamps=ts_flag)
+                    )
+            ok += n_ok; tot += n_tot
+            _line("legacy Whisper (vocab+merges only)", n_ok, n_tot)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    assert ok == tot and tot > 0, f"whisper: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -847,7 +1053,7 @@ def main():
         test_normalization(), test_new_features(), test_rank_inversion(),
         test_auto(), test_kimi_tiktoken_model(), test_tekken_and_legacy_formats(),
         test_bytes_inputs(), test_warmup_and_fast_startup(),
-        test_review_regressions(),
+        test_review_regressions(), test_whisper(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

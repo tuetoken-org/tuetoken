@@ -39,10 +39,13 @@ class AutoTokenizer:
     is_fast = True
 
     # ---- construction -------------------------------------------------------
-    def __init__(self, tokenizer_json, config=None, warmup=None):
+    def __init__(self, tokenizer_json, config=None, warmup=None,
+                 language=None, task=None, predict_timestamps=None,
+                 normalizer_json=None):
         self._tokenizer_json = tokenizer_json
         self._core = _Core(tokenizer_json)
         self._cfg = config or {}
+        self._normalizer_json = normalizer_json
 
         # Fast metadata extracted during the single Rust parse (avoids re-parsing
         # the full 12+ MB tokenizer.json in Python; full id<->token dicts are
@@ -110,6 +113,26 @@ class AutoTokenizer:
             [bool(a.get("rstrip", False)) for a in self._added],
             scheme,
         )
+
+        # Config-driven Whisper support (timestamps, prefix tokens, prompt strip).
+        from . import _whisper as _wh
+        self._is_whisper = _wh.is_whisper_tokenizer(self._cfg, self._added_content_to_id)
+        self.language = language
+        self.task = task
+        self.predict_timestamps = bool(predict_timestamps) if predict_timestamps is not None else False
+        self._whisper_ts_begin = None
+        if self._is_whisper:
+            ts0 = self._added_content_to_id.get("<|0.00|>")
+            if ts0 is None and self._special_ids:
+                ts0 = max(self._special_ids) + 1
+            if ts0 is not None:
+                self._whisper_ts_begin = int(ts0)
+                sop = int(self._added_content_to_id.get("<|startofprev|>", 0xFFFF_FFFF))
+                sot = int(self._added_content_to_id.get("<|startoftranscript|>", 0xFFFF_FFFF))
+                self._core.set_whisper_decode(self._whisper_ts_begin, sop, sot)
+            if language is not None or task is not None or predict_timestamps is not None:
+                self.set_prefix_tokens(language=language, task=task, predict_timestamps=predict_timestamps)
+
         if warmup is True:
             self.warmup()
         elif warmup:
@@ -151,14 +174,18 @@ class AutoTokenizer:
         return self._core.warmup(texts, num_threads)
 
     @classmethod
-    def from_file(cls, tokenizer_json, config=None, warmup=None):
+    def from_file(cls, tokenizer_json, config=None, warmup=None,
+                  language=None, task=None, predict_timestamps=None,
+                  normalizer_json=None):
         cfg = None
         if isinstance(config, str):
             with open(config, encoding="utf-8") as f:
                 cfg = json.load(f)
         elif isinstance(config, dict):
             cfg = config
-        return cls(tokenizer_json, cfg, warmup=warmup)
+        return cls(tokenizer_json, cfg, warmup=warmup, language=language,
+                   task=task, predict_timestamps=predict_timestamps,
+                   normalizer_json=normalizer_json)
 
     @classmethod
     def from_tiktoken_model(cls, source, pattern, special_tokens=None, revision=None, warmup=None):
@@ -203,9 +230,11 @@ class AutoTokenizer:
         return cls(tj_path, cfg, warmup=warmup)
 
     @classmethod
-    def from_pretrained(cls, repo_id, revision=None, warmup=None, **_):
+    def from_pretrained(cls, repo_id, revision=None, warmup=None,
+                        language=None, task=None, predict_timestamps=None, **_):
         from huggingface_hub import hf_hub_download
         kw = {"revision": revision} if revision else {}
+        extra = dict(language=language, task=task, predict_timestamps=predict_timestamps)
         try:
             tj = hf_hub_download(repo_id, "tokenizer.json", **kw)
         except Exception as e:
@@ -215,18 +244,29 @@ class AutoTokenizer:
             res = _fmt.try_load_tekken_repo(repo_id, revision=revision)
             if res is not None:
                 tj_path, cfg = res
-                return cls(tj_path, cfg, warmup=warmup)
+                return cls(tj_path, cfg, warmup=warmup, **extra)
             # 2. tiktoken-format model (ships tiktoken.model + a tokenization_*.py,
             #    e.g. Kimi-K2 / Kimi-VL)? Recover pat_str via pure static AST.
             from . import _tiktoken as _tt
             pattern = _tt.tiktoken_pattern_from_repo(repo_id, revision)
             if pattern is not None:
                 return cls.from_tiktoken_model(repo_id, pattern=pattern, revision=revision, warmup=warmup)
-            # 3. Legacy ByteLevel BPE (vocab.json + merges.txt, e.g. facebook/opt-125m)?
+            # 3. Legacy ByteLevel BPE (vocab.json + merges.txt, e.g. OPT / legacy Whisper)?
             legacy = _fmt.try_load_legacy_bpe_repo(repo_id, revision=revision)
             if legacy is not None:
                 tj_path, cfg = legacy
-                return cls(tj_path, cfg, warmup=warmup)
+                norm_json = None
+                if (cfg.get("tokenizer_class") or "").startswith("Whisper"):
+                    if os.path.isdir(repo_id):
+                        cand = os.path.join(repo_id, "normalizer.json")
+                        if os.path.isfile(cand):
+                            norm_json = cand
+                    else:
+                        try:
+                            norm_json = hf_hub_download(repo_id, "normalizer.json", **kw)
+                        except Exception:
+                            pass
+                return cls(tj_path, cfg, warmup=warmup, normalizer_json=norm_json, **extra)
             # Not auto-recoverable: actionable error if it IS tiktoken-format, else
             # re-raise the original download failure.
             try:
@@ -247,7 +287,13 @@ class AutoTokenizer:
                     cfg.update(json.load(f))
             except Exception:
                 pass
-        return cls(tj, cfg, warmup=warmup)
+        norm_json = None
+        if (cfg.get("tokenizer_class") or "").startswith("Whisper"):
+            try:
+                norm_json = hf_hub_download(repo_id, "normalizer.json", **kw)
+            except Exception:
+                pass
+        return cls(tj, cfg, warmup=warmup, normalizer_json=norm_json, **extra)
 
     # ---- token <-> id helpers ----------------------------------------------
     def get_vocab(self):
@@ -401,25 +447,146 @@ class AutoTokenizer:
 
     def encode(self, text, text_pair=None, add_special_tokens=True):
         ids_a = self._encode_pieces(text)
-        ids_b = self._encode_pieces(text_pair) if text_pair is not None else None
+        if text_pair is None:
+            if not add_special_tokens:
+                return ids_a
+            prefix, suffix = self._post_prefix_suffix()
+            if self.__dict__.get("_ps_exact", False):
+                if not prefix and not suffix:
+                    return ids_a
+                return prefix + ids_a + suffix
+            ids, _ = self._apply_post(ids_a, None)
+            return ids
+        ids_b = self._encode_pieces(text_pair)
         if add_special_tokens:
             ids, _ = self._apply_post(ids_a, ids_b)
             return ids
-        return ids_a + (ids_b or [])
+        return ids_a + ids_b
+
+    # ---- Whisper helpers (prefix tokens, timestamps, prompts, normalizers) --
+    @property
+    def prefix_tokens(self):
+        if not self._is_whisper:
+            raise AttributeError("prefix_tokens is only defined for Whisper tokenizers")
+        from . import _whisper as _wh
+        return _wh.whisper_prefix_tokens(
+            self._added_content_to_id, self.language, self.task, self.predict_timestamps
+        )
+
+    def set_prefix_tokens(self, language=None, task=None, predict_timestamps=None):
+        if not self._is_whisper:
+            raise AttributeError("set_prefix_tokens is only defined for Whisper tokenizers")
+        from . import _whisper as _wh
+        if language is not None:
+            self.language = language
+        if task is not None:
+            self.task = task
+        if predict_timestamps is not None:
+            self.predict_timestamps = bool(predict_timestamps)
+        prefix_ids = self.prefix_tokens
+        eos = self.eos_token or "<|endoftext|>"
+        eos_id = self.eos_token_id
+        self._post = _wh.whisper_post_processor(self._fast_id_to_token, eos, eos_id, prefix_ids)
+        self.__dict__.pop("_ps_cache", None)
+        self.__dict__.pop("_ps_exact", None)
+
+    def get_decoder_prompt_ids(self, task=None, language=None, no_timestamps=True):
+        self.set_prefix_tokens(task=task, language=language, predict_timestamps=not no_timestamps)
+        forced = self.prefix_tokens[1:]
+        return [(rank + 1, tok) for rank, tok in enumerate(forced)]
+
+    def get_prompt_ids(self, text, return_tensors="np"):
+        if not self._is_whisper:
+            raise AttributeError("get_prompt_ids is only defined for Whisper tokenizers")
+        sop_id = self._added_content_to_id["<|startofprev|>"]
+        prompt_ids = self._encode_pieces(" " + text.strip())
+        min_special = min(self._special_ids) if self._special_ids else 0
+        for x in prompt_ids:
+            if x >= min_special:
+                tok = self.convert_ids_to_tokens(x)
+                raise ValueError(
+                    f"Encountered text in the prompt corresponding to disallowed special token: {tok}."
+                )
+        ids = [sop_id] + prompt_ids
+        if return_tensors == "np":
+            import numpy as np
+            return np.array(ids)
+        if return_tensors == "pt":
+            import torch
+            return torch.tensor(ids)
+        return ids
+
+    def timestamp_ids(self, time_precision=0.02):
+        if not self._is_whisper:
+            raise AttributeError("timestamp_ids is only defined for Whisper tokenizers")
+        return [self._id("<|%.2f|>" % (i * time_precision)) for i in range(1501)]
+
+    def normalize(self, text):
+        from . import _whisper as _wh
+        return _wh.english_normalize(text, self._normalizer_json)
+
+    @staticmethod
+    def basic_normalize(text, remove_diacritics=False):
+        from . import _whisper as _wh
+        return _wh.basic_normalize(text, remove_diacritics=remove_diacritics)
 
     # ---- decode -------------------------------------------------------------
-    def decode(self, ids, skip_special_tokens=False, **_):
-        ids = [int(i) for i in ids]
-        if skip_special_tokens:
-            ids = [i for i in ids if i not in self._special_ids]
-        return self._core.decode(ids)
+    def decode(self, ids, skip_special_tokens=False, decode_with_timestamps=False,
+               output_offsets=False, time_precision=0.02, segment_size=1500,
+               normalize=False, basic_normalize=False, remove_diacritics=False, **_):
+        if isinstance(ids, int):
+            ids = [ids]
+        elif hasattr(ids, "tolist"):
+            ids = ids.tolist()
+            if ids and isinstance(ids[0], list) and len(ids) == 1:
+                ids = ids[0]
+        elif not isinstance(ids, list):
+            ids = [int(i) for i in ids]
+        text = self._core.decode(
+            ids, bool(skip_special_tokens), bool(decode_with_timestamps),
+            float(time_precision), int(segment_size),
+        )
+        if not decode_with_timestamps:
+            if normalize:
+                text = self.normalize(text)
+            elif basic_normalize:
+                text = self.basic_normalize(text, remove_diacritics=remove_diacritics)
+        if output_offsets and self._is_whisper and self._whisper_ts_begin is not None:
+            from . import _whisper as _wh
+            offsets = _wh.whisper_compute_offsets(
+                ids, self._core, self._whisper_ts_begin, float(time_precision), int(segment_size)
+            )
+            return {"text": text, "offsets": offsets}
+        return text
 
-    def batch_decode(self, sequences, skip_special_tokens=False, **_):
-        if skip_special_tokens:
-            sequences = [[int(i) for i in s if int(i) not in self._special_ids] for s in sequences]
-        else:
-            sequences = [[int(i) for i in s] for s in sequences]
-        return self._core.decode_batch(sequences, 0)  # parallel Rust gather
+    def batch_decode(self, sequences, skip_special_tokens=False, decode_with_timestamps=False,
+                     output_offsets=False, time_precision=0.02, segment_size=1500,
+                     normalize=False, basic_normalize=False, remove_diacritics=False, **_):
+        if hasattr(sequences, "tolist"):
+            sequences = sequences.tolist()
+        elif sequences and not isinstance(sequences[0], list):
+            sequences = [s.tolist() if hasattr(s, "tolist") else [int(i) for i in s] for s in sequences]
+        texts = self._core.decode_batch(
+            sequences, 0, bool(skip_special_tokens), bool(decode_with_timestamps),
+            float(time_precision), int(segment_size),
+        )
+        if not decode_with_timestamps:
+            if normalize:
+                texts = [self.normalize(t) for t in texts]
+            elif basic_normalize:
+                texts = [self.basic_normalize(t, remove_diacritics=remove_diacritics) for t in texts]
+        if output_offsets and self._is_whisper and self._whisper_ts_begin is not None:
+            from . import _whisper as _wh
+            return [
+                {
+                    "text": t,
+                    "offsets": _wh.whisper_compute_offsets(
+                        s, self._core, self._whisper_ts_begin, float(time_precision), int(segment_size)
+                    ),
+                }
+                for t, s in zip(texts, sequences)
+            ]
+        return texts
 
     def _post_prefix_suffix(self):
         """Special ids the post-processor adds before/after a single sequence
@@ -479,9 +646,9 @@ class AutoTokenizer:
             if not add_special_tokens or self.__dict__.get("_ps_exact", False):
                 budget = (max(0, max_length - len(prefix) - len(suffix))
                           if (truncation and max_length) else None)
-                seqs = self._core.encode_special_post(
-                    texts, list(prefix), list(suffix), budget, self.truncation_side == "left", 0)
-                masks = [[1] * len(q) for q in seqs] if (return_attention_mask or padding) else None
+                want_mask = bool(return_attention_mask or padding)
+                seqs, masks = self._core.encode_special_post_masked(
+                    texts, list(prefix), list(suffix), budget, self.truncation_side == "left", want_mask, 0)
                 types = [[0] * len(q) for q in seqs] if return_token_type_ids else None
                 if padding:
                     width = max_length if (padding == "max_length" and max_length) else max((len(q) for q in seqs), default=0)

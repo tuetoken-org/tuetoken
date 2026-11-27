@@ -243,9 +243,11 @@ _LEGACY_BYTELEVEL_CLASSES = {
     "CodeGenTokenizer",
     "CodeGenTokenizerFast",
     "OPTTokenizer",
+    "WhisperTokenizer",
+    "WhisperTokenizerFast",
 }
 
-_LEGACY_BYTELEVEL_MODEL_TYPES = {"gpt2", "roberta", "bart", "opt", "codegen"}
+_LEGACY_BYTELEVEL_MODEL_TYPES = {"gpt2", "roberta", "bart", "opt", "codegen", "whisper"}
 
 
 def _tok_content(v):
@@ -257,31 +259,41 @@ def _tok_content(v):
 
 
 def try_load_legacy_bpe_repo(repo_id, revision=None, cache_dir=None):
-    """Best-effort converter for HF repos shipping `vocab.json` + `merges.txt`
-    without `tokenizer.json` (e.g. `facebook/opt-125m`).
+    """Best-effort converter for HF repos (or local directories) shipping
+    `vocab.json` + `merges.txt` without `tokenizer.json` (e.g. `facebook/opt-125m`
+    or legacy/fine-tuned Whisper repos).
 
     Strictly fail-closed: returns `None` unless the repo metadata unambiguously
     identifies a standard ByteLevel BPE model.
     """
-    from huggingface_hub import hf_hub_download
+    is_local_dir = os.path.isdir(repo_id)
 
-    kw = {"revision": revision} if revision else {}
+    def _fetch(filename):
+        if is_local_dir:
+            p = os.path.join(repo_id, filename)
+            if not os.path.isfile(p):
+                raise FileNotFoundError(p)
+            return p
+        from huggingface_hub import hf_hub_download
+        kw = {"revision": revision} if revision else {}
+        return hf_hub_download(repo_id, filename, **kw)
+
     try:
-        vocab_path = hf_hub_download(repo_id, "vocab.json", **kw)
-        merges_path = hf_hub_download(repo_id, "merges.txt", **kw)
+        vocab_path = _fetch("vocab.json")
+        merges_path = _fetch("merges.txt")
     except Exception:
         return None
 
     cfg = {}
     for name in ("special_tokens_map.json", "tokenizer_config.json"):
         try:
-            with open(hf_hub_download(repo_id, name, **kw), encoding="utf-8") as f:
+            with open(_fetch(name), encoding="utf-8") as f:
                 cfg.update(json.load(f))
         except Exception:
             pass
     model_cfg = {}
     try:
-        with open(hf_hub_download(repo_id, "config.json", **kw), encoding="utf-8") as f:
+        with open(_fetch("config.json"), encoding="utf-8") as f:
             model_cfg = json.load(f)
     except Exception:
         pass
@@ -298,14 +310,15 @@ def try_load_legacy_bpe_repo(repo_id, revision=None, cache_dir=None):
     at_path = None
     at_sig = ""
     try:
-        at_path = os.path.abspath(hf_hub_download(repo_id, "added_tokens.json", **kw))
+        at_path = os.path.abspath(_fetch("added_tokens.json"))
         st_a = os.stat(at_path)
         at_sig = f"{at_path}:{st_a.st_size}:{st_a.st_mtime_ns}"
     except Exception:
         pass
+    atd = cfg.get("added_tokens_decoder") or {}
     key = hashlib.sha1(
-        f"v2\x00{abs_v}:{st_v.st_size}:{st_v.st_mtime_ns}\x00{abs_m}:{st_m.st_size}:{st_m.st_mtime_ns}"
-        f"\x00{at_sig}\x00{tok_cls}\x00{model_type}\x00{cfg.get('add_prefix_space', False)}\x00{cfg.get('add_bos_token', True)}".encode()
+        f"v3\x00{abs_v}:{st_v.st_size}:{st_v.st_mtime_ns}\x00{abs_m}:{st_m.st_size}:{st_m.st_mtime_ns}"
+        f"\x00{at_sig}\x00{len(atd)}\x00{tok_cls}\x00{model_type}\x00{cfg.get('add_prefix_space', False)}\x00{cfg.get('add_bos_token', True)}".encode()
     ).hexdigest()[:16]
     cdir = Path(cache_dir) if cache_dir else (Path.home() / ".cache" / "tuetoken")
     cdir.mkdir(parents=True, exist_ok=True)
@@ -325,41 +338,69 @@ def try_load_legacy_bpe_repo(repo_id, revision=None, cache_dir=None):
                 continue
             merges.append(line)
 
-    # Collect added / special tokens from config + optional added_tokens.json
+    # Collect added / special tokens from added_tokens.json, added_tokens_decoder, and config
     added_map = {}
     if at_path is not None:
         try:
             with open(at_path, encoding="utf-8") as f:
                 for content, tid in json.load(f).items():
-                    added_map[content] = (int(tid), False)
+                    is_whisper_ts = (
+                        (model_type == "whisper" or tok_cls.startswith("Whisper"))
+                        and content.startswith("<|") and content.endswith("|>")
+                        and "." in content
+                    )
+                    is_whisper_sp = (
+                        (model_type == "whisper" or tok_cls.startswith("Whisper"))
+                        and not is_whisper_ts
+                    )
+                    added_map[content] = (int(tid), is_whisper_sp, False, False, False, False)
         except Exception:
             pass
+    for sid, info in atd.items():
+        if isinstance(info, dict) and info.get("content"):
+            added_map[info["content"]] = (
+                int(sid),
+                bool(info.get("special", False)),
+                bool(info.get("single_word", False)),
+                bool(info.get("lstrip", False)),
+                bool(info.get("rstrip", False)),
+                bool(info.get("normalized", False)),
+            )
 
     for field in ("bos_token", "eos_token", "unk_token", "pad_token", "cls_token", "sep_token", "mask_token"):
         c = _tok_content(cfg.get(field))
-        if c and c in vocab:
-            added_map[c] = (int(vocab[c]), True)
+        if c and c in vocab and c not in added_map:
+            added_map[c] = (int(vocab[c]), True, False, False, False, False)
     for item in cfg.get("additional_special_tokens") or []:
         c = _tok_content(item)
-        if c and c in vocab:
-            added_map[c] = (int(vocab[c]), True)
+        if c and c in vocab and c not in added_map:
+            added_map[c] = (int(vocab[c]), True, False, False, False, False)
 
     added_tokens = [
         {
             "id": tid,
             "content": content,
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
+            "single_word": sw,
+            "lstrip": ls,
+            "rstrip": rs,
+            "normalized": nm,
             "special": is_spec,
         }
-        for content, (tid, is_spec) in sorted(added_map.items(), key=lambda x: x[1][0])
+        for content, (tid, is_spec, sw, ls, rs, nm) in sorted(added_map.items(), key=lambda x: x[1][0])
     ]
 
     add_prefix_space = bool(cfg.get("add_prefix_space", False))
     post_processor = None
-    if model_type == "opt":
+    if model_type == "whisper" or tok_cls.startswith("Whisper"):
+        sot = added_map.get("<|startoftranscript|>")
+        nts = added_map.get("<|notimestamps|>")
+        eot_tok = _tok_content(cfg.get("eos_token")) or "<|endoftext|>"
+        eot_id = added_map[eot_tok][0] if eot_tok in added_map else vocab.get(eot_tok)
+        if sot is not None and nts is not None and eot_id is not None:
+            from . import _whisper as _wh
+            id2t = {sot[0]: "<|startoftranscript|>", nts[0]: "<|notimestamps|>", int(eot_id): eot_tok}
+            post_processor = _wh.whisper_post_processor(id2t, eot_tok, int(eot_id), [sot[0], nts[0]])
+    elif model_type == "opt":
         bos = _tok_content(cfg.get("bos_token")) or "</s>"
         if cfg.get("add_bos_token", True) and bos in vocab:
             post_processor = {

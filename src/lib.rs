@@ -807,9 +807,14 @@ struct Tokenizer {
     // string (specials + gaps) in one Rust pass instead of Python regex + a call
     // per fragment. Set once via `set_special_tokens`; None until then.
     special_ac: Option<aho_corasick::AhoCorasick>,
+    special_prefilter: SpecialPrefilter,
     special_ids: Vec<u32>,     // pattern i -> token id
     special_lstrip: Vec<bool>, // absorb whitespace to the left of the match
     special_rstrip: Vec<bool>, // absorb whitespace to the right
+    special_skip_mask: Vec<bool>, // token id -> true iff `special == true` in added_tokens
+    whisper_ts_begin: u32,     // `<|0.00|>` token id for Whisper models, else u32::MAX
+    whisper_sop_id: u32,       // `<|startofprev|>` token id for Whisper prompt stripping
+    whisper_sot_id: u32,       // `<|startoftranscript|>` token id for Whisper prompt stripping
     prepend_scheme: u8,        // 0 none, 1 always, 2 first, 3 never (metaspace prepend)
     // Load-time verified whole-chunk table (≤15-byte pre-token -> its single
     // token). See chunk_table.rs. Only consulted under Merge::Auto.
@@ -829,6 +834,87 @@ struct Tokenizer {
     int_table: OnceLock<Vec<Py<PyAny>>>,
     // Compact metadata for AutoTokenizer so Python skips re-parsing tokenizer.json.
     auto_meta: AutoMeta,
+}
+
+/// Fast SIMD prefilter for `encode_special_one`: before invoking the Aho-Corasick
+/// automaton (which may hold 1,600+ patterns, e.g. Whisper's `<|0.00|>`..`<|30.00|>`),
+/// scan for a shared 2-byte prefix or 1..=3 possible first bytes using `memchr`.
+/// On plain text with no special tokens, this bypasses AC completely and runs the
+/// SIMD BPE fast path directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialPrefilter {
+    None,
+    Prefix2(u8, u8),
+    Bytes1(u8),
+    Bytes2(u8, u8),
+    Bytes3(u8, u8, u8),
+}
+
+impl SpecialPrefilter {
+    fn from_patterns(patterns: &[String]) -> Self {
+        let mut first_bytes = [0u8; 4];
+        let mut n_first = 0usize;
+        let mut common2: Option<(u8, u8)> = None;
+        let mut all_ge2 = true;
+        let mut same2 = true;
+        for p in patterns {
+            let b = p.as_bytes();
+            if b.is_empty() {
+                return Self::None;
+            }
+            if b.len() < 2 {
+                all_ge2 = false;
+            } else if same2 {
+                match common2 {
+                    None => common2 = Some((b[0], b[1])),
+                    Some(pair) if pair != (b[0], b[1]) => same2 = false,
+                    _ => {}
+                }
+            }
+            let b0 = b[0];
+            if !first_bytes[..n_first].contains(&b0) && n_first < 4 {
+                first_bytes[n_first] = b0;
+                n_first += 1;
+            }
+        }
+        if let Some((b0, b1)) = common2 {
+            if all_ge2 && same2 {
+                return Self::Prefix2(b0, b1);
+            }
+        }
+        match n_first {
+            1 => Self::Bytes1(first_bytes[0]),
+            2 => Self::Bytes2(first_bytes[0], first_bytes[1]),
+            3 => Self::Bytes3(first_bytes[0], first_bytes[1], first_bytes[2]),
+            _ => Self::None,
+        }
+    }
+
+    #[inline]
+    fn find_first(self, hay: &[u8]) -> Option<usize> {
+        match self {
+            Self::None => Some(0),
+            Self::Prefix2(b0, b1) => {
+                if hay.len() < 2 {
+                    return None;
+                }
+                let mut pos = 0usize;
+                let limit = hay.len() - 1;
+                while pos < limit {
+                    let off = memchr::memchr(b0, &hay[pos..limit])?;
+                    let idx = pos + off;
+                    if hay[idx + 1] == b1 {
+                        return Some(idx);
+                    }
+                    pos = idx + 1;
+                }
+                None
+            }
+            Self::Bytes1(b0) => memchr::memchr(b0, hay),
+            Self::Bytes2(b0, b1) => memchr::memchr2(b0, b1, hay),
+            Self::Bytes3(b0, b1, b2) => memchr::memchr3(b0, b1, b2, hay),
+        }
+    }
 }
 
 /// Compact 24-byte pipeline record (down from 40B; chunk byte spans are
@@ -2167,11 +2253,15 @@ impl Tokenizer {
         f: impl Fn(&T) -> R + Sync,
     ) -> Vec<R> {
         const MIN_TASK_BYTES: usize = 4096;
+        const PAR_MIN_BYTES: usize = 65_536;
         let nt = if num_threads == 0 { 0 } else { num_threads.min(1024) };
         if nt == 1 || items.len() <= 1 || !parallel_ok() {
             return items.iter().map(f).collect();
         }
         let total: usize = items.iter().map(&weight).sum();
+        if total < PAR_MIN_BYTES {
+            return items.iter().map(f).collect();
+        }
         let avg = (total / items.len().max(1)).max(1);
         let min_len = (MIN_TASK_BYTES / avg).max(1);
         let run = || {
@@ -2259,20 +2349,6 @@ impl Tokenizer {
                 }
                 off += c;
                 pyo3::ffi::PyList_SET_ITEM(outer, d as pyo3::ffi::Py_ssize_t, inner);
-            }
-            Bound::from_owned_ptr(py, outer).cast_into_unchecked()
-        }
-    }
-
-    fn to_pylists<'py>(&self, py: Python<'py>, seqs: &[Vec<u32>]) -> Bound<'py, PyList> {
-        unsafe {
-            let outer = pyo3::ffi::PyList_New(seqs.len() as pyo3::ffi::Py_ssize_t);
-            if outer.is_null() {
-                return PyList::new(py, seqs.iter().map(|v| self.to_pylist(py, v))).expect("list alloc");
-            }
-            for (i, v) in seqs.iter().enumerate() {
-                let inner = self.to_pylist(py, v).into_ptr();
-                pyo3::ffi::PyList_SET_ITEM(outer, i as pyo3::ffi::Py_ssize_t, inner);
             }
             Bound::from_owned_ptr(py, outer).cast_into_unchecked()
         }
@@ -2431,9 +2507,10 @@ impl Tokenizer {
         self.chunk_table = table;
     }
 
-    /// Gather the raw bytes for `ids` from the contiguous token-byte arena.
-    /// Two passes: sum lengths for one exact allocation, then memcpy each span.
-    fn gather_bytes(&self, ids: &[u32]) -> Vec<u8> {
+    /// Gather the raw bytes for `ids` from the contiguous token-byte arena into `buf`.
+    /// Two passes: sum lengths for one exact reservation, then memcpy each span.
+    fn gather_bytes_into(&self, ids: &[u32], buf: &mut Vec<u8>) {
+        buf.clear();
         let nspans = self.byte_span.len();
         let mut total = 0usize;
         for &t in ids {
@@ -2441,7 +2518,7 @@ impl Tokenizer {
                 total += unsafe { self.byte_span.get_unchecked(t as usize).1 } as usize;
             }
         }
-        let mut buf: Vec<u8> = Vec::with_capacity(total);
+        buf.reserve(total);
         for &t in ids {
             let ti = t as usize;
             if ti < nspans {
@@ -2451,6 +2528,155 @@ impl Tokenizer {
                 buf.extend_from_slice(unsafe { self.byte_arena.get_unchecked(off..off + len) });
             }
         }
+    }
+
+    /// Gather the raw bytes for `ids` from the contiguous token-byte arena.
+    fn gather_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.gather_bytes_into(ids, &mut buf);
+        buf
+    }
+
+    /// Gather decoded bytes for `ids` into `out` (cleared first), supporting
+    /// `skip_special` and Whisper prompt stripping / timestamp stripping /
+    /// multi-segment timestamp accumulation (`decode_with_timestamps=true`).
+    fn gather_bytes_into_opts(
+        &self,
+        ids: &[u32],
+        skip_special: bool,
+        decode_with_timestamps: bool,
+        time_precision: f64,
+        segment_size: usize,
+        out: &mut Vec<u8>,
+    ) {
+        out.clear();
+        let ts_begin = self.whisper_ts_begin;
+        if !skip_special && ts_begin == u32::MAX {
+            self.gather_bytes_into(ids, out);
+            return;
+        }
+        // Whisper `_strip_prompt`: when `skip_special=true` and the sequence begins
+        // with `<|startofprev|>`, drop everything before `<|startoftranscript|>`
+        // (or yield empty if absent).
+        let ids = if skip_special
+            && self.whisper_sop_id != u32::MAX
+            && ids.first() == Some(&self.whisper_sop_id)
+        {
+            match ids.iter().position(|&t| t == self.whisper_sot_id) {
+                Some(pos) => &ids[pos..],
+                None => return,
+            }
+        } else {
+            ids
+        };
+
+        let nspans = self.byte_span.len();
+        let skip_mask = &self.special_skip_mask;
+        let is_special = |t: u32| -> bool {
+            let ti = t as usize;
+            ti < skip_mask.len() && unsafe { *skip_mask.get_unchecked(ti) }
+        };
+
+        if decode_with_timestamps && ts_begin != u32::MAX {
+            // Exact single-pass port of HF `WhisperTokenizerFast._decode_with_timestamps`:
+            // accumulate segment rollovers (>30s audio) and rewind consecutive
+            // boundary timestamps without per-segment Python decode re-entry.
+            use std::io::Write;
+            out.reserve(ids.len() * 4);
+            let mut marks: Vec<usize> = Vec::with_capacity(16);
+            marks.push(0);
+            let mut cur_max_ts = 0.0f64;
+            let mut prev_seg_len = 0.0f64;
+            let mut penult_ts = 0.0f64;
+
+            for (i, &t) in ids.iter().enumerate() {
+                if t >= ts_begin {
+                    let ts = (t - ts_begin) as f64 * time_precision;
+                    if ts < cur_max_ts {
+                        let last_was_single_ending =
+                            i >= 2 && !(ids[i - 1] >= ts_begin && ids[i - 2] >= ts_begin);
+                        if last_was_single_ending {
+                            prev_seg_len += time_precision * (segment_size as f64);
+                        } else {
+                            cur_max_ts = penult_ts;
+                            prev_seg_len += penult_ts;
+                            if marks.len() >= 2 {
+                                let new_len = marks.len() - 2;
+                                let cut = marks[new_len];
+                                marks.truncate(new_len);
+                                out.truncate(cut);
+                            } else {
+                                marks.clear();
+                                out.clear();
+                            }
+                        }
+                    }
+                    penult_ts = cur_max_ts;
+                    cur_max_ts = ts;
+                    marks.push(out.len());
+                    let _ = write!(out, "<|{:.2}|>", ts + prev_seg_len);
+                    marks.push(out.len());
+                } else {
+                    if skip_special && is_special(t) {
+                        continue;
+                    }
+                    let ti = t as usize;
+                    if ti < nspans {
+                        // SAFETY: ti < nspans; span points inside byte_arena.
+                        let (off, len) = unsafe { *self.byte_span.get_unchecked(ti) };
+                        let (off, len) = (off as usize, len as usize);
+                        out.extend_from_slice(unsafe {
+                            self.byte_arena.get_unchecked(off..off + len)
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        // Standard (or Whisper non-timestamped) decode: two-pass exact reserve.
+        let mut total = 0usize;
+        for &t in ids {
+            if t >= ts_begin || (skip_special && is_special(t)) {
+                continue;
+            }
+            let ti = t as usize;
+            if ti < nspans {
+                total += unsafe { self.byte_span.get_unchecked(ti).1 } as usize;
+            }
+        }
+        out.reserve(total);
+        for &t in ids {
+            if t >= ts_begin || (skip_special && is_special(t)) {
+                continue;
+            }
+            let ti = t as usize;
+            if ti < nspans {
+                // SAFETY: ti < nspans; span points inside byte_arena.
+                let (off, len) = unsafe { *self.byte_span.get_unchecked(ti) };
+                let (off, len) = (off as usize, len as usize);
+                out.extend_from_slice(unsafe { self.byte_arena.get_unchecked(off..off + len) });
+            }
+        }
+    }
+
+    fn gather_bytes_opts(
+        &self,
+        ids: &[u32],
+        skip_special: bool,
+        decode_with_timestamps: bool,
+        time_precision: f64,
+        segment_size: usize,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.gather_bytes_into_opts(
+            ids,
+            skip_special,
+            decode_with_timestamps,
+            time_precision,
+            segment_size,
+            &mut buf,
+        );
         buf
     }
 
@@ -4799,41 +5025,60 @@ impl Tokenizer {
         }
     }
 
-    /// Special-token-aware encode of one string (no GIL handling) — shared by the
-    /// `encode_special` and `encode_special_batch` entry points. Borrows `SCRATCH`
-    /// once and writes all fragments + special IDs directly into one output `Vec`,
-    /// honoring Unicode `char::is_whitespace()` for HF `AddedToken` `lstrip`/`rstrip`.
-    fn encode_special_one(&self, text: &str) -> Vec<u32> {
-        let ac = match &self.special_ac {
-            Some(a) => a,
-            None => return self.encode_one(text, Merge::Auto),
+    /// Special-token-aware encode of one string appended directly into `s.out`.
+    #[inline]
+    fn encode_special_into(&self, text: &str, s: &mut Scratch) {
+        let Some(ac) = &self.special_ac else {
+            self.encode_fragment_into(text, true, s);
+            return;
         };
+        let Some(first) = self.special_prefilter.find_first(text.as_bytes()) else {
+            self.encode_fragment_into(text, true, s);
+            return;
+        };
+        debug_assert!(text.is_char_boundary(first));
+        let n = text.len();
+        let mut last = 0usize;
+        for m in ac.find_iter(&text[first..]) {
+            let ms = first + m.start();
+            let me = first + m.end();
+            if ms < last {
+                continue;
+            }
+            let pat = m.pattern().as_usize();
+            let (mut start, mut end) = (ms, me);
+            if self.special_lstrip[pat] {
+                start = last + text[last..start].trim_end().len();
+            }
+            if self.special_rstrip[pat] {
+                end = n - text[end..].trim_start().len();
+            }
+            if start > last {
+                self.encode_fragment_into(&text[last..start], last == 0, s);
+            }
+            s.out.push(self.special_ids[pat]);
+            last = end;
+        }
+        if last < n {
+            self.encode_fragment_into(&text[last..], last == 0, s);
+        }
+    }
+
+    /// Special-token-aware encode of one string (no GIL handling) — shared by the
+    /// `encode_special` and `encode_special_batch` entry points. Uses `SpecialPrefilter`
+    /// to skip Aho-Corasick completely on plain text, and borrows `SCRATCH` once to
+    /// write all fragments + special IDs directly into one output `Vec`, honoring
+    /// Unicode `char::is_whitespace()` for HF `AddedToken` `lstrip`/`rstrip`.
+    fn encode_special_one(&self, text: &str) -> Vec<u32> {
+        if self.special_ac.is_none() || self.special_prefilter.find_first(text.as_bytes()).is_none()
+        {
+            return self.encode_one(text, Merge::Auto);
+        }
         let n = text.len();
         let run = |s: &mut Scratch| -> Vec<u32> {
             let saved = std::mem::take(&mut s.out);
             s.out = Vec::with_capacity(n / 3 + 8);
-            let mut last = 0usize;
-            for m in ac.find_iter(text) {
-                if m.start() < last {
-                    continue;
-                }
-                let pat = m.pattern().as_usize();
-                let (mut start, mut end) = (m.start(), m.end());
-                if self.special_lstrip[pat] {
-                    start = last + text[last..start].trim_end().len();
-                }
-                if self.special_rstrip[pat] {
-                    end = n - text[end..].trim_start().len();
-                }
-                if start > last {
-                    self.encode_fragment_into(&text[last..start], last == 0, s);
-                }
-                s.out.push(self.special_ids[pat]);
-                last = end;
-            }
-            if last < n {
-                self.encode_fragment_into(&text[last..], last == 0, s);
-            }
+            self.encode_special_into(text, s);
             std::mem::replace(&mut s.out, saved)
         };
         SCRATCH.with(|cell| match cell.try_borrow_mut() {
@@ -4847,6 +5092,163 @@ impl Tokenizer {
                 run(&mut s)
             }
         })
+    }
+
+    /// Encode a batch of text views serially into ONE flat `Vec<u32>` + row ends
+    /// (single `SCRATCH` borrow, zero per-row `Vec` allocations, zero rayon wakeup).
+    fn encode_special_serial_flat(&self, views: &[&str], total_bytes: usize) -> (Vec<u32>, Vec<usize>) {
+        let run = |s: &mut Scratch| -> (Vec<u32>, Vec<usize>) {
+            let saved = std::mem::take(&mut s.out);
+            s.out = Vec::with_capacity(total_bytes / 3 + views.len() * 2 + 8);
+            let mut ends = Vec::with_capacity(views.len());
+            for &t in views {
+                self.encode_special_into(t, s);
+                ends.push(s.out.len());
+            }
+            let flat = std::mem::replace(&mut s.out, saved);
+            (flat, ends)
+        };
+        SCRATCH.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut s) => {
+                s.dyn_cache.claim(self.uid);
+                s.long_cache.claim(self.uid);
+                run(&mut s)
+            }
+            Err(_) => {
+                let mut s = Scratch::default();
+                run(&mut s)
+            }
+        })
+    }
+
+    /// Encode a batch of text views in parallel into a small number of flat
+    /// per-chunk `(Vec<u32>, Vec<usize>)` buffers (avoiding N per-row heap allocs).
+    fn encode_special_par_chunks(
+        &self,
+        views: &[&str],
+        num_threads: usize,
+    ) -> Vec<(Vec<u32>, Vec<usize>)> {
+        let n = views.len();
+        let target_chunks = if num_threads == 0 {
+            rayon::current_num_threads().saturating_mul(2)
+        } else {
+            num_threads.min(1024).saturating_mul(2)
+        }
+        .max(1);
+        let chunk_len = n.div_ceil(target_chunks).max(16);
+        let run = || {
+            views
+                .par_chunks(chunk_len)
+                .map(|slice| {
+                    let bytes: usize = slice.iter().map(|t| t.len()).sum();
+                    self.encode_special_serial_flat(slice, bytes)
+                })
+                .collect::<Vec<_>>()
+        };
+        if num_threads == 0 {
+            run()
+        } else {
+            match fixed_pool(num_threads.min(1024)) {
+                Some(pool) => pool.install(run),
+                None => run(),
+            }
+        }
+    }
+
+    /// Build Python `list[list[int]]` rows (and optionally all-1s `attention_mask`
+    /// rows) from special-token-aware encoded texts in one Rust pass.
+    #[allow(clippy::too_many_arguments)]
+    fn build_special_post_lists<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<PyText>,
+        prefix: &[u32],
+        suffix: &[u32],
+        budget: Option<usize>,
+        trunc_left: bool,
+        want_mask: bool,
+        num_threads: usize,
+    ) -> PyResult<(Bound<'py, PyList>, Option<Bound<'py, PyList>>)> {
+        const FLAT_SERIAL_MAX: usize = 131_072;
+        let wide = wide_texts(py, &texts, num_threads)?;
+        let views = text_views(&texts, &wide);
+        let total: usize = views.iter().map(|t| t.len()).sum();
+        let nrows = views.len();
+        let chunks: Vec<(Vec<u32>, Vec<usize>)> =
+            if num_threads == 1 || nrows <= 1 || !parallel_ok() || total < FLAT_SERIAL_MAX {
+                let one = self.maybe_detach(py, total, || self.encode_special_serial_flat(&views, total));
+                vec![one]
+            } else {
+                py.detach(|| self.encode_special_par_chunks(&views, num_threads))
+            };
+
+        let table = self.ints(py);
+        let one_ptr = if let Some(o) = table.get(1) {
+            o.as_ptr()
+        } else {
+            unsafe { pyo3::ffi::PyLong_FromLong(1) }
+        };
+        let one_owned = table.get(1).is_none();
+        let obj = |t: u32| unsafe {
+            match table.get(t as usize) {
+                Some(o) => {
+                    let p = o.as_ptr();
+                    pyo3::ffi::Py_INCREF(p);
+                    p
+                }
+                None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
+            }
+        };
+        // SAFETY: each new list's slots are filled exactly once with owned refs.
+        unsafe {
+            let outer = pyo3::ffi::PyList_New(nrows as pyo3::ffi::Py_ssize_t);
+            assert!(!outer.is_null(), "list alloc");
+            let m_outer = if want_mask {
+                let p = pyo3::ffi::PyList_New(nrows as pyo3::ffi::Py_ssize_t);
+                assert!(!p.is_null(), "list alloc");
+                p
+            } else {
+                std::ptr::null_mut()
+            };
+            let mut r = 0usize;
+            for (flat_buf, flat_ends) in &chunks {
+                let mut start = 0usize;
+                for &end in flat_ends {
+                    let c = &flat_buf[start..end];
+                    start = end;
+                    let keep = budget.map_or(c.len(), |b| c.len().min(b));
+                    let content: &[u32] =
+                        if trunc_left { &c[c.len() - keep..] } else { &c[..keep] };
+                    let n = prefix.len() + content.len() + suffix.len();
+                    let inner = pyo3::ffi::PyList_New(n as pyo3::ffi::Py_ssize_t);
+                    assert!(!inner.is_null(), "list alloc");
+                    for (k, &t) in prefix.iter().chain(content).chain(suffix.iter()).enumerate() {
+                        pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj(t));
+                    }
+                    pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, inner);
+                    if !m_outer.is_null() {
+                        let m_inner = pyo3::ffi::PyList_New(n as pyo3::ffi::Py_ssize_t);
+                        assert!(!m_inner.is_null(), "list alloc");
+                        for k in 0..n {
+                            pyo3::ffi::Py_INCREF(one_ptr);
+                            pyo3::ffi::PyList_SET_ITEM(m_inner, k as pyo3::ffi::Py_ssize_t, one_ptr);
+                        }
+                        pyo3::ffi::PyList_SET_ITEM(m_outer, r as pyo3::ffi::Py_ssize_t, m_inner);
+                    }
+                    r += 1;
+                }
+            }
+            if one_owned {
+                pyo3::ffi::Py_DECREF(one_ptr);
+            }
+            let seqs = Bound::from_owned_ptr(py, outer).cast_into_unchecked();
+            let masks = if m_outer.is_null() {
+                None
+            } else {
+                Some(Bound::from_owned_ptr(py, m_outer).cast_into_unchecked())
+            };
+            Ok((seqs, masks))
+        }
     }
 
     fn apply_warmup_arg(&self, py: Python<'_>, warmup: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
@@ -5113,12 +5515,18 @@ impl Tokenizer {
             }
         }
         drop(vocab);
-        for (content, id, _, _, _) in &added_meta {
+        let mut special_skip_mask = vec![false; vocab_size];
+        for (content, id, sp, _, _) in &added_meta {
             let id = *id as usize;
-            if id < vocab_size && byte_span[id].1 == 0 {
-                let start = byte_arena.len() as u32;
-                byte_arena.extend_from_slice(content.as_bytes());
-                byte_span[id] = (start, content.len() as u32);
+            if id < vocab_size {
+                if *sp {
+                    special_skip_mask[id] = true;
+                }
+                if byte_span[id].1 == 0 {
+                    let start = byte_arena.len() as u32;
+                    byte_arena.extend_from_slice(content.as_bytes());
+                    byte_span[id] = (start, content.len() as u32);
+                }
             }
         }
 
@@ -5224,9 +5632,14 @@ impl Tokenizer {
             is_byte_level: !byte_fallback,
             monotonic,
             special_ac: None,
+            special_prefilter: SpecialPrefilter::None,
             special_ids: Vec::new(),
             special_lstrip: Vec::new(),
             special_rstrip: Vec::new(),
+            special_skip_mask,
+            whisper_ts_begin: u32::MAX,
+            whisper_sop_id: u32::MAX,
+            whisper_sot_id: u32::MAX,
             prepend_scheme: 0,
             chunk_table: chunk_table::ChunkTable::empty(),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -5439,6 +5852,7 @@ impl Tokenizer {
     fn set_special_tokens(&mut self, contents: Vec<String>, ids: Vec<u32>,
                           lstrip: Vec<bool>, rstrip: Vec<bool>, scheme: u8) -> PyResult<()> {
         use aho_corasick::{AhoCorasick, MatchKind};
+        self.special_prefilter = SpecialPrefilter::from_patterns(&contents);
         self.special_ac = if contents.is_empty() {
             None
         } else {
@@ -5456,6 +5870,15 @@ impl Tokenizer {
         Ok(())
     }
 
+    /// Configure Whisper-specific decode handling in Rust (timestamp token range
+    /// starting at `ts_begin`, plus `<|startofprev|>` / `<|startoftranscript|>` ids
+    /// for prompt stripping when `skip_special_tokens=True`).
+    fn set_whisper_decode(&mut self, ts_begin: u32, sop_id: u32, sot_id: u32) {
+        self.whisper_ts_begin = ts_begin;
+        self.whisper_sop_id = sop_id;
+        self.whisper_sot_id = sot_id;
+    }
+
     /// Special-token-aware encode (WITHOUT the post-processor's BOS/EOS): split on
     /// the registered added tokens (leftmost-longest, honouring lstrip/rstrip), BPE
     /// each gap, splice the special ids — all in one Rust pass. Same ids as the
@@ -5470,8 +5893,8 @@ impl Tokenizer {
     /// loop. `num_threads` 0 = all cores.
     #[pyo3(signature = (texts, num_threads = 0))]
     fn encode_special_batch<'py>(&self, py: Python<'py>, texts: Vec<PyText>, num_threads: usize) -> PyResult<Bound<'py, PyList>> {
-        let seqs = { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_special_one(t))) };
-        Ok(self.to_pylists(py, &seqs))
+        let (seqs, _) = self.build_special_post_lists(py, texts, &[], &[], None, false, false, num_threads)?;
+        Ok(seqs)
     }
 
     /// AutoTokenizer `__call__` fast path (single sequences, no tensors): special
@@ -5491,35 +5914,45 @@ impl Tokenizer {
         trunc_left: bool,
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyList>> {
-        let seqs = { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_special_one(t))) };
-        let table = self.ints(py);
-        let obj = |t: u32| unsafe {
-            match table.get(t as usize) {
-                Some(o) => {
-                    let p = o.as_ptr();
-                    pyo3::ffi::Py_INCREF(p);
-                    p
-                }
-                None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
-            }
-        };
-        // SAFETY: each new list's slots are filled exactly once with owned refs.
-        unsafe {
-            let outer = pyo3::ffi::PyList_New(seqs.len() as pyo3::ffi::Py_ssize_t);
-            assert!(!outer.is_null(), "list alloc");
-            for (r, c) in seqs.iter().enumerate() {
-                let keep = budget.map_or(c.len(), |b| c.len().min(b));
-                let content: &[u32] = if trunc_left { &c[c.len() - keep..] } else { &c[..keep] };
-                let n = prefix.len() + content.len() + suffix.len();
-                let inner = pyo3::ffi::PyList_New(n as pyo3::ffi::Py_ssize_t);
-                assert!(!inner.is_null(), "list alloc");
-                for (k, &t) in prefix.iter().chain(content).chain(suffix.iter()).enumerate() {
-                    pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj(t));
-                }
-                pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, inner);
-            }
-            Ok(Bound::from_owned_ptr(py, outer).cast_into_unchecked())
-        }
+        let (seqs, _) = self.build_special_post_lists(
+            py,
+            texts,
+            &prefix,
+            &suffix,
+            budget,
+            trunc_left,
+            false,
+            num_threads,
+        )?;
+        Ok(seqs)
+    }
+
+    /// Same as `encode_special_post`, optionally also constructing the all-1s
+    /// `attention_mask` Python lists in the same Rust FFI pass (avoiding a
+    /// Python `[[1] * len(q) for q in seqs]` loop over 10K+ rows).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (texts, prefix, suffix, budget = None, trunc_left = false, want_mask = true, num_threads = 0))]
+    fn encode_special_post_masked<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<PyText>,
+        prefix: Vec<u32>,
+        suffix: Vec<u32>,
+        budget: Option<usize>,
+        trunc_left: bool,
+        want_mask: bool,
+        num_threads: usize,
+    ) -> PyResult<(Bound<'py, PyList>, Option<Bound<'py, PyList>>)> {
+        self.build_special_post_lists(
+            py,
+            texts,
+            &prefix,
+            &suffix,
+            budget,
+            trunc_left,
+            want_mask,
+            num_threads,
+        )
     }
 
     /// Buffer fast-path for the output side: ordinary-encode to a raw
@@ -5933,28 +6366,147 @@ impl Tokenizer {
         Ok(out)
     }
 
-    /// Decode many token sequences, in parallel. The byte gather runs without the
-    /// GIL; the Python strings are built once at the end.
-    #[pyo3(signature = (sequences, num_threads = 0))]
+    /// Decode many token sequences, in parallel for large batches or in a single
+    /// reused byte buffer for small batches. Supports `skip_special_tokens` and
+    /// Whisper timestamp decoding directly in Rust (zero Python per-token loops).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (sequences, num_threads = 0, skip_special_tokens = false, decode_with_timestamps = false, time_precision = 0.02, segment_size = 1500))]
     fn decode_batch<'py>(
         &self,
         py: Python<'py>,
-        sequences: Vec<Vec<u32>>,
+        sequences: &Bound<'py, PyAny>,
         num_threads: usize,
-    ) -> Bound<'py, PyList> {
-        let bufs: Vec<Vec<u8>> =
-            py.detach(|| self.par_over(num_threads, &sequences, |ids| ids.len() * 4, |ids| self.gather_bytes(ids)));
-        let out = PyList::empty(py);
-        for buf in &bufs {
-            out.append(bytes_to_pystr(py, self.strip_decoded(buf))).unwrap();
+        skip_special_tokens: bool,
+        decode_with_timestamps: bool,
+        time_precision: f64,
+        segment_size: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        // Fast FFI extraction for list[list[int]] into one flat Vec<u32> + row ends
+        // (avoids PyO3's generic Vec<Vec<u32>> per-row heap allocations + boxing overhead).
+        let (flat_ids, row_ends): (Vec<u32>, Vec<usize>) = unsafe {
+            let ptr = sequences.as_ptr();
+            if pyo3::ffi::PyList_Check(ptr) != 0 {
+                let nrows = pyo3::ffi::PyList_GET_SIZE(ptr) as usize;
+                let mut flat: Vec<u32> = Vec::with_capacity(nrows * 16);
+                let mut ends: Vec<usize> = Vec::with_capacity(nrows);
+                let mut ok = true;
+                'outer: for r in 0..nrows {
+                    let row = pyo3::ffi::PyList_GET_ITEM(ptr, r as pyo3::ffi::Py_ssize_t);
+                    if pyo3::ffi::PyList_Check(row) == 0 {
+                        ok = false;
+                        break;
+                    }
+                    let n = pyo3::ffi::PyList_GET_SIZE(row) as usize;
+                    flat.reserve(n);
+                    for i in 0..n {
+                        let item = pyo3::ffi::PyList_GET_ITEM(row, i as pyo3::ffi::Py_ssize_t);
+                        let val = pyo3::ffi::PyLong_AsLongLong(item);
+                        if val < 0 || val > u32::MAX as i64 {
+                            ok = false;
+                            break 'outer;
+                        }
+                        flat.push(val as u32);
+                    }
+                    ends.push(flat.len());
+                }
+                if ok && pyo3::ffi::PyErr_Occurred().is_null() {
+                    (flat, ends)
+                } else {
+                    pyo3::ffi::PyErr_Clear();
+                    let vecs = sequences.extract::<Vec<Vec<u32>>>()?;
+                    let total: usize = vecs.iter().map(|v| v.len()).sum();
+                    let mut flat = Vec::with_capacity(total);
+                    let mut ends = Vec::with_capacity(vecs.len());
+                    for v in vecs {
+                        flat.extend_from_slice(&v);
+                        ends.push(flat.len());
+                    }
+                    (flat, ends)
+                }
+            } else {
+                let vecs = sequences.extract::<Vec<Vec<u32>>>()?;
+                let total: usize = vecs.iter().map(|v| v.len()).sum();
+                let mut flat = Vec::with_capacity(total);
+                let mut ends = Vec::with_capacity(vecs.len());
+                for v in vecs {
+                    flat.extend_from_slice(&v);
+                    ends.push(flat.len());
+                }
+                (flat, ends)
+            }
+        };
+
+        let nrows = row_ends.len();
+        const PAR_DECODE_MIN_TOKS: usize = 32_768;
+        if num_threads == 1 || nrows <= 1 || !parallel_ok() || flat_ids.len() < PAR_DECODE_MIN_TOKS
+        {
+            let mut buf = Vec::with_capacity(256);
+            unsafe {
+                let outer = pyo3::ffi::PyList_New(nrows as pyo3::ffi::Py_ssize_t);
+                assert!(!outer.is_null(), "list alloc");
+                let mut start = 0usize;
+                for (r, &end) in row_ends.iter().enumerate() {
+                    self.gather_bytes_into_opts(
+                        &flat_ids[start..end],
+                        skip_special_tokens,
+                        decode_with_timestamps,
+                        time_precision,
+                        segment_size,
+                        &mut buf,
+                    );
+                    start = end;
+                    let s = bytes_to_pystr(py, self.strip_decoded(&buf));
+                    pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, s.into_ptr());
+                }
+                return Ok(Bound::from_owned_ptr(py, outer).cast_into_unchecked());
+            }
         }
-        out
+
+        let ranges: Vec<(usize, usize)> = {
+            let mut v = Vec::with_capacity(nrows);
+            let mut start = 0usize;
+            for &end in &row_ends {
+                v.push((start, end));
+                start = end;
+            }
+            v
+        };
+        let bufs: Vec<Vec<u8>> = py.detach(|| {
+            self.par_over(
+                num_threads,
+                &ranges,
+                |&(a, b)| (b - a) * 4,
+                |&(a, b)| {
+                    self.gather_bytes_opts(
+                        &flat_ids[a..b],
+                        skip_special_tokens,
+                        decode_with_timestamps,
+                        time_precision,
+                        segment_size,
+                    )
+                },
+            )
+        });
+        unsafe {
+            let outer = pyo3::ffi::PyList_New(nrows as pyo3::ffi::Py_ssize_t);
+            assert!(!outer.is_null(), "list alloc");
+            for (r, buf) in bufs.iter().enumerate() {
+                let s = bytes_to_pystr(py, self.strip_decoded(buf));
+                pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, s.into_ptr());
+            }
+            Ok(Bound::from_owned_ptr(py, outer).cast_into_unchecked())
+        }
     }
 
+    #[pyo3(signature = (tokens, skip_special_tokens = false, decode_with_timestamps = false, time_precision = 0.02, segment_size = 1500))]
     fn decode<'py>(
         &self,
         py: Python<'py>,
         tokens: &Bound<'py, PyAny>,
+        skip_special_tokens: bool,
+        decode_with_timestamps: bool,
+        time_precision: f64,
+        segment_size: usize,
     ) -> PyResult<Bound<'py, PyString>> {
         // Fast list extraction: pyo3's `Vec<u32>` FromPyObject is ~2x slower than
         // the raw CPython list API (it dominates ~44% of list-decode time). For a
@@ -5992,7 +6544,15 @@ impl Tokenizer {
                 tokens.extract::<Vec<u32>>()?
             }
         };
-        let buf = py.detach(|| self.gather_bytes(&ids));
+        let buf = self.maybe_detach(py, ids.len().saturating_mul(4), || {
+            self.gather_bytes_opts(
+                &ids,
+                skip_special_tokens,
+                decode_with_timestamps,
+                time_precision,
+                segment_size,
+            )
+        });
         Ok(bytes_to_pystr(py, self.strip_decoded(&buf)))
     }
 
@@ -7027,5 +7587,117 @@ mod perf {
         assert_eq!(lookup(b"xyzw"), Some(266));  // yz has higher rank -> xy+zw succeeds
         assert_eq!(lookup(b"bbb"), None);        // b+bb preempted by leftmost b+b -> [bb, b]
         assert_eq!(lookup(b"unmerged_tok"), None);
+    }
+
+    #[test]
+    fn special_prefilter_classification_and_scan() {
+        let p_whisper = SpecialPrefilter::from_patterns(&[
+            "<|endoftext|>".to_string(),
+            "<|startoftranscript|>".to_string(),
+            "<|0.00|>".to_string(),
+            "<|30.00|>".to_string(),
+        ]);
+        assert_eq!(p_whisper, SpecialPrefilter::Prefix2(b'<', b'|'));
+        assert_eq!(p_whisper.find_first(b"plain hello world < not pipe"), None);
+        assert_eq!(p_whisper.find_first(b"a < b <|0.00|> c"), Some(6));
+        assert_eq!(p_whisper.find_first(b"<"), None);
+
+        let p_one = SpecialPrefilter::from_patterns(&[
+            "<s>".to_string(),
+            "<|im_start|>".to_string(),
+        ]);
+        assert_eq!(p_one, SpecialPrefilter::Bytes1(b'<'));
+        assert_eq!(p_one.find_first(b"no angle brackets here"), None);
+        assert_eq!(p_one.find_first(b"hi <s>"), Some(3));
+
+        let p_two = SpecialPrefilter::from_patterns(&[
+            "<s>".to_string(),
+            "[INST]".to_string(),
+        ]);
+        assert_eq!(p_two, SpecialPrefilter::Bytes2(b'<', b'['));
+        assert_eq!(p_two.find_first(b"plain text"), None);
+        assert_eq!(p_two.find_first(b"abc [INST]"), Some(4));
+
+        let p_three = SpecialPrefilter::from_patterns(&[
+            "<s>".to_string(),
+            "[CLS]".to_string(),
+            "{X}".to_string(),
+        ]);
+        assert_eq!(p_three, SpecialPrefilter::Bytes3(b'<', b'[', b'{'));
+        assert_eq!(p_three.find_first(b"plain text"), None);
+        assert_eq!(p_three.find_first(b"a {X}"), Some(2));
+
+        let p_many = SpecialPrefilter::from_patterns(&[
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ]);
+        assert_eq!(p_many, SpecialPrefilter::None);
+        assert_eq!(p_many.find_first(b"xyz"), Some(0));
+    }
+
+    #[test]
+    fn whisper_gather_bytes_opts_timestamps_and_prompt_strip() {
+        let mut vocab = serde_json::Map::new();
+        let c2b = bytes_to_unicode_table();
+        let mut b2u = ['\0'; 256];
+        for (cp, &bv) in c2b.iter().enumerate() {
+            if bv != u16::MAX {
+                b2u[bv as usize] = char::from_u32(cp as u32).unwrap();
+            }
+        }
+        for b in 0u8..=255 {
+            vocab.insert(b2u[b as usize].to_string(), serde_json::json!(b as u32));
+        }
+        // Special tokens: 256=<|endoftext|>, 257=<|startoftranscript|>, 258=<|startofprev|>
+        // Timestamps (special=false): 260=<|0.00|>, 260+k=<|0.02*k|>
+        let mut added = vec![
+            serde_json::json!({"id": 256, "content": "<|endoftext|>", "special": true, "lstrip": false, "rstrip": false}),
+            serde_json::json!({"id": 257, "content": "<|startoftranscript|>", "special": true, "lstrip": false, "rstrip": false}),
+            serde_json::json!({"id": 258, "content": "<|startofprev|>", "special": true, "lstrip": false, "rstrip": false}),
+        ];
+        for k in 0..=1500u32 {
+            let label = format!("<|{:.2}|>", k as f64 * 0.02);
+            added.push(serde_json::json!({"id": 260 + k, "content": label, "special": false, "lstrip": false, "rstrip": false}));
+        }
+        let doc = serde_json::json!({
+            "version": "1.0",
+            "model": { "type": "BPE", "vocab": vocab, "merges": [] },
+            "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "use_regex": true },
+            "decoder": { "type": "ByteLevel" },
+            "added_tokens": added
+        });
+        let tmp = std::env::temp_dir().join(format!("tuetoken_whisper_dec_{}.json", std::process::id()));
+        std::fs::write(&tmp, doc.to_string()).unwrap();
+        let mut tk = Tokenizer::new(tmp.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        tk.set_whisper_decode(260, 258, 257);
+
+        let ts = |sec_fiftieths: u32| 260 + sec_fiftieths;
+        let ids_prompt_and_segs: Vec<u32> = vec![
+            258, b'p' as u32, b'r' as u32, // <|startofprev|>pr
+            257,                           // <|startoftranscript|>
+            ts(0), b'A' as u32, ts(1000),  // <|0.00|>A<|20.00|>
+            ts(1000), ts(250), b'B' as u32, ts(500), // consecutive boundary -> rewind second 20.00, shift +20.00 -> <|25.00|>B<|30.00|>
+            256,                           // <|endoftext|>
+        ];
+        // 1. skip_special=true, decode_with_timestamps=false: strips prompt, specials, AND timestamps
+        let s1 = String::from_utf8(tk.gather_bytes_opts(&ids_prompt_and_segs, true, false, 0.02, 1500)).unwrap();
+        assert_eq!(s1, "AB");
+        // 2. skip_special=false, decode_with_timestamps=false: keeps prompt & specials, strips timestamps
+        let s2 = String::from_utf8(tk.gather_bytes_opts(&ids_prompt_and_segs, false, false, 0.02, 1500)).unwrap();
+        assert_eq!(s2, "<|startofprev|>pr<|startoftranscript|>AB<|endoftext|>");
+        // 3. skip_special=true, decode_with_timestamps=true: strips prompt & specials, accumulates rollover!
+        let s3 = String::from_utf8(tk.gather_bytes_opts(&ids_prompt_and_segs, true, true, 0.02, 1500)).unwrap();
+        assert_eq!(s3, "<|0.00|>A<|20.00|><|25.00|>B<|30.00|>");
+        // 4. Single-ending segment rollover (+30.00s): <|0.00|>X<|29.00|><|1.00|>Y<|5.00|>
+        let ids_single_end = vec![257, ts(0), b'X' as u32, ts(1450), ts(50), b'Y' as u32, ts(250), 256];
+        let s4 = String::from_utf8(tk.gather_bytes_opts(&ids_single_end, true, true, 0.02, 1500)).unwrap();
+        assert_eq!(s4, "<|0.00|>X<|29.00|><|31.00|>Y<|35.00|>");
+        // 5. Prompt with NO <|startoftranscript|> -> empty when skip_special=true
+        let ids_no_sot = vec![258, b'x' as u32, b'y' as u32];
+        let s5 = String::from_utf8(tk.gather_bytes_opts(&ids_no_sot, true, false, 0.02, 1500)).unwrap();
+        assert_eq!(s5, "");
     }
 }
