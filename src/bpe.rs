@@ -555,144 +555,29 @@ const INIT_NEXT: [u8; MAX_SMALL] = {
     a
 };
 
-/// 64-byte aligned pair-rank buffer: indices `0..64` hold packed `(rank << 6) | idx`
-/// (or `u32::MAX` for dead/unmergeable pairs), and index `64` is a dead sink for
-/// branchless `rnk[prev[0]] = u32::MAX`.
-#[repr(C, align(64))]
-struct AlignedRnk([u32; MAX_SMALL + 1]);
-
-#[inline(always)]
-fn pack_rnk(r: u32, idx: usize) -> u32 {
-    if r == u32::MAX { u32::MAX } else { (r << 6) | (idx as u32) }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn min_rnk_neon(p: *const u32, scan_len: usize) -> u32 {
-    use std::arch::aarch64::*;
-    match scan_len {
-        4 => vminvq_u32(vld1q_u32(p)),
-        8 => vminvq_u32(vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)))),
-        16 => {
-            let m01 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)));
-            let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
-            vminvq_u32(vminq_u32(m01, m23))
-        }
-        32 => {
-            let a0 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(16)));
-            let a1 = vminq_u32(vld1q_u32(p.add(4)), vld1q_u32(p.add(20)));
-            let a2 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(24)));
-            let a3 = vminq_u32(vld1q_u32(p.add(12)), vld1q_u32(p.add(28)));
-            vminvq_u32(vminq_u32(vminq_u32(a0, a1), vminq_u32(a2, a3)))
-        }
-        _ => {
-            let mut a0 = vld1q_u32(p);
-            let mut a1 = vld1q_u32(p.add(4));
-            let mut a2 = vld1q_u32(p.add(8));
-            let mut a3 = vld1q_u32(p.add(12));
-            let mut off = 16usize;
-            while off < 64 {
-                a0 = vminq_u32(a0, vld1q_u32(p.add(off)));
-                a1 = vminq_u32(a1, vld1q_u32(p.add(off + 4)));
-                a2 = vminq_u32(a2, vld1q_u32(p.add(off + 8)));
-                a3 = vminq_u32(a3, vld1q_u32(p.add(off + 12)));
-                off += 16;
-            }
-            vminvq_u32(vminq_u32(vminq_u32(a0, a1), vminq_u32(a2, a3)))
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn hmin_epu32_avx2(v: std::arch::x86_64::__m256i) -> u32 {
-    use std::arch::x86_64::*;
-    let lo = _mm256_castsi256_si128(v);
-    let hi = _mm256_extracti128_si256(v, 1);
-    let m4 = _mm_min_epu32(lo, hi);
-    let m2 = _mm_min_epu32(m4, _mm_shuffle_epi32(m4, 0b01_00_11_10));
-    let m1 = _mm_min_epu32(m2, _mm_shuffle_epi32(m2, 0b10_11_00_01));
-    _mm_cvtsi128_si32(m1) as u32
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn min_rnk_avx2(p: *const u32, scan_len: usize) -> u32 {
-    use std::arch::x86_64::*;
-    match scan_len {
-        4 => {
-            let m4 = _mm_load_si128(p as *const __m128i);
-            let m2 = _mm_min_epu32(m4, _mm_shuffle_epi32(m4, 0b01_00_11_10));
-            let m1 = _mm_min_epu32(m2, _mm_shuffle_epi32(m2, 0b10_11_00_01));
-            _mm_cvtsi128_si32(m1) as u32
-        }
-        8 => hmin_epu32_avx2(_mm256_load_si256(p as *const __m256i)),
-        16 => {
-            let v0 = _mm256_load_si256(p as *const __m256i);
-            let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
-            hmin_epu32_avx2(_mm256_min_epu32(v0, v1))
-        }
-        32 => {
-            let v0 = _mm256_load_si256(p as *const __m256i);
-            let v1 = _mm256_load_si256(p.add(8) as *const __m256i);
-            let v2 = _mm256_load_si256(p.add(16) as *const __m256i);
-            let v3 = _mm256_load_si256(p.add(24) as *const __m256i);
-            hmin_epu32_avx2(_mm256_min_epu32(_mm256_min_epu32(v0, v1), _mm256_min_epu32(v2, v3)))
-        }
-        _ => {
-            let mut a0 = _mm256_load_si256(p as *const __m256i);
-            let mut a1 = _mm256_load_si256(p.add(8) as *const __m256i);
-            let mut a2 = _mm256_load_si256(p.add(16) as *const __m256i);
-            let mut a3 = _mm256_load_si256(p.add(24) as *const __m256i);
-            a0 = _mm256_min_epu32(a0, _mm256_load_si256(p.add(32) as *const __m256i));
-            a1 = _mm256_min_epu32(a1, _mm256_load_si256(p.add(40) as *const __m256i));
-            a2 = _mm256_min_epu32(a2, _mm256_load_si256(p.add(48) as *const __m256i));
-            a3 = _mm256_min_epu32(a3, _mm256_load_si256(p.add(56) as *const __m256i));
-            hmin_epu32_avx2(_mm256_min_epu32(_mm256_min_epu32(a0, a1), _mm256_min_epu32(a2, a3)))
-        }
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline(always)]
-unsafe fn min_rnk_scalar(p: *const u32, scan_len: usize) -> u32 {
-    let mut a0 = *p;
-    let mut a1 = *p.add(1);
-    let mut a2 = *p.add(2);
-    let mut a3 = *p.add(3);
-    let mut i = 4usize;
-    while i < scan_len {
-        a0 = a0.min(*p.add(i));
-        a1 = a1.min(*p.add(i + 1));
-        a2 = a2.min(*p.add(i + 2));
-        a3 = a3.min(*p.add(i + 3));
-        i += 4;
-    }
-    a0.min(a1).min(a2.min(a3))
-}
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn has_avx2() -> bool {
+fn has_bmi1() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     let s = STATE.load(Ordering::Relaxed);
     if s != 0 {
         return s == 2;
     }
-    let ok = std::is_x86_feature_detected!("avx2");
+    let ok = std::is_x86_feature_detected!("bmi1");
     STATE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
     ok
 }
 
-/// Stack doubly-linked-list canonical BPE merge with packed `(rank << 6) | idx`
-/// SIMD min-reduction: zero element shifting, O(1) deletion, branchless SIMD
-/// simultaneous `(min_rank, leftmost_idx)` search, L1 `can_lr` terminal filter,
-/// and dual-neighbor prefetch.
+/// Stack doubly-linked-list canonical BPE merge with zero-STLF `active: u64`
+/// bitmask min-reduction:
+/// - Tracks only currently mergeable pair indices in a 64-bit `active` mask.
+/// - Reads `rnk[i]` with matching 4-byte scalar loads (eliminates the 12-18
+///   cycle Store-To-Load Forwarding stall from wide SIMD loads overlapping
+///   narrow 4-byte scalar writes on both Zen 4 and Apple Silicon).
+/// - Instant zero-load exit on `active == 0` and 1-load exit when 1 pair left.
 macro_rules! merge_small_ll_body {
-    ($tokens:expr, $map:expr, $min_fn:ident) => {{
+    ($tokens:expr, $map:expr) => {{
         let n = $tokens.len();
         debug_assert!(n >= 2 && n <= MAX_SMALL && !$map.packed.is_empty());
         if n == 2 {
@@ -712,20 +597,10 @@ macro_rules! merge_small_ll_body {
             or_all |= t;
         }
         let nr = n - 1;
-        let scan_len = if nr <= 4 {
-            4
-        } else if nr <= 8 {
-            8
-        } else if nr <= 16 {
-            16
-        } else if nr <= 32 {
-            32
-        } else {
-            64
-        };
-        let mut rnk_buf = std::mem::MaybeUninit::<AlignedRnk>::uninit();
+        let mut rnk_buf = std::mem::MaybeUninit::<[u32; MAX_SMALL]>::uninit();
         let rnk = rnk_buf.as_mut_ptr() as *mut u32;
         let mut best = u32::MAX;
+        let mut active = 0u64;
         if or_all < 256 {
             let dense = $map.dense.as_ptr();
             if !$map.has_dense_overflow {
@@ -733,9 +608,12 @@ macro_rules! merge_small_ll_body {
                     let a = *tok.add(i) as usize;
                     let b = *tok.add(i + 1) as usize;
                     let d = *dense.add((a << 8) | b);
-                    let p = if d == DENSE_NONE { u32::MAX } else { ((d as u32) << 6) | (i as u32) };
-                    *rnk.add(i) = p;
-                    best = best.min(p);
+                    if d != DENSE_NONE {
+                        let p = ((d as u32) << 6) | (i as u32);
+                        *rnk.add(i) = p;
+                        active |= 1u64 << i;
+                        best = best.min(p);
+                    }
                 }
             } else {
                 for i in 0..nr {
@@ -749,24 +627,27 @@ macro_rules! merge_small_ll_body {
                     } else {
                         $map.probe_dense_overflow(a, b)
                     };
-                    let p = pack_rnk(r, i);
-                    *rnk.add(i) = p;
-                    best = best.min(p);
+                    if r != u32::MAX {
+                        let p = (r << 6) | (i as u32);
+                        *rnk.add(i) = p;
+                        active |= 1u64 << i;
+                        best = best.min(p);
+                    }
                 }
             }
         } else {
             for i in 0..nr {
                 let r = $map.lookup_rank(*tok.add(i), *tok.add(i + 1));
-                let p = pack_rnk(r, i);
-                *rnk.add(i) = p;
-                best = best.min(p);
+                if r != u32::MAX {
+                    let p = (r << 6) | (i as u32);
+                    *rnk.add(i) = p;
+                    active |= 1u64 << i;
+                    best = best.min(p);
+                }
             }
         }
-        if best == u32::MAX {
+        if active == 0 {
             return;
-        }
-        for i in nr..scan_len {
-            *rnk.add(i) = u32::MAX;
         }
         let mut prev_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL + 1]>::uninit();
         let mut next_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL]>::uninit();
@@ -783,22 +664,17 @@ macro_rules! merge_small_ll_body {
             *tok.add(bi) = merged;
             *next.add(bi) = rr as u8;
             *prev.add(rr) = bi as u8;
-            *rnk.add(r) = u32::MAX;
             if bi == 0 && rr == n {
                 break;
             }
-            let l = *prev.add(bi) as usize; // 64 (dead sink) when bi == 0
+            let l = *prev.add(bi) as usize;
+            let lmask = if bi != 0 { 1u64 << l } else { 0 };
+            active &= !((1u64 << r) | (1u64 << bi) | lmask);
             let mlr = $map.lr_bits(merged);
-            if mlr == 0 {
-                // >72% of merged BPE tokens are isolated: zero neighbor probes.
-                *rnk.add(l) = u32::MAX;
-                *rnk.add(bi) = u32::MAX;
-            } else {
-                let has_l = bi != 0;
-                let has_r = rr < n;
-                let do_l = has_l && (mlr & 2) != 0 && ($map.lr_bits(*tok.add(l)) & 1) != 0;
-                let do_r = has_r && (mlr & 1) != 0 && ($map.lr_bits(*tok.add(rr)) & 2) != 0;
-                if merged >= 256 {
+            if mlr != 0 {
+                let do_l = bi != 0 && (mlr & 2) != 0 && ($map.lr_bits(*tok.add(l)) & 1) != 0;
+                let do_r = rr < n && (mlr & 1) != 0 && ($map.lr_bits(*tok.add(rr)) & 2) != 0;
+                let (rl, rr_val) = if merged >= 256 {
                     let mut idx_l = usize::MAX;
                     let mut idx_r = usize::MAX;
                     let mut kh_l = 0u64;
@@ -820,36 +696,39 @@ macro_rules! merge_small_ll_body {
                     if idx_l != usize::MAX && idx_r != usize::MAX {
                         $map.prefetch_idx(idx_l);
                         $map.prefetch_idx(idx_r);
-                        *rnk.add(l) = pack_rnk($map.probe_packed_kh(kh_l, idx_l), l);
-                        *rnk.add(bi) = pack_rnk($map.probe_packed_kh(kh_r, idx_r), bi);
+                        ($map.probe_packed_kh(kh_l, idx_l), $map.probe_packed_kh(kh_r, idx_r))
                     } else {
-                        *rnk.add(l) = if idx_l != usize::MAX {
-                            pack_rnk($map.probe_packed_kh(kh_l, idx_l), l)
-                        } else {
-                            u32::MAX
-                        };
-                        *rnk.add(bi) = if idx_r != usize::MAX {
-                            pack_rnk($map.probe_packed_kh(kh_r, idx_r), bi)
-                        } else {
-                            u32::MAX
-                        };
+                        (
+                            if idx_l != usize::MAX { $map.probe_packed_kh(kh_l, idx_l) } else { u32::MAX },
+                            if idx_r != usize::MAX { $map.probe_packed_kh(kh_r, idx_r) } else { u32::MAX },
+                        )
                     }
                 } else {
-                    *rnk.add(l) = if do_l {
-                        pack_rnk($map.lookup_rank(*tok.add(l), merged), l)
-                    } else {
-                        u32::MAX
-                    };
-                    *rnk.add(bi) = if do_r {
-                        pack_rnk($map.lookup_rank(merged, *tok.add(rr)), bi)
-                    } else {
-                        u32::MAX
-                    };
+                    (
+                        if do_l { $map.lookup_rank(*tok.add(l), merged) } else { u32::MAX },
+                        if do_r { $map.lookup_rank(merged, *tok.add(rr)) } else { u32::MAX },
+                    )
+                };
+                if rl != u32::MAX {
+                    *rnk.add(l) = (rl << 6) | (l as u32);
+                    active |= 1u64 << l;
+                }
+                if rr_val != u32::MAX {
+                    *rnk.add(bi) = (rr_val << 6) | (bi as u32);
+                    active |= 1u64 << bi;
                 }
             }
-            best = $min_fn(rnk, scan_len);
-            if best == u32::MAX {
+            if active == 0 {
                 break;
+            }
+            let mut m = active;
+            let i0 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            best = *rnk.add(i0);
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                best = best.min(*rnk.add(i));
             }
         }
         $tokens.clear();
@@ -862,30 +741,23 @@ macro_rules! merge_small_ll_body {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn merge_small_ll_avx2(tokens: &mut Vec<u32>, map: &MergeMap) {
-    merge_small_ll_body!(tokens, map, min_rnk_avx2)
+#[target_feature(enable = "bmi1")]
+unsafe fn merge_small_ll_bmi1(tokens: &mut Vec<u32>, map: &MergeMap) {
+    merge_small_ll_body!(tokens, map)
 }
 
 #[inline]
 unsafe fn merge_small_ll_default(tokens: &mut Vec<u32>, map: &MergeMap) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        merge_small_ll_body!(tokens, map, min_rnk_neon)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        merge_small_ll_body!(tokens, map, min_rnk_scalar)
-    }
+    merge_small_ll_body!(tokens, map)
 }
 
 #[inline]
 fn merge_small_canonical(tokens: &mut Vec<u32>, map: &MergeMap) {
     #[cfg(target_arch = "x86_64")]
     {
-        if has_avx2() {
-            // SAFETY: AVX2 runtime-checked above.
-            unsafe { merge_small_ll_avx2(tokens, map) };
+        if has_bmi1() {
+            // SAFETY: BMI1 runtime-checked above.
+            unsafe { merge_small_ll_bmi1(tokens, map) };
             return;
         }
     }
@@ -897,10 +769,11 @@ fn merge_small_canonical(tokens: &mut Vec<u32>, map: &MergeMap) {
 /// - Eliminates the 4 redundant `s.chunk` copies on every cold merge.
 /// - Uses `dense_byte[(b0 << 8) | b1]` to break the `singleton -> dense` chain.
 /// - Maintains a 64B stack `lr[64]` array (cuts `can_lr` loads 3x).
-/// - Uses fixed-16B/32B/64B vector copies for `INIT_PREV`/`INIT_NEXT`.
+/// - Zero-STLF `active: u64` bitmask min-reduction (eliminates wide-load STLF
+///   stalls and scans only live mergeable pairs with 2-way ILP unrolling).
 /// - Specializes `n == 1, 2, 3` with zero stack arrays or linked-list setup.
 macro_rules! merge_bytes_ll_body {
-    ($chunk:expr, $singleton:expr, $map:expr, $out:expr, $min_fn:ident) => {{
+    ($chunk:expr, $singleton:expr, $map:expr, $out:expr) => {{
         let n = $chunk.len();
         debug_assert!(n >= 1 && n <= MAX_SMALL && !$map.dense_byte.is_empty());
         let cp = $chunk.as_ptr();
@@ -991,20 +864,10 @@ macro_rules! merge_bytes_ll_body {
         let lr = lr_buf.as_mut_ptr() as *mut u8;
         let blr = $map.byte_lr.as_ptr();
         let nr = n - 1;
-        let scan_len = if nr <= 4 {
-            4
-        } else if nr <= 8 {
-            8
-        } else if nr <= 16 {
-            16
-        } else if nr <= 32 {
-            32
-        } else {
-            64
-        };
-        let mut rnk_buf = std::mem::MaybeUninit::<AlignedRnk>::uninit();
+        let mut rnk_buf = std::mem::MaybeUninit::<[u32; MAX_SMALL]>::uninit();
         let rnk = rnk_buf.as_mut_ptr() as *mut u32;
         let mut best = u32::MAX;
+        let mut active = 0u64;
         let mut b0 = *cp as usize;
         if !$map.has_dense_byte_overflow {
             for i in 0..nr {
@@ -1012,9 +875,12 @@ macro_rules! merge_bytes_ll_body {
                 *tok.add(i) = *$singleton.get_unchecked(b0);
                 *lr.add(i) = *blr.add(b0);
                 let d = *db.add((b0 << 8) | b1);
-                let p = if d == DENSE_NONE { u32::MAX } else { ((d as u32) << 6) | (i as u32) };
-                *rnk.add(i) = p;
-                best = best.min(p);
+                if d != DENSE_NONE {
+                    let p = ((d as u32) << 6) | (i as u32);
+                    *rnk.add(i) = p;
+                    active |= 1u64 << i;
+                    best = best.min(p);
+                }
                 b0 = b1;
             }
         } else {
@@ -1031,23 +897,23 @@ macro_rules! merge_bytes_ll_body {
                 } else {
                     $map.probe_dense_overflow(t0, *$singleton.get_unchecked(b1))
                 };
-                let p = pack_rnk(r, i);
-                *rnk.add(i) = p;
-                best = best.min(p);
+                if r != u32::MAX {
+                    let p = (r << 6) | (i as u32);
+                    *rnk.add(i) = p;
+                    active |= 1u64 << i;
+                    best = best.min(p);
+                }
                 b0 = b1;
             }
         }
         *tok.add(nr) = *$singleton.get_unchecked(b0);
         *lr.add(nr) = *blr.add(b0);
-        if best == u32::MAX {
+        if active == 0 {
             $out.reserve(n);
             let base = $out.len();
             std::ptr::copy_nonoverlapping(tok, $out.as_mut_ptr().add(base), n);
             $out.set_len(base + n);
             return;
-        }
-        for i in nr..scan_len {
-            *rnk.add(i) = u32::MAX;
         }
         let mut prev_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL + 1]>::uninit();
         let mut next_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL]>::uninit();
@@ -1073,20 +939,18 @@ macro_rules! merge_bytes_ll_body {
             *tok.add(bi) = merged;
             *next.add(bi) = rr as u8;
             *prev.add(rr) = bi as u8;
-            *rnk.add(r) = u32::MAX;
             if bi == 0 && rr == n {
                 break;
             }
-            let l = *prev.add(bi) as usize; // 64 (dead sink) when bi == 0
+            let l = *prev.add(bi) as usize;
+            let lmask = if bi != 0 { 1u64 << l } else { 0 };
+            active &= !((1u64 << r) | (1u64 << bi) | lmask);
             let mlr = $map.lr_bits(merged);
             *lr.add(bi) = mlr;
-            if mlr == 0 {
-                *rnk.add(l) = u32::MAX;
-                *rnk.add(bi) = u32::MAX;
-            } else {
+            if mlr != 0 {
                 let do_l = bi != 0 && (mlr & 2) != 0 && (*lr.add(l) & 1) != 0;
                 let do_r = rr < n && (mlr & 1) != 0 && (*lr.add(rr) & 2) != 0;
-                if merged >= 256 {
+                let (rl, rr_val) = if merged >= 256 {
                     let mut idx_l = usize::MAX;
                     let mut idx_r = usize::MAX;
                     let mut kh_l = 0u64;
@@ -1108,36 +972,53 @@ macro_rules! merge_bytes_ll_body {
                     if idx_l != usize::MAX && idx_r != usize::MAX {
                         $map.prefetch_idx(idx_l);
                         $map.prefetch_idx(idx_r);
-                        *rnk.add(l) = pack_rnk($map.probe_packed_kh(kh_l, idx_l), l);
-                        *rnk.add(bi) = pack_rnk($map.probe_packed_kh(kh_r, idx_r), bi);
+                        ($map.probe_packed_kh(kh_l, idx_l), $map.probe_packed_kh(kh_r, idx_r))
                     } else {
-                        *rnk.add(l) = if idx_l != usize::MAX {
-                            pack_rnk($map.probe_packed_kh(kh_l, idx_l), l)
-                        } else {
-                            u32::MAX
-                        };
-                        *rnk.add(bi) = if idx_r != usize::MAX {
-                            pack_rnk($map.probe_packed_kh(kh_r, idx_r), bi)
-                        } else {
-                            u32::MAX
-                        };
+                        (
+                            if idx_l != usize::MAX { $map.probe_packed_kh(kh_l, idx_l) } else { u32::MAX },
+                            if idx_r != usize::MAX { $map.probe_packed_kh(kh_r, idx_r) } else { u32::MAX },
+                        )
                     }
                 } else {
-                    *rnk.add(l) = if do_l {
-                        pack_rnk($map.lookup_rank(*tok.add(l), merged), l)
-                    } else {
-                        u32::MAX
-                    };
-                    *rnk.add(bi) = if do_r {
-                        pack_rnk($map.lookup_rank(merged, *tok.add(rr)), bi)
-                    } else {
-                        u32::MAX
-                    };
+                    (
+                        if do_l { $map.lookup_rank(*tok.add(l), merged) } else { u32::MAX },
+                        if do_r { $map.lookup_rank(merged, *tok.add(rr)) } else { u32::MAX },
+                    )
+                };
+                if rl != u32::MAX {
+                    *rnk.add(l) = (rl << 6) | (l as u32);
+                    active |= 1u64 << l;
+                }
+                if rr_val != u32::MAX {
+                    *rnk.add(bi) = (rr_val << 6) | (bi as u32);
+                    active |= 1u64 << bi;
                 }
             }
-            best = $min_fn(rnk, scan_len);
-            if best == u32::MAX {
+            if active == 0 {
                 break;
+            }
+            let mut m = active;
+            let i0 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let mut b0 = *rnk.add(i0);
+            if m != 0 {
+                let i1 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let mut b1 = *rnk.add(i1);
+                while m != 0 {
+                    let ia = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    b0 = b0.min(*rnk.add(ia));
+                    if m == 0 {
+                        break;
+                    }
+                    let ib = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    b1 = b1.min(*rnk.add(ib));
+                }
+                best = b0.min(b1);
+            } else {
+                best = b0;
             }
         }
         $out.reserve(n);
@@ -1154,21 +1035,14 @@ macro_rules! merge_bytes_ll_body {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn merge_bytes_ll_avx2(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
-    merge_bytes_ll_body!(chunk, singleton, map, out, min_rnk_avx2)
+#[target_feature(enable = "bmi1")]
+unsafe fn merge_bytes_ll_bmi1(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
+    merge_bytes_ll_body!(chunk, singleton, map, out)
 }
 
 #[inline]
 unsafe fn merge_bytes_ll_default(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        merge_bytes_ll_body!(chunk, singleton, map, out, min_rnk_neon)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        merge_bytes_ll_body!(chunk, singleton, map, out, min_rnk_scalar)
-    }
+    merge_bytes_ll_body!(chunk, singleton, map, out)
 }
 
 /// Fast zero-copy canonical BPE for `1 <= chunk.len() <= 64` when
@@ -1177,8 +1051,8 @@ unsafe fn merge_bytes_ll_default(chunk: &[u8], singleton: &[u32; 256], map: &Mer
 pub fn merge_bytes_into(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
     {
-        if has_avx2() {
-            unsafe { merge_bytes_ll_avx2(chunk, singleton, map, out) };
+        if has_bmi1() {
+            unsafe { merge_bytes_ll_bmi1(chunk, singleton, map, out) };
             return;
         }
     }
