@@ -685,7 +685,7 @@ pub struct LongCache {
 const LONG_MAPS: usize = 4;
 const LONG_MAX_ENTRIES: usize = 1 << 17;
 const LONG_MAX_ARENA: usize = 1 << 22; // u32s (16 MiB max; lazy-allocated only when long chunks exist)
-const LONG_MAX_BYTES: usize = 1024; // longer chunks are not worth caching
+const LONG_MAX_BYTES: usize = u16::MAX as usize; // matches ArenaSlot::k_len: u16; bounded by SpillMap/LongCache caps
 
 impl LongCache {
     #[inline]

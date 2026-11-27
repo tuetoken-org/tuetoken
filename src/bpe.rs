@@ -53,11 +53,10 @@ pub struct MergeMap {
     /// In real BPE vocabularies >82% of tokens never appear on the left and >85%
     /// never appear on the right, filtering most negative MergeMap probes in L1.
     can_lr: Vec<u8>,
-    /// 1-word k=4 Blocked Bloom filter over non-dense MergeMap keys
-    /// (`cap / 16` u64s = 256 KiB for o200k, 128 KiB for cl100k, 64 KiB for gpt2):
-    /// kills ~99.3% of negative probes in one L2 load using the exact same hash.
+    /// 1-word k=4 Split-32-bit Blocked Bloom filter over non-dense MergeMap keys
+    /// (`nbuckets` u64s = 256 KiB for o200k, 128 KiB for cl100k, 64 KiB for gpt2),
+    /// 1-to-1 indexed with `buckets` via the exact same `b = h >> bshift`.
     bloom: Vec<u64>,
-    bloom_shift: u32,
     /// Fast rank -> target resolution: if every merge satisfies `target == rank + off`
     /// (true for 100% of gpt2 / cl100k / o200k), `linear_off != u32::MAX` and
     /// `target(rank)` is one ADD with zero memory loads; otherwise `targets[rank]`.
@@ -119,7 +118,7 @@ impl MergeMap {
         let mut can_lr = vec![0u8; (vocab_n + 3) >> 2];
         let mut dense = vec![DENSE_NONE; 1 << 16];
         let mut has_dense_overflow = false;
-        let nbuckets = (cap >> 3).max(2);
+        let nbuckets = (cap >> 3).max(16);
         let bmask = nbuckets - 1;
         let bshift = 64 - nbuckets.trailing_zeros();
         let mut buckets = if use_packed {
@@ -134,10 +133,7 @@ impl MergeMap {
         };
         let mask = cap - 1;
         let shift = 64 - bits;
-        let bloom_words = (cap >> 3).max(16);
-        let bloom_bits = bloom_words.trailing_zeros();
-        let bloom_shift = 64 - bloom_bits;
-        let mut bloom = vec![0u64; bloom_words];
+        let mut bloom = vec![0u64; nbuckets];
 
         for (i, &(t1, t2, _tg)) in merges.iter().enumerate() {
             let r = i as u32;
@@ -165,8 +161,8 @@ impl MergeMap {
             if use_packed {
                 let kh = Self::pack_key(t1, t2);
                 let h = Self::hash_packed(kh);
-                bloom[(h >> bloom_shift) as usize] |= Self::bloom_mask(h);
                 let mut b = (h >> bshift) as usize;
+                bloom[b] |= Self::bloom_mask(h);
                 'ins: loop {
                     let buck = &mut buckets[b].0;
                     for slot in buck.iter_mut() {
@@ -185,7 +181,7 @@ impl MergeMap {
             } else {
                 let key = Self::key(t1, t2);
                 let h = Self::hash_key(key);
-                bloom[(h >> bloom_shift) as usize] |= Self::bloom_mask(h);
+                bloom[(h >> bshift) as usize] |= Self::bloom_mask(h);
                 let mut idx = (h >> shift) as usize;
                 while entries[idx].key != 0 {
                     if entries[idx].key == key {
@@ -212,7 +208,6 @@ impl MergeMap {
             byte_lr: [0u8; 256],
             can_lr,
             bloom,
-            bloom_shift,
             linear_off,
             all_targets_ge_256,
             vocab_n,
@@ -260,12 +255,16 @@ impl MergeMap {
         (kh ^ (kh >> 21)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
+    /// Pure-GPR k=3 Blocked Bloom mask from high-entropy avalanche bits 26..43
+    /// (disjoint from `b = h >> bshift`). Rejects ~99.1% of negative probes in
+    /// one L2 load while keeping 3 scalar shifts out of LLVM's 4-lane AVX2 SLP
+    /// vectorizer (zero GPR<->XMM crossings, zero Bloom load sinking).
     #[inline(always)]
     fn bloom_mask(h: u64) -> u64 {
-        (1u64 << ((h >> 22) & 63))
-            | (1u64 << ((h >> 28) & 63))
-            | (1u64 << ((h >> 34) & 63))
-            | (1u64 << ((h >> 40) & 63))
+        let m0 = 1u64.wrapping_shl((h >> 26) as u32);
+        let m1 = 1u64.wrapping_shl((h >> 32) as u32);
+        let m2 = 1u64.wrapping_shl((h >> 38) as u32);
+        m0 | m1 | m2
     }
 
     /// (0,0) packs to 0 (the empty sentinel); remap it to u64::MAX so it does
@@ -283,10 +282,15 @@ impl MergeMap {
     }
 
     #[inline(always)]
-    fn bloom_may_contain(&self, h: u64) -> bool {
-        let w = unsafe { *self.bloom.get_unchecked((h >> self.bloom_shift) as usize) };
+    fn bloom_may_contain_b(&self, h: u64, b: usize) -> bool {
+        let w = unsafe { *self.bloom.get_unchecked(b) };
         let bmask = Self::bloom_mask(h);
         (w & bmask) == bmask
+    }
+
+    #[inline(always)]
+    fn bloom_may_contain(&self, h: u64) -> bool {
+        self.bloom_may_contain_b(h, (h >> self.bshift) as usize)
     }
 
     #[inline(always)]
@@ -521,10 +525,11 @@ impl MergeMap {
         if !self.buckets.is_empty() {
             let kh = Self::pack_key(t1, t2);
             let h = Self::hash_packed(kh);
-            if !self.bloom_may_contain(h) {
+            let b = (h >> self.bshift) as usize;
+            if !self.bloom_may_contain_b(h, b) {
                 return u32::MAX;
             }
-            return self.probe_bucket_best(kh, (h >> self.bshift) as usize);
+            return self.probe_bucket_best(kh, b);
         }
         let h = Self::hash_key(Self::key(t1, t2));
         if !self.bloom_may_contain(h) {
@@ -1147,11 +1152,16 @@ macro_rules! merge_bytes_ll_body {
                         let kh_r = MergeMap::pack_key(merged, *tok.add(rr));
                         let hl = MergeMap::hash_packed(kh_l);
                         let hr = MergeMap::hash_packed(kh_r);
-                        // Issue both L2 Bloom loads concurrently with zero intervening branch!
-                        let ok_l = $map.bloom_may_contain(hl);
-                        let ok_r = $map.bloom_may_contain(hr);
                         let b_l = (hl >> $map.bshift) as usize;
                         let b_r = (hr >> $map.bshift) as usize;
+                        // Issue both L2 Bloom loads back-to-back BEFORE computing masks!
+                        let bp = $map.bloom.as_ptr();
+                        let wl = *bp.add(b_l);
+                        let wr = *bp.add(b_r);
+                        let ml = MergeMap::bloom_mask(hl);
+                        let mr = MergeMap::bloom_mask(hr);
+                        let ok_l = (wl & ml) == ml;
+                        let ok_r = (wr & mr) == mr;
                         if ok_l && ok_r {
                             $map.prefetch_bucket(b_l);
                             $map.prefetch_bucket(b_r);
@@ -1165,9 +1175,10 @@ macro_rules! merge_bytes_ll_body {
                     } else if do_l {
                         let kh_l = MergeMap::pack_key(*tok.add(l), merged);
                         let hl = MergeMap::hash_packed(kh_l);
+                        let b_l = (hl >> $map.bshift) as usize;
                         (
-                            if $map.bloom_may_contain(hl) {
-                                $map.$probe(kh_l, (hl >> $map.bshift) as usize)
+                            if $map.bloom_may_contain_b(hl, b_l) {
+                                $map.$probe(kh_l, b_l)
                             } else {
                                 u32::MAX
                             },
@@ -1176,10 +1187,11 @@ macro_rules! merge_bytes_ll_body {
                     } else if do_r {
                         let kh_r = MergeMap::pack_key(merged, *tok.add(rr));
                         let hr = MergeMap::hash_packed(kh_r);
+                        let b_r = (hr >> $map.bshift) as usize;
                         (
                             u32::MAX,
-                            if $map.bloom_may_contain(hr) {
-                                $map.$probe(kh_r, (hr >> $map.bshift) as usize)
+                            if $map.bloom_may_contain_b(hr, b_r) {
+                                $map.$probe(kh_r, b_r)
                             } else {
                                 u32::MAX
                             },
