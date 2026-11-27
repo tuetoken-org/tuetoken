@@ -269,6 +269,22 @@ impl Normalizer {
         })
     }
 
+    /// Detect exact SentencePiece metaspace normalizer pipelines:
+    /// - `1`: `[Prepend("▁"), Replace(" ", "▁")]` (Phi-3.5, Llama-2, SOLAR, Zamba2)
+    /// - `2`: `[Replace(" ", "▁")]` (Yi-1.5, Gemma-2/3, ERNIE-4.5)
+    /// - `0`: anything else.
+    pub fn sp_metaspace_kind(&self) -> u8 {
+        match self.stages.as_slice() {
+            [NormStage::Prepend(p), NormStage::ReplaceStr { from, to }]
+                if p == "\u{2581}" && from == " " && to == "\u{2581}" =>
+            {
+                1
+            }
+            [NormStage::ReplaceStr { from, to }] if from == " " && to == "\u{2581}" => 2,
+            _ => 0,
+        }
+    }
+
     /// Apply every stage in order, staying zero-copy (`Cow::Borrowed`) whenever
     /// no stage alters the input text.
     #[inline]

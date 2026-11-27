@@ -1083,6 +1083,23 @@ impl PretokPipe {
         None
     }
 
+    /// If the pipeline is a single unsplit `Metaspace { replacement: '▁', split: false }`,
+    /// return its prepend scheme (`1 = always`, `2 = first`, `3 = never`).
+    pub fn single_unsplit_u2581_prepend(&self) -> Option<u8> {
+        if self.stages.len() == 1 {
+            if let PretokStage::Metaspace { replacement: '\u{2581}', split: false, prepend_scheme } =
+                self.stages[0]
+            {
+                return Some(match prepend_scheme {
+                    PrependScheme::Always => 1,
+                    PrependScheme::First => 2,
+                    PrependScheme::Never => 3,
+                });
+            }
+        }
+        None
+    }
+
     /// Zero-copy byte ranges for `slice_only` pipelines, reusing `ps`.
     fn chunk_ranges_into(&self, text: &str, ps: &mut PipeScratch) {
         debug_assert!(self.slice_only);

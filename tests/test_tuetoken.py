@@ -1146,6 +1146,81 @@ def test_fast_and_batch_chat_templates():
     return ok, tot
 
 
+def test_sentencepiece_fast_meta():
+    """Verify zero-alloc SIMD SentencePiece fast path + Gemma-3 cross-space guard vs HF tokenizers."""
+    print("=== SentencePiece fast path & Gemma-3 cross-space guard parity ===")
+    from tokenizers import Tokenizer as HFTok
+    from transformers import AutoTokenizer as HFAuto
+    from tuetoken import AutoTokenizer as TTAuto
+
+    cases = [
+        "",
+        " ",
+        "   ",
+        "hello",
+        " hello",
+        "  hello  world  ",
+        "Hello, world! This is a SentencePiece test with numbers 12345 and\nnewlines.\n\n",
+        "literal \u2581 metaspace \u2581\u2581 mixed with spaces and \u2581hello",
+        "\u2581leading_metaspace and trailing \u2581",
+        "<div> </div> <span> > </div> >  </div> > </span> > </a> >= >",
+        "Code: if a > b && c > 0 { return \"a > b\"; } // <b>hi</b> > </div>",
+        "Unicode: café naïve 日本語テスト 🚀👨‍👩‍👧‍👦 Привет мир! — “quoted”",
+        # 300KB multi-thread parallel split (> SPLIT_THRESHOLD)
+        ("The quick brown fox jumps over the lazy dog. <div> > </div> 12345 café 日本語\n" * 4000),
+    ]
+
+    ok = tot = 0
+    for repo in (
+        "microsoft/Phi-3.5-mini-instruct",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "unsloth/gemma-2-9b-it",
+        "unsloth/gemma-3-4b-it",
+    ):
+        try:
+            hf = HFAuto.from_pretrained(repo)
+            tt = TTAuto.from_pretrained(repo)
+        except Exception as e:
+            print(f"  [skip {repo}: {e}]")
+            continue
+        n_ok = n_tot = 0
+        for s in cases:
+            n_tot += 2
+            n_ok += int(tt.encode(s, add_special_tokens=False) == hf.encode(s, add_special_tokens=False))
+            n_ok += int(tt.encode(s, add_special_tokens=True) == hf.encode(s, add_special_tokens=True))
+        # Batch & multi-threaded parallel batch parity
+        batch_inputs = [c for c in cases[:-1]] + [cases[-1][:40000]]
+        n_tot += 1
+        n_ok += int(
+            tt(batch_inputs, add_special_tokens=False)["input_ids"]
+            == [hf.encode(c, add_special_tokens=False) for c in batch_inputs]
+        )
+        # Also verify raw Tokenizer encode_ordinary / encode_ordinary_batch on models without non-special added_tokens colliding
+        if "gemma" not in repo:
+            hf_tok = HFTok.from_pretrained(repo)
+            n_tot += 2
+            n_ok += int(
+                tt._core.encode_ordinary(cases[-1])
+                == hf_tok.encode(cases[-1], add_special_tokens=False).ids
+            )
+            n_ok += int(
+                tt._core.encode_ordinary_batch(batch_inputs)
+                == [hf_tok.encode(c, add_special_tokens=False).ids for c in batch_inputs]
+            )
+        else:
+            # Verify raw encode_special_batch matches HF exactly on Gemma-2/3 too
+            n_tot += 1
+            n_ok += int(
+                tt._core.encode_special_batch(batch_inputs)
+                == [hf.encode(c, add_special_tokens=False) for c in batch_inputs]
+            )
+        ok += n_ok
+        tot += n_tot
+        _line(repo, n_ok, n_tot)
+    assert tot > 0 and ok == tot, f"SentencePiece fast path: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -1154,7 +1229,7 @@ def main():
         test_auto(), test_kimi_tiktoken_model(), test_tekken_and_legacy_formats(),
         test_bytes_inputs(), test_warmup_and_fast_startup(),
         test_review_regressions(), test_whisper(), test_zero_copy_buffer_decode(),
-        test_fast_and_batch_chat_templates(),
+        test_fast_and_batch_chat_templates(), test_sentencepiece_fast_meta(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

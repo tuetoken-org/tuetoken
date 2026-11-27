@@ -1021,6 +1021,114 @@ fn is_cjk_pretok(pre: &Value) -> bool {
         && !pts[3].get("use_regex").and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
+/// Zero-allocation SIMD SentencePiece fast-path mode (enabled only when
+/// load-time verification proves `safe_meta_split == Some('▁')` and the
+/// normalizer/pre-tokenizer strictly match one of the standard SP metaspace
+/// pipelines). Keeps 1-byte `' '` as a lossless surrogate for 3-byte `'▁'`
+/// across `ChunkTable`, `SharedTable`, and `SharedLongTable`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpFastMeta {
+    None,
+    /// `norm = [Prepend("▁"), Replace(" ", "▁")]`, `pre = None` (Phi-3.5, Llama-2, SOLAR, Zamba2).
+    NormPrependAlways,
+    /// `norm = [Replace(" ", "▁")]`, `pre = None | Split(" ", MergedWithPrevious)` (Yi-1.5, Gemma-2/3, ERNIE-4.5).
+    NormNoPrepend,
+    /// `norm = None`, `pre = Metaspace("▁", split=false, prepend_scheme)` (Mistral-7B-v0.3, Nemotron-Mini).
+    Metaspace { prepend_scheme: u8 },
+}
+
+fn detect_sp_fast_meta(
+    byte_fallback: bool,
+    ignore_merges: bool,
+    has_eow: bool,
+    sp_split_ok: bool,
+    normalizer: &norm::Normalizer,
+    pretok_pipe: Option<&pretok_pipe::PretokPipe>,
+    pre: &Value,
+) -> SpFastMeta {
+    if !byte_fallback || ignore_merges || has_eow || !sp_split_ok {
+        return SpFastMeta::None;
+    }
+    match (normalizer.sp_metaspace_kind(), pretok_pipe) {
+        (1, None) => SpFastMeta::NormPrependAlways,
+        (2, None) => SpFastMeta::NormNoPrepend,
+        (2, Some(_))
+            if pre.get("type").and_then(|v| v.as_str()) == Some("Split")
+                && pre.get("pattern").and_then(|p| p.get("String")).and_then(|v| v.as_str())
+                    == Some(" ")
+                && pre.get("behavior").and_then(|v| v.as_str()) == Some("MergedWithPrevious")
+                && !pre.get("invert").and_then(|v| v.as_bool()).unwrap_or(false) =>
+        {
+            SpFastMeta::NormNoPrepend
+        }
+        (0, Some(pipe)) if normalizer.is_identity() => match pipe.single_unsplit_u2581_prepend() {
+            Some(ps) => SpFastMeta::Metaspace { prepend_scheme: ps },
+            None => SpFastMeta::None,
+        },
+        _ => SpFastMeta::None,
+    }
+}
+
+/// Analyze all merges producing tokens with internal `'▁'` (after leading `'▁'`s).
+/// Returns `(safe_unconditional, sp_split_ok, cross_prev_mask)`:
+/// - `safe_unconditional`: true iff ZERO merges contain an internal `'▁'`.
+/// - `sp_split_ok`: true iff `meta_split_cand == Some('▁')` and `<= 16` distinct
+///   bytes ever precede an internal `'▁'` in any merge target (e.g. Gemma-3 has 1: `'>'`).
+/// - `cross_prev_mask`: 256-bit set of bytes `c` that appear immediately before `' '`
+///   in any decoded internal-`'▁'` merge target (sound superset of cross-space merges).
+fn analyze_sp_cross_prev(
+    meta_split_cand: Option<char>,
+    merges: &[(u32, u32, u32)],
+    has_internal_ms: &[bool],
+    byte_arena: &[u8],
+    byte_span: &[(u32, u32)],
+) -> (Option<char>, bool, [u64; 4]) {
+    let Some(rep) = meta_split_cand else {
+        return (None, false, [0u64; 4]);
+    };
+    let n = has_internal_ms.len();
+    let mut any_internal = false;
+    let mut cross = [0u64; 4];
+    let mut can_guard = rep == '\u{2581}';
+    for &(_, _, tg) in merges {
+        let tgi = tg as usize;
+        if tgi < n && has_internal_ms[tgi] {
+            any_internal = true;
+            if !can_guard {
+                break;
+            }
+            if tgi >= byte_span.len() {
+                can_guard = false;
+                break;
+            }
+            let (off, len) = byte_span[tgi];
+            if len == 0 {
+                can_guard = false;
+                break;
+            }
+            let b = &byte_arena[off as usize..(off + len) as usize];
+            let mut found_edge = false;
+            for j in 1..b.len() {
+                if b[j] == b' ' && b[j - 1] != b' ' {
+                    let prev = b[j - 1] as usize;
+                    cross[prev >> 6] |= 1u64 << (prev & 63);
+                    found_edge = true;
+                }
+            }
+            if !found_edge {
+                can_guard = false;
+                break;
+            }
+        }
+    }
+    if !any_internal {
+        return (Some(rep), rep == '\u{2581}', [0u64; 4]);
+    }
+    let cnt: u32 = cross.iter().map(|w| w.count_ones()).sum();
+    let sp_ok = can_guard && cnt <= 16;
+    (None, sp_ok, if sp_ok { cross } else { [0u64; 4] })
+}
+
 /// Pre-tokenizer dispatch mode selected once at load time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FastPretok {
@@ -1081,6 +1189,14 @@ struct Tokenizer {
     // Proven-exact metaspace chunk split char (e.g. Some('▁')): set only when
     // load-time verification proves no merge crosses `(non-rep | rep)` boundaries.
     safe_meta_split: Option<char>,
+    sp_fast_meta: SpFastMeta,
+    /// 256-bit bitmap of bytes `c` that appear immediately before an internal `'▁'`
+    /// in any merge target (e.g. `{ b'>' }` for Gemma-3's `">▁</"` merge). Any
+    /// `(non-' ', ' ')` boundary where `prev` is NOT in this bitmap is mathematically
+    /// proven uncrossable by BPE; boundaries where `prev` IS set stay unsplit.
+    sp_cross_prev: [u64; 4],
+    sp_has_cross: bool,
+    sp_rep_id: i32,
     // char (codepoint) -> token id for single-character vocab tokens. ASCII goes
     // in the array (hot path), the rest in the map.
     char_ascii: [i32; 128],
@@ -2822,7 +2938,14 @@ impl Tokenizer {
             let (off, len) = this.byte_span[id as usize];
             let b = &this.byte_arena[off as usize..(off + len) as usize];
             s.out.clear();
-            this.emit(b, s, Merge::Auto);
+            if this.sp_fast_meta != SpFastMeta::None {
+                if memchr::memmem::find(b, "\u{2581}".as_bytes()).is_some() {
+                    return None;
+                }
+                this.process_chunk_sp_direct(b, s);
+            } else {
+                this.emit(b, s, Merge::Auto);
+            }
             if s.out.len() != 1 {
                 return None;
             }
@@ -3578,7 +3701,10 @@ impl Tokenizer {
     #[inline]
     fn emit(&self, chunk: &[u8], s: &mut Scratch, mode: Merge) {
         let n = chunk.len();
-        if mode == Merge::Auto && n.wrapping_sub(1) < chunk_table::MAX_KEY {
+        if mode == Merge::Auto
+            && n.wrapping_sub(1) < chunk_table::MAX_KEY
+            && (self.sp_fast_meta == SpFastMeta::None || !chunk.contains(&b' '))
+        {
             let (lo, hi) = chunk_table::pack(chunk);
             if let Some(t) = self.chunk_table.get(lo, hi) {
                 s.out.push(t);
@@ -3676,6 +3802,370 @@ impl Tokenizer {
             i += cl;
         }
         self.finish_chunk(s, mode);
+    }
+
+    /// Direct SentencePiece chunk BPE using 1-byte `' '` as a lossless surrogate
+    /// for 3-byte `'▁'` (zero UTF-8 expansion, zero `char_map` lookup for `'▁'`).
+    #[inline]
+    fn process_chunk_sp_direct(&self, chunk: &[u8], s: &mut Scratch) {
+        s.chunk.clear();
+        let n = chunk.len();
+        let mut i = 0usize;
+        while i < n {
+            // SAFETY: `i < n`.
+            let b = unsafe { *chunk.get_unchecked(i) };
+            if b < 128 {
+                let tid = if b == b' ' {
+                    self.sp_rep_id
+                } else {
+                    unsafe { *self.char_ascii.get_unchecked(b as usize) }
+                };
+                if tid >= 0 {
+                    s.chunk.push(tid as u32);
+                } else if b == b' ' {
+                    for &eb in "\u{2581}".as_bytes() {
+                        let t = self.singleton[eb as usize];
+                        if t >= 0 {
+                            s.chunk.push(t as u32);
+                        }
+                    }
+                } else {
+                    let t = self.singleton[b as usize];
+                    if t >= 0 {
+                        s.chunk.push(t as u32);
+                    }
+                }
+                i += 1;
+            } else {
+                let (cp, cl) = unicode::decode(chunk, i);
+                let tid = self.char_map.get(&cp).map(|&x| x as i32).unwrap_or(-1);
+                if tid >= 0 {
+                    s.chunk.push(tid as u32);
+                } else {
+                    let end = (i + cl).min(n);
+                    for &eb in &chunk[i..end] {
+                        let t = self.singleton[eb as usize];
+                        if t >= 0 {
+                            s.chunk.push(t as u32);
+                        }
+                    }
+                }
+                i += cl;
+            }
+        }
+        self.finish_chunk(s, Merge::Auto);
+    }
+
+    /// Cold-miss resolver for SentencePiece `<= 15B` space-surrogate chunks:
+    /// checks `chunk_table` first (instant hit for all vocab words), else runs
+    /// `process_chunk_sp_direct`, and learns into `self.learned` / `self.spill`.
+    #[inline(never)]
+    fn emit_sp_chunk_fresh(&self, chunk: &[u8], lo: u64, hi: u64, s: &mut Scratch) {
+        let h = chunk_table::hash(lo, hi);
+        if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
+            s.out.push(t);
+            self.learned.put_6(lo, hi, h, &[t]);
+            return;
+        }
+        let st = s.out.len();
+        self.process_chunk_sp_direct(chunk, s);
+        let toks = &s.out[st..];
+        if !self.learned.put_6(lo, hi, h, toks) {
+            self.spill.put(chunk, toks);
+            self.learned.put_spilled(lo, hi, h);
+        }
+    }
+
+    /// Cold-miss resolver for SentencePiece `16..=31B` chunks via `SharedLongTable`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_sp_long_at(
+        &self,
+        bytes: &[u8],
+        pos: usize,
+        end: usize,
+        lp: u64,
+        lh: u64,
+        lview: chunk_table::LongView<'_>,
+        s: &mut Scratch,
+    ) {
+        let len = end - pos;
+        let lk = chunk_table::pack32_at(bytes, pos, len);
+        match unsafe { lview.get_into_at(lk, lp, &mut s.out) } {
+            chunk_table::LongHit::Hit => return,
+            chunk_table::LongHit::Empty => {
+                if !lview.is_current(&self.long_table)
+                    && self.long_table.get_into(lk, lh, &mut s.out) == chunk_table::LongHit::Hit
+                {
+                    return;
+                }
+                let key = &bytes[pos..end];
+                let st = s.out.len();
+                self.process_chunk_sp_direct(key, s);
+                let toks = &s.out[st..];
+                if !self.long_table.put(lk, lh, toks) {
+                    let sh = chunk_table::hash_bytes(key);
+                    let _ = self.spill.put_h(key, sh, toks);
+                    s.long_cache.put_h(self.uid, key, sh, toks);
+                }
+                return;
+            }
+            chunk_table::LongHit::Spilled => {}
+        }
+        self.emit_sp_chunk_slice(&bytes[pos..end], s);
+    }
+
+    /// Single-chunk SentencePiece fast resolver (`ChunkTable` + `SharedTable` +
+    /// `SharedLongTable` + `SpillMap`) for chunks with 1-byte space surrogate.
+    #[inline]
+    fn emit_sp_chunk_slice(&self, chunk: &[u8], s: &mut Scratch) {
+        let len = chunk.len();
+        if len == 0 {
+            return;
+        }
+        if len <= chunk_table::MAX_KEY {
+            let (lo, hi) = chunk_table::pack(chunk);
+            let h = chunk_table::hash(lo, hi);
+            if let Some((toks, cnt)) = self.learned.get_6(lo, hi, h) {
+                if cnt != chunk_table::SPILLED {
+                    s.out.extend_from_slice(&toks[..cnt]);
+                    return;
+                }
+                let sh = chunk_table::hash_bytes(chunk);
+                if self.spill.get_into_h(chunk, sh, &mut s.out) {
+                    return;
+                }
+            }
+            if let Some(t) = self.chunk_table.get_h(lo, hi, h) {
+                s.out.push(t);
+                self.learned.put_6(lo, hi, h, &[t]);
+                return;
+            }
+            let st = s.out.len();
+            self.process_chunk_sp_direct(chunk, s);
+            let toks = &s.out[st..];
+            if !self.learned.put_6(lo, hi, h, toks) {
+                self.spill.put(chunk, toks);
+                self.learned.put_spilled(lo, hi, h);
+            }
+            return;
+        }
+        if len <= chunk_table::MAX_LONG_KEY {
+            let lk = chunk_table::pack32_at(chunk, 0, len);
+            let lh = chunk_table::hash32(lk);
+            if self.long_table.get_into(lk, lh, &mut s.out) == chunk_table::LongHit::Hit {
+                return;
+            }
+            let sh = chunk_table::hash_bytes(chunk);
+            if let Some(ts) = s.long_cache.get_h(self.uid, chunk, sh) {
+                s.out.extend_from_slice(ts);
+                return;
+            }
+            if self.spill.get_into_h(chunk, sh, &mut s.out) {
+                return;
+            }
+            let st = s.out.len();
+            self.process_chunk_sp_direct(chunk, s);
+            let toks = &s.out[st..];
+            if !self.long_table.put(lk, lh, toks) {
+                let _ = self.spill.put_h(chunk, sh, toks);
+                s.long_cache.put_h(self.uid, chunk, sh, toks);
+            }
+            return;
+        }
+        let sh = chunk_table::hash_bytes(chunk);
+        if let Some(ts) = s.long_cache.get_h(self.uid, chunk, sh) {
+            s.out.extend_from_slice(ts);
+            return;
+        }
+        if self.spill.get_into_h(chunk, sh, &mut s.out) {
+            return;
+        }
+        let st = s.out.len();
+        self.process_chunk_sp_direct(chunk, s);
+        let (out, lc) = (&s.out, &mut s.long_cache);
+        lc.put_h(self.uid, chunk, sh, &out[st..]);
+        let _ = self.spill.put_h(chunk, sh, &out[st..]);
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn flush_recs_sp(
+        &self,
+        bytes: &[u8],
+        buf: &[PipeRec],
+        ends: &[u32],
+        first_a: usize,
+        s: &mut Scratch,
+        view: chunk_table::View<'_, 3>,
+        lview: chunk_table::LongView<'_>,
+    ) {
+        let len = buf.len();
+        s.out.reserve(6 * len + 16);
+        let mut base_out = s.out.as_mut_ptr();
+        let mut wp = unsafe { base_out.add(s.out.len()) };
+        let base_rp = buf.as_ptr();
+        let mut rp = base_rp;
+        let end_rp = unsafe { base_rp.add(len) };
+        while rp < end_rp {
+            let r = unsafe { *rp };
+            let empty_slot = if r.p != 0 {
+                match unsafe { view.emit_inline_at(r.lo, r.hi, r.p, wp) } {
+                    chunk_table::InlineHit::Hit(c) => {
+                        wp = unsafe { wp.add(c) };
+                        rp = unsafe { rp.add(1) };
+                        continue;
+                    }
+                    chunk_table::InlineHit::Empty => true,
+                    chunk_table::InlineHit::Spilled => false,
+                }
+            } else {
+                false
+            };
+            let k = unsafe { rp.offset_from(base_rp) as usize };
+            let w = unsafe { wp.offset_from(base_out) as usize };
+            unsafe { s.out.set_len(w) };
+            let a = if k == 0 { first_a } else { ends[k - 1] as usize };
+            let e = ends[k] as usize;
+            if empty_slot {
+                self.emit_sp_chunk_fresh(&bytes[a..e], r.lo, r.hi, s);
+            } else if r.p == 0 && r.lo != 0 {
+                self.emit_sp_long_at(bytes, a, e, r.lo, r.hi, lview, s);
+            } else {
+                self.emit_sp_chunk_slice(&bytes[a..e], s);
+            }
+            s.out.reserve(6 * (len - k) + 16);
+            base_out = s.out.as_mut_ptr();
+            wp = unsafe { base_out.add(s.out.len()) };
+            rp = unsafe { rp.add(1) };
+        }
+        unsafe { s.out.set_len(wp.offset_from(base_out) as usize) };
+    }
+
+    /// Find the next proven-exact SentencePiece chunk end starting at `pos`:
+    /// skips leading `' '` run, then scans to the first `' '` whose preceding byte
+    /// is NOT in `cross` (so rare cross-space merges like Gemma-3 `">▁</"` stay intact).
+    #[inline(always)]
+    fn next_sp_end(bytes: &[u8], pos: usize, cross: &[u64; 4], has_cross: bool) -> usize {
+        let n = bytes.len();
+        let mut q = pos;
+        while q < n && unsafe { *bytes.get_unchecked(q) } == b' ' {
+            q += 1;
+        }
+        if !has_cross {
+            return if q < n {
+                match memchr::memchr(b' ', &bytes[q..]) {
+                    Some(rel) => q + rel,
+                    None => n,
+                }
+            } else {
+                n
+            };
+        }
+        loop {
+            if q >= n {
+                return n;
+            }
+            match memchr::memchr(b' ', &bytes[q..]) {
+                Some(rel) => {
+                    let p = q + rel;
+                    let prev = unsafe { *bytes.get_unchecked(p - 1) } as usize;
+                    if ((cross[prev >> 6] >> (prev & 63)) & 1) == 0 {
+                        return p;
+                    }
+                    q = p + 1;
+                    while q < n && unsafe { *bytes.get_unchecked(q) } == b' ' {
+                        q += 1;
+                    }
+                }
+                None => return n,
+            }
+        }
+    }
+
+    /// Zero-allocation SIMD-chunked, `SharedTable`-pipelined SentencePiece encoder.
+    /// Returns `true` if handled, or `false` if `text` contains a literal `'▁'`
+    /// (caller falls back to exact `normalizer.apply` + `encode_meta_char`).
+    fn encode_sp_fast(&self, text: &str, prepend: bool, is_doc_start: bool, s: &mut Scratch) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        // Literal `'▁'` in raw text is rare (~0.0001%); fall back to exact normalizer path.
+        if memchr::memmem::find(bytes, "\u{2581}".as_bytes()).is_some() {
+            return false;
+        }
+        let need_prepend = match self.sp_fast_meta {
+            SpFastMeta::NormPrependAlways => is_doc_start,
+            SpFastMeta::NormNoPrepend => false,
+            SpFastMeta::Metaspace { prepend_scheme } => {
+                let allow = match prepend_scheme {
+                    1 => is_doc_start,
+                    2 => is_doc_start && prepend,
+                    _ => false,
+                };
+                allow && bytes[0] != b' '
+            }
+            SpFastMeta::None => return false,
+        };
+        let cross = &self.sp_cross_prev;
+        let has_cross = self.sp_has_cross;
+
+        // Chunk 0: `' '* non-' '*` starting at 0 (preserving any cross-space prev bytes),
+        // with optional virtual leading `' '`.
+        let e0 = Self::next_sp_end(bytes, 0, cross, has_cross);
+        if need_prepend {
+            if e0 < 63 {
+                let mut stack = [0u8; 64];
+                stack[0] = b' ';
+                stack[1..1 + e0].copy_from_slice(&bytes[..e0]);
+                self.emit_sp_chunk_slice(&stack[..1 + e0], s);
+            } else {
+                let mut v = Vec::with_capacity(1 + e0);
+                v.push(b' ');
+                v.extend_from_slice(&bytes[..e0]);
+                self.emit_sp_chunk_slice(&v, s);
+            }
+        } else {
+            self.emit_sp_chunk_slice(&bytes[..e0], s);
+        }
+
+        let mut pos = e0;
+        if pos >= n {
+            return true;
+        }
+
+        // Remaining chunks all start with `b' '` inside `bytes` (100% zero-copy!).
+        if n - pos >= 1024 && n <= u32::MAX as usize {
+            const CAP: usize = 256;
+            let mut ends = [0u32; CAP];
+            let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP];
+            while pos < n {
+                let first_a = pos;
+                let mut k = 0usize;
+                while pos < n && k < CAP {
+                    let next = Self::next_sp_end(bytes, pos + 1, cross, has_cross);
+                    ends[k] = next as u32;
+                    k += 1;
+                    pos = next;
+                }
+                let view = self.learned.view();
+                let lview = self.long_table.view();
+                Self::fill_recs(bytes, &ends, 0, k, first_a, buf.as_mut_ptr(), view, lview);
+                // SAFETY: `fill_recs` initialized `buf[..k]`.
+                let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
+                self.flush_recs_sp(bytes, sl, &ends[..k], first_a, s, view, lview);
+            }
+        } else {
+            while pos < n {
+                let start = pos;
+                let next = Self::next_sp_end(bytes, pos + 1, cross, has_cross);
+                self.emit_sp_chunk_slice(&bytes[start..next], s);
+                pos = next;
+            }
+        }
+        true
     }
 
     /// Apply the model's composable normalizer pipeline (`Cow::Borrowed` when
@@ -5074,7 +5564,42 @@ impl Tokenizer {
     /// Can one long document be split across threads? Only the hand-written
     /// state-machine path, where the split rule below is proven (see split_points).
     fn splittable(&self) -> bool {
-        self.fast_pretok == FastPretok::BlockScan
+        self.fast_pretok == FastPretok::BlockScan || self.sp_fast_meta != SpFastMeta::None
+    }
+
+    /// Proven-exact chunk boundaries for `SpFastMeta`: any `b[p] == b' '` preceded
+    /// by `b[p - 1] != b' '` and not in `cross` starts a new chunk uncrossable by BPE.
+    fn split_points_sp(b: &[u8], seg: usize, cross: &[u64; 4]) -> Vec<usize> {
+        let n = b.len();
+        let mut pts = vec![0usize];
+        let mut target = seg;
+        while target < n {
+            let lim = (target + seg).min(n);
+            let mut found = None;
+            let mut i = target.max(1);
+            while i < lim {
+                if let Some(rel) = memchr::memchr(b' ', &b[i..lim]) {
+                    let p = i + rel;
+                    let prev = b[p - 1];
+                    if prev != b' ' && ((cross[(prev as usize) >> 6] >> (prev & 63)) & 1) == 0 {
+                        found = Some(p);
+                        break;
+                    }
+                    i = p + 1;
+                } else {
+                    break;
+                }
+            }
+            match found {
+                Some(p) => {
+                    pts.push(p);
+                    target = p + seg;
+                }
+                None => target = lim + 1,
+            }
+        }
+        pts.push(n);
+        pts
     }
 
     /// Positions `p` that are GUARANTEED chunk boundaries for every grammar
@@ -5167,7 +5692,7 @@ impl Tokenizer {
                 Src::Raw(_) | Src::Wide(_) => unreachable!("unvalidated bytes/wide reach plan() only without a normalizer"),
             }
         };
-        let norm: Vec<Cow<'t, [u8]>> = if self.normalizer.is_identity() {
+        let norm: Vec<Cow<'t, [u8]>> = if self.normalizer.is_identity() || self.sp_fast_meta != SpFastMeta::None {
             texts
                 .iter()
                 .map(|t| {
@@ -5223,9 +5748,20 @@ impl Tokenizer {
             }
             let b: &[u8] = d;
             if splittable && b.len() >= SPLIT_MIN {
-                let pts = Self::split_points(b, seg_bytes);
-                for w in pts.windows(2) {
-                    items.push((i as u32, w[0], w[1], true));
+                if self.sp_fast_meta != SpFastMeta::None {
+                    if memchr::memmem::find(b, "\u{2581}".as_bytes()).is_none() {
+                        let pts = Self::split_points_sp(b, seg_bytes, &self.sp_cross_prev);
+                        for w in pts.windows(2) {
+                            items.push((i as u32, w[0], w[1], true));
+                        }
+                    } else {
+                        items.push((i as u32, 0, b.len(), false));
+                    }
+                } else {
+                    let pts = Self::split_points(b, seg_bytes);
+                    for w in pts.windows(2) {
+                        items.push((i as u32, w[0], w[1], true));
+                    }
                 }
             } else {
                 items.push((i as u32, 0, b.len(), false));
@@ -5257,6 +5793,20 @@ impl Tokenizer {
         let d: &[u8] = &norm[doc as usize];
         if !trusted[doc as usize] && simdutf8::basic::from_utf8(&d[a..b]).is_err() {
             return false;
+        }
+        if self.sp_fast_meta != SpFastMeta::None {
+            if seg {
+                // SAFETY: split_points_sp splits strictly before ASCII `' '`, and
+                // non-trusted bytes were validated above; `b` has no literal `'▁'`.
+                let sub = unsafe { std::str::from_utf8_unchecked(&d[a..b]) };
+                let ok = self.encode_sp_fast(sub, a == 0, a == 0, s);
+                debug_assert!(ok);
+            } else {
+                // SAFETY: trusted (from a str) or validated just above (whole doc).
+                let whole = unsafe { std::str::from_utf8_unchecked(d) };
+                self.encode_into(whole, Merge::Auto, true, s);
+            }
+            return true;
         }
         if seg {
             self.encode_range(d, a, b, s);
@@ -5856,6 +6406,9 @@ impl Tokenizer {
     }
 
     fn encode_into(&self, text: &str, mode: Merge, prepend: bool, s: &mut Scratch) {
+        if mode == Merge::Auto && self.sp_fast_meta != SpFastMeta::None && self.encode_sp_fast(text, prepend, true, s) {
+            return;
+        }
         // The normalizer runs first in the HF pipeline (normalizer -> pre_tokenizer
         // -> model), for ByteLevel models too — not just SentencePiece. Skipping it
         // silently mistokenizes decomposed/combining Unicode (NFD text, jamo, Å, …)
@@ -5913,7 +6466,7 @@ impl Tokenizer {
             return;
         }
         let prepend = self.prepend_scheme != 2 || at_start;
-        if frag.len() >= SPLIT_MIN && self.splittable() {
+        if frag.len() >= SPLIT_MIN && self.splittable() && (at_start || self.sp_fast_meta == SpFastMeta::None) {
             s.out.extend_from_slice(&self.encode_split(frag));
         } else {
             self.encode_into(frag, Merge::Auto, prepend, s);
@@ -6370,11 +6923,13 @@ impl Tokenizer {
         }
 
         let merges = fl.merges;
-        let safe_meta_split = meta_split_cand.filter(|_| {
-            merges
-                .iter()
-                .all(|&(_, _, tg)| (tg as usize) >= vocab_size || !has_internal_ms[tg as usize])
-        });
+        let (safe_meta_split, sp_split_ok, sp_cross_prev) = analyze_sp_cross_prev(
+            meta_split_cand,
+            &merges,
+            &has_internal_ms,
+            &byte_arena,
+            &byte_span,
+        );
 
         let check_monotonic = || {
             let mut produce_max: Vec<i64> = vec![-1; vocab_size];
@@ -6426,6 +6981,18 @@ impl Tokenizer {
             && fl.singleton_eow.is_none()
             && map.init_byte_tables(&singleton, &merges, monotonic);
 
+        let sp_fast_meta = detect_sp_fast_meta(
+            byte_fallback,
+            ignore_merges,
+            fl.singleton_eow.is_some(),
+            sp_split_ok,
+            &normalizer,
+            pretok_pipe.as_ref(),
+            pre,
+        );
+        let sp_has_cross = sp_cross_prev != [0u64; 4];
+        let sp_rep_id = fl.char_map.get(&('\u{2581}' as u32)).map(|&x| x as i32).unwrap_or(-1);
+
         let mut tk = Tokenizer {
             kind,
             fast_pretok,
@@ -6445,6 +7012,10 @@ impl Tokenizer {
             pretok_pipe,
             byte_fallback,
             safe_meta_split,
+            sp_fast_meta,
+            sp_cross_prev,
+            sp_has_cross,
+            sp_rep_id,
             char_ascii: fl.char_ascii,
             char_map: fl.char_map,
             decode_strip_space,
@@ -6770,13 +7341,15 @@ impl Tokenizer {
         }
 
         let merges = model.merges;
-        // Enable metaspace chunk-splitting iff NO merge produces a token containing
-        // `rep` after a non-`rep` character (mathematical guarantee of BPE exactness).
-        let safe_meta_split = meta_split_cand.filter(|_| {
-            merges
-                .iter()
-                .all(|&(_, _, tg)| (tg as usize) >= vocab_size || !has_internal_ms[tg as usize])
-        });
+        // Enable metaspace chunk-splitting (and guarded cross-space splitting for
+        // models like Gemma-3 with rare cross-space merges such as `">▁</"`).
+        let (safe_meta_split, sp_split_ok, sp_cross_prev) = analyze_sp_cross_prev(
+            meta_split_cand,
+            &merges,
+            &has_internal_ms,
+            &byte_arena,
+            &byte_span,
+        );
         let allow_par = parallel_ok();
         let check_monotonic = || {
             let mut produce_max: Vec<i64> = vec![-1; vocab_size];
@@ -6828,6 +7401,18 @@ impl Tokenizer {
             && singleton_eow.is_none()
             && map.init_byte_tables(&singleton, &merges, monotonic);
 
+        let sp_fast_meta = detect_sp_fast_meta(
+            byte_fallback,
+            ignore_merges,
+            singleton_eow.is_some(),
+            sp_split_ok,
+            &normalizer,
+            pretok_pipe.as_ref(),
+            pre,
+        );
+        let sp_has_cross = sp_cross_prev != [0u64; 4];
+        let sp_rep_id = char_map.get(&('\u{2581}' as u32)).map(|&x| x as i32).unwrap_or(-1);
+
         let mut tk = Tokenizer {
             kind,
             fast_pretok,
@@ -6847,6 +7432,10 @@ impl Tokenizer {
             pretok_pipe,
             byte_fallback,
             safe_meta_split,
+            sp_fast_meta,
+            sp_cross_prev,
+            sp_has_cross,
+            sp_rep_id,
             char_ascii,
             char_map,
             decode_strip_space,
