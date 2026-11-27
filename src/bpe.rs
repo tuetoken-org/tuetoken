@@ -1938,8 +1938,10 @@ macro_rules! merge_bytes_ll_body {
                         let kh_r = MergeMap::pack_key(merged, tr);
                         let hr = MergeMap::hash_packed(kh_r);
                         let b_r = $map.bucket_of(merged, tr, hr);
+                        // Issue `bloom[b_r]` load concurrently with `dense[tl, merged]` load!
+                        let wr = *$map.bloom.get_unchecked(b_r);
                         let rl = $map.lookup_dense(tl, merged);
-                        let rr_v = if $map.bloom_may_contain_b(hr, b_r) {
+                        let rr_v = if MergeMap::bloom_hit(wr, hr) {
                             $map.$probe(kh_r, b_r)
                         } else {
                             u32::MAX
@@ -1949,8 +1951,10 @@ macro_rules! merge_bytes_ll_body {
                         let kh_l = MergeMap::pack_key(tl, merged);
                         let hl = MergeMap::hash_packed(kh_l);
                         let b_l = $map.bucket_of(tl, merged, hl);
+                        // Issue `bloom[b_l]` load concurrently with `dense[merged, tr]` load!
+                        let wl = *$map.bloom.get_unchecked(b_l);
                         let rr_v = $map.lookup_dense(merged, tr);
-                        let rl = if $map.bloom_may_contain_b(hl, b_l) {
+                        let rl = if MergeMap::bloom_hit(wl, hl) {
                             $map.$probe(kh_l, b_l)
                         } else {
                             u32::MAX

@@ -1260,6 +1260,33 @@ impl<const W: usize> GrowJob<W> {
             let s_hi = (s_lo + self.stripe).min(old_t.len + PROBE_MAX);
             let d_lo = s_lo.min(old_t.len) << self.diff;
             let d_hi = s_hi.min(old_t.len) << self.diff;
+            // 8-slot prefetch ring hides L2/L3 latency when scattering into `new_t`.
+            const RING: usize = 8;
+            let mut ring: [(u64, u64, [u32; W], u32, u64, usize); RING] =
+                [(0, 0, [0u32; W], 0, 0, 0); RING];
+            let mut rlen = 0usize;
+            let flush_one = |item: (u64, u64, [u32; W], u32, u64, usize),
+                             local_copied: &mut usize,
+                             local_ov: &mut Vec<ShortOverflow<W>>| {
+                let (lo, hi, tv, m, h, mut j) = item;
+                if j >= d_lo && j < d_hi {
+                    while j < d_hi {
+                        let d = new_t.slot(j);
+                        if d.meta.load(Ordering::Relaxed) == 0 {
+                            d.lo.store(lo, Ordering::Relaxed);
+                            d.hi.store(hi, Ordering::Relaxed);
+                            for (x, &y) in d.toks.iter().zip(tv.iter()) {
+                                x.store(y, Ordering::Relaxed);
+                            }
+                            d.meta.store(m, Ordering::Relaxed);
+                            *local_copied += 1;
+                            return;
+                        }
+                        j += 1;
+                    }
+                }
+                local_ov.push((lo, hi, tv, m, h));
+            };
             for i in s_lo..s_hi {
                 let s = old_t.slot(i);
                 let mut m = s.meta.load(Ordering::Acquire);
@@ -1272,37 +1299,24 @@ impl<const W: usize> GrowJob<W> {
                     continue;
                 }
                 let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
-                let h = hash(lo, hi);
-                let mut j = (h >> new_t.shift) as usize;
-                if j >= d_lo && j < d_hi {
-                    while j < d_hi {
-                        let d = new_t.slot(j);
-                        if d.meta.load(Ordering::Relaxed) == 0 {
-                            d.lo.store(lo, Ordering::Relaxed);
-                            d.hi.store(hi, Ordering::Relaxed);
-                            for (x, y) in d.toks.iter().zip(s.toks.iter()) {
-                                x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
-                            }
-                            d.meta.store(m, Ordering::Relaxed);
-                            local_copied += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if j == d_hi {
-                        let mut tv = [0u32; W];
-                        for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
-                            *dst = src.load(Ordering::Relaxed);
-                        }
-                        local_ov.push((lo, hi, tv, m, h));
-                    }
-                } else {
-                    let mut tv = [0u32; W];
-                    for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
-                        *dst = src.load(Ordering::Relaxed);
-                    }
-                    local_ov.push((lo, hi, tv, m, h));
+                let mut tv = [0u32; W];
+                for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                    *dst = src.load(Ordering::Relaxed);
                 }
+                let h = hash(lo, hi);
+                let j = (h >> new_t.shift) as usize;
+                if j >= d_lo && j < d_hi {
+                    prefetch_write(new_t.slot(j) as *const SSlot<W> as *const u8);
+                }
+                let slot = rlen & (RING - 1);
+                if rlen >= RING {
+                    flush_one(ring[slot], &mut local_copied, &mut local_ov);
+                }
+                ring[slot] = (lo, hi, tv, m, h, j);
+                rlen += 1;
+            }
+            for k in rlen.saturating_sub(RING)..rlen {
+                flush_one(ring[k & (RING - 1)], &mut local_copied, &mut local_ov);
             }
             if !local_ov.is_empty() {
                 let mut g = self.overflow.lock().unwrap_or_else(|e| e.into_inner());
@@ -1442,22 +1456,26 @@ impl<const W: usize> SharedTable<W> {
     }
 
     fn put_n(&self, lo: u64, hi: u64, h: u64, toks: &[u32], pub_meta: u32) {
-        if self.max_bits.load(Ordering::Relaxed) == 0 {
+        let max_b = self.max_bits.load(Ordering::Relaxed);
+        if max_b == 0 {
             return;
         }
-        let t = self.table();
-        let count = t.count.0.load(Ordering::Relaxed);
+        let mut t = self.table();
+        let mut count = t.count.0.load(Ordering::Relaxed);
         if count * 8 >= t.len * 5 {
-            if t.bits() < self.max_bits.load(Ordering::Relaxed) {
+            if t.bits() < max_b {
                 self.grow(t);
+                t = self.table();
+                count = t.count.0.load(Ordering::Relaxed);
             } else {
                 return;
             }
         }
-        if self.growing.load(Ordering::Acquire) {
+        if self.growing.load(Ordering::Relaxed) {
             self.wait_or_help_grow();
+            t = self.table();
+            count = t.count.0.load(Ordering::Relaxed);
         }
-        let t = self.table();
         let home = (h >> t.shift) as usize;
         for step in 0..PROBE_MAX {
             let s = t.slot(home + step);
@@ -1472,7 +1490,7 @@ impl<const W: usize> SharedTable<W> {
                         }
                         s.meta.store(pub_meta, Ordering::Release);
                         let t_ptr = t as *const STable<W> as usize;
-                        if t.count.0.load(Ordering::Relaxed) < 256 {
+                        if count < 256 {
                             t.count.0.fetch_add(1, Ordering::Relaxed);
                         } else {
                             PENDING.with(|c| {
@@ -2182,6 +2200,34 @@ impl LGrowJob {
             let s_hi = (s_lo + self.stripe).min(old_t.len + PROBE_MAX);
             let d_lo = s_lo.min(old_t.len) << self.diff;
             let d_hi = s_hi.min(old_t.len) << self.diff;
+            // 8-slot prefetch ring hides L2/L3 latency when scattering into `new_t`.
+            const RING: usize = 8;
+            type LRingItem = ([u64; 4], [u32; 7], u32, u64, usize);
+            let mut ring: [LRingItem; RING] = [([0u64; 4], [0u32; 7], 0, 0, 0); RING];
+            let mut rlen = 0usize;
+            let flush_one = |item: LRingItem,
+                             local_copied: &mut usize,
+                             local_ov: &mut Vec<LongOverflow>| {
+                let (k, tv, m, h, mut j) = item;
+                if j >= d_lo && j < d_hi {
+                    while j < d_hi {
+                        let d = new_t.slot(j);
+                        if d.meta.load(Ordering::Relaxed) == 0 {
+                            for (dst, &val) in d.k.iter().zip(k.iter()) {
+                                dst.store(val, Ordering::Relaxed);
+                            }
+                            for (dst, &val) in d.toks.iter().zip(tv.iter()) {
+                                dst.store(val, Ordering::Relaxed);
+                            }
+                            d.meta.store(m, Ordering::Relaxed);
+                            *local_copied += 1;
+                            return;
+                        }
+                        j += 1;
+                    }
+                }
+                local_ov.push((k, tv, m, h));
+            };
             for i in s_lo..s_hi {
                 let s = old_t.slot(i);
                 let mut m = s.meta.load(Ordering::Acquire);
@@ -2199,38 +2245,24 @@ impl LGrowJob {
                     s.k[2].load(Ordering::Relaxed),
                     s.k[3].load(Ordering::Relaxed),
                 ];
-                let h = hash32(k);
-                let mut j = (h >> new_t.shift) as usize;
-                if j >= d_lo && j < d_hi {
-                    while j < d_hi {
-                        let d = new_t.slot(j);
-                        if d.meta.load(Ordering::Relaxed) == 0 {
-                            for (dst, &val) in d.k.iter().zip(k.iter()) {
-                                dst.store(val, Ordering::Relaxed);
-                            }
-                            for (dst, src) in d.toks.iter().zip(s.toks.iter()) {
-                                dst.store(src.load(Ordering::Relaxed), Ordering::Relaxed);
-                            }
-                            d.meta.store(m, Ordering::Relaxed);
-                            local_copied += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if j == d_hi {
-                        let mut tv = [0u32; 7];
-                        for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
-                            *dst = src.load(Ordering::Relaxed);
-                        }
-                        local_ov.push((k, tv, m, h));
-                    }
-                } else {
-                    let mut tv = [0u32; 7];
-                    for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
-                        *dst = src.load(Ordering::Relaxed);
-                    }
-                    local_ov.push((k, tv, m, h));
+                let mut tv = [0u32; 7];
+                for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                    *dst = src.load(Ordering::Relaxed);
                 }
+                let h = hash32(k);
+                let j = (h >> new_t.shift) as usize;
+                if j >= d_lo && j < d_hi {
+                    prefetch_write(new_t.slot(j) as *const LSlot as *const u8);
+                }
+                let slot = rlen & (RING - 1);
+                if rlen >= RING {
+                    flush_one(ring[slot], &mut local_copied, &mut local_ov);
+                }
+                ring[slot] = (k, tv, m, h, j);
+                rlen += 1;
+            }
+            for idx in rlen.saturating_sub(RING)..rlen {
+                flush_one(ring[idx & (RING - 1)], &mut local_copied, &mut local_ov);
             }
             if !local_ov.is_empty() {
                 let mut g = self.overflow.lock().unwrap_or_else(|e| e.into_inner());
@@ -2366,18 +2398,19 @@ impl SharedLongTable {
                 return false;
             }
         }
-        let t = unsafe { &*tp };
+        let mut t = unsafe { &*tp };
         if t.count.0.load(Ordering::Relaxed) * 8 >= t.len * 5 {
             if t.bits() < max_b {
                 self.grow_to(t, t.bits() + 1);
+                t = unsafe { &*self.cur.load(Ordering::Acquire) };
             } else {
                 return false;
             }
         }
-        if self.growing.load(Ordering::Acquire) {
+        if self.growing.load(Ordering::Relaxed) {
             self.wait_or_help_grow();
+            t = unsafe { &*self.cur.load(Ordering::Acquire) };
         }
-        let t = unsafe { &*self.cur.load(Ordering::Acquire) };
         let (words, pub_meta, inline) = if !toks.is_empty() && toks.len() <= 7 {
             let mut w = [0u32; 7];
             w[..toks.len()].copy_from_slice(toks);

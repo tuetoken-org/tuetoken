@@ -3431,7 +3431,44 @@ impl Tokenizer {
                     penult_ts = cur_max_ts;
                     cur_max_ts = ts;
                     marks.push(out.len());
-                    let _ = write!(out, "<|{:.2}|>", ts + prev_seg_len);
+                    // Fast fixed-point `<|S.CC|>` formatting for standard 0.02s Whisper
+                    // precision (exact match to `format!("<|{:.2}|>", val)` without std::fmt
+                    // float Dragonbox overhead); falls back to `write!` for non-standard precisions.
+                    let val = ts + prev_seg_len;
+                    if time_precision == 0.02 && (0.0..1e9).contains(&val) {
+                        let cents = (val * 100.0 + 0.5) as u64;
+                        let secs = cents / 100;
+                        let frac = (cents % 100) as u8;
+                        let mut tmp = [0u8; 24];
+                        let mut p = 0usize;
+                        tmp[p] = b'<'; p += 1;
+                        tmp[p] = b'|'; p += 1;
+                        if secs == 0 {
+                            tmp[p] = b'0'; p += 1;
+                        } else {
+                            let mut d = [0u8; 12];
+                            let mut dn = 0usize;
+                            let mut s = secs;
+                            while s > 0 {
+                                d[dn] = b'0' + (s % 10) as u8;
+                                s /= 10;
+                                dn += 1;
+                            }
+                            while dn > 0 {
+                                dn -= 1;
+                                tmp[p] = d[dn];
+                                p += 1;
+                            }
+                        }
+                        tmp[p] = b'.'; p += 1;
+                        tmp[p] = b'0' + (frac / 10); p += 1;
+                        tmp[p] = b'0' + (frac % 10); p += 1;
+                        tmp[p] = b'|'; p += 1;
+                        tmp[p] = b'>'; p += 1;
+                        out.extend_from_slice(&tmp[..p]);
+                    } else {
+                        let _ = write!(out, "<|{val:.2}|>");
+                    }
                     marks.push(out.len());
                 } else {
                     if skip_special && is_special(t) {
@@ -3855,13 +3892,8 @@ impl Tokenizer {
         view: chunk_table::View<'_, 3>,
         lview: &chunk_table::LongView<'_>,
     ) -> usize {
-        let n = bytes.len();
         let bp = bytes.as_ptr();
-        let mut j = ends.len();
-        while j > 0 && *ends.get_unchecked(j - 1) as usize + 16 > n {
-            j -= 1;
-        }
-        for &e_u32 in ends.get_unchecked(..j) {
+        for &e_u32 in ends {
             let e = e_u32 as usize;
             let len = e - a;
             if len.wrapping_sub(1) < chunk_table::MAX_KEY {
@@ -3875,9 +3907,6 @@ impl Tokenizer {
             }
             out = out.add(1);
             a = e;
-        }
-        if j < ends.len() {
-            return Self::fill_recs_tail(bytes, ends.get_unchecked(j..), a, out, view, *lview);
         }
         a
     }
@@ -3900,13 +3929,33 @@ impl Tokenizer {
     ) -> usize {
         let sl = &ends[lo..hi];
         let out = unsafe { bufp.add(lo) };
-        #[cfg(target_arch = "x86_64")]
-        {
-            if has_avx2_bmi1() {
-                return unsafe { Self::fill_recs_bmi2(bytes, sl, a, out, view, &lview) };
-            }
+        let n = bytes.len();
+        let mut j = sl.len();
+        while j > 0 && sl[j - 1] as usize + 16 > n {
+            j -= 1;
         }
-        Self::fill_recs_generic(bytes, sl, a, out, view, &lview)
+        let a = if j > 0 {
+            let head = &sl[..j];
+            #[cfg(target_arch = "x86_64")]
+            {
+                if has_avx2_bmi1() {
+                    unsafe { Self::fill_recs_bmi2(bytes, head, a, out, view, &lview) }
+                } else {
+                    Self::fill_recs_generic(bytes, head, a, out, view, &lview)
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                Self::fill_recs_generic(bytes, head, a, out, view, &lview)
+            }
+        } else {
+            a
+        };
+        if j < sl.len() {
+            Self::fill_recs_tail(bytes, &sl[j..], a, unsafe { out.add(j) }, view, lview)
+        } else {
+            a
+        }
     }
 
     #[inline(never)]
@@ -3918,13 +3967,8 @@ impl Tokenizer {
         view: chunk_table::View<'_, 3>,
         lview: &chunk_table::LongView<'_>,
     ) -> usize {
-        let n = bytes.len();
         let bp = bytes.as_ptr();
-        let mut j = ends.len();
-        while j > 0 && ends[j - 1] as usize + 16 > n {
-            j -= 1;
-        }
-        for &e_u32 in &ends[..j] {
+        for &e_u32 in ends {
             let e = e_u32 as usize;
             let len = e - a;
             if len.wrapping_sub(1) < chunk_table::MAX_KEY {
@@ -3938,9 +3982,6 @@ impl Tokenizer {
             }
             out = unsafe { out.add(1) };
             a = e;
-        }
-        if j < ends.len() {
-            return Self::fill_recs_tail(bytes, &ends[j..], a, out, view, *lview);
         }
         a
     }
