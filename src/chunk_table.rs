@@ -54,19 +54,17 @@ pub fn pack(chunk: &[u8]) -> (u64, u64) {
 }
 
 /// Pack `len` bytes starting at `p` when at least 16 bytes are readable from `p`
-/// (one unaligned 16-byte load + mask instead of a variable-length memcpy).
+/// using pure 64-bit GPR loads + masks (zero XMM->GPR domain crossing on x86_64
+/// and single-`ldp` loads on ARM64).
 ///
 /// SAFETY: `p .. p+16` must be readable; 1 ≤ len ≤ 15.
 #[inline(always)]
 pub unsafe fn pack_wide(p: *const u8, len: usize) -> (u64, u64) {
     debug_assert!(len >= 1 && len <= MAX_KEY);
-    // one 16-byte load, keep the first `len` bytes (branch-free; len <= 15 so the
-    // shift is < 128)
-    let raw = u128::from_le((p as *const u128).read_unaligned());
-    // mask from a 16-entry table: one load instead of a variable 128-bit shift
-    // (which compiles to ~9 instructions with selects on AArch64)
-    let k = raw & *KEY_MASK.get_unchecked(len);
-    (k as u64, ((k >> 64) as u64) | ((len as u64) << 56))
+    let (m0, m1) = *KEY_MASK64.get_unchecked(len);
+    let lo = u64::from_le((p as *const u64).read_unaligned()) & m0;
+    let hi = (u64::from_le((p.add(8) as *const u64).read_unaligned()) & m1) | ((len as u64) << 56);
+    (lo, hi)
 }
 
 /// `pack_wide` for chunk `b[pos..pos + len]` (1 <= len <= MAX_KEY) wherever it
@@ -92,25 +90,27 @@ pub fn pack_tail(c: &[u8]) -> (u64, u64) {
     unsafe { pack_wide(t.as_ptr(), c.len()) }
 }
 
-static KEY_MASK: [u128; 16] = {
-    let mut m = [0u128; 16];
+static KEY_MASK64: [(u64, u64); 16] = {
+    let mut m = [(0u64, 0u64); 16];
     let mut i = 1;
     while i < 16 {
-        m[i] = (1u128 << (8 * i)) - 1;
+        let full = (1u128 << (8 * i)) - 1;
+        m[i] = (full as u64, (full >> 64) as u64);
         i += 1;
     }
     m
 };
 
 /// `pack_wide` for any `len`; meaningful only for 1 <= len <= 15 (callers
-/// discard it otherwise). The mask index is clamped: never out of bounds.
+/// discard it otherwise). Pure 64-bit GPR path with zero XMM domain crossings.
 ///
 /// SAFETY: `p .. p+16` must be readable.
 #[inline(always)]
 pub unsafe fn pack_wide_any(p: *const u8, len: usize) -> (u64, u64) {
-    let raw = u128::from_le((p as *const u128).read_unaligned());
-    let k = raw & *KEY_MASK.get_unchecked(len & 15);
-    (k as u64, ((k >> 64) as u64) | ((len as u64) << 56))
+    let (m0, m1) = *KEY_MASK64.get_unchecked(len & 15);
+    let lo = u64::from_le((p as *const u64).read_unaligned()) & m0;
+    let hi = (u64::from_le((p.add(8) as *const u64).read_unaligned()) & m1) | ((len as u64) << 56);
+    (lo, hi)
 }
 
 /// Portable read-prefetch hint (no-op where unsupported).
@@ -227,6 +227,29 @@ pub fn advise_hugepage(ptr: *mut u8, bytes: usize) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (ptr, bytes);
+}
+
+/// Allocate zeroed memory for `layout`, advising Linux `MADV_HUGEPAGE` *before*
+/// first-touch zeroing on `>= 2 MiB` 2 MiB-aligned tables so pages fault in as
+/// genuine 2 MiB Transparent Huge Pages (eliminating 4-level dTLB walks).
+#[inline]
+unsafe fn alloc_zeroed_huge(layout: std::alloc::Layout) -> *mut u8 {
+    #[cfg(target_os = "linux")]
+    if layout.size() >= (2 << 20) && layout.align() >= (2 << 20) {
+        let ptr = std::alloc::alloc(layout);
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        advise_hugepage(ptr, layout.size());
+        std::ptr::write_bytes(ptr, 0, layout.size());
+        return ptr;
+    }
+    let ptr = std::alloc::alloc_zeroed(layout);
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    advise_hugepage(ptr, layout.size());
+    ptr
 }
 
 /// Per-thread 2-way set-associative cache for the chunks the static table can't
@@ -666,9 +689,15 @@ struct STable<const W: usize> {
 impl<const W: usize> STable<W> {
     fn layout(n: usize) -> std::alloc::Layout {
         let sz = std::mem::size_of::<SSlot<W>>();
-        // 64-byte aligned so every (2b, 2b+1) pair of 32B SSlot<3> shares one
-        // 64B cache line and `addr ^ 32` is always the in-line sibling slot.
-        std::alloc::Layout::from_size_align(sz * n, sz.next_power_of_two().max(64)).expect("table layout")
+        let bytes = sz * n;
+        // 64B minimum alignment for cache-line pairing; on Linux, align >=2 MiB
+        // tables to 2 MiB so `MADV_HUGEPAGE` actually backs them with 2 MiB THP
+        // (unaligned glibc mmap + 16B header yields 0 KiB AnonHugePages!).
+        #[cfg(target_os = "linux")]
+        let align = if bytes >= (2 << 20) { 2 << 20 } else { sz.next_power_of_two().max(64) };
+        #[cfg(not(target_os = "linux"))]
+        let align = sz.next_power_of_two().max(64);
+        std::alloc::Layout::from_size_align(bytes, align).expect("table layout")
     }
 
     fn new(bits: u32) -> Box<STable<W>> {
@@ -676,11 +705,7 @@ impl<const W: usize> STable<W> {
         let layout = Self::layout(n);
         // SAFETY: non-zero size; all-zero bytes are a valid SSlot (atomics of
         // 0 = empty). Freed in Drop with the same layout.
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut SSlot<W>;
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        advise_hugepage(ptr as *mut u8, layout.size());
+        let ptr = unsafe { alloc_zeroed_huge(layout) } as *mut SSlot<W>;
         Box::new(STable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
     }
 
@@ -869,13 +894,118 @@ impl View<'_, 3> {
     }
 }
 
+#[inline(always)]
+fn spin_or_yield(spins: &mut u32) {
+    *spins = spins.wrapping_add(1);
+    if *spins < 64 {
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
+}
+
+/// Cooperative work-stealing growth job shared by all threads that reach
+/// `put_n` while a `SharedTable` is doubling: every participating thread copies
+/// disjoint 4096-slot stripes (`[s_lo..s_hi) -> [d_lo..d_hi)` with zero CAS)
+/// and then inserts its pending entry into the new table (zero lost entries,
+/// zero duplicate BPE storms during table growth).
+struct GrowJob<const W: usize> {
+    old: *const STable<W>,
+    new: *mut STable<W>,
+    next_stripe: AtomicUsize,
+    done_stripes: AtomicUsize,
+    copied: AtomicUsize,
+    n_stripes: usize,
+    stripe: usize,
+    diff: u32,
+    overflow: std::sync::Mutex<Vec<(u64, u64, [u32; W], u32, u64)>>,
+    finished: AtomicBool,
+}
+
+unsafe impl<const W: usize> Send for GrowJob<W> {}
+unsafe impl<const W: usize> Sync for GrowJob<W> {}
+
+impl<const W: usize> GrowJob<W> {
+    #[inline(never)]
+    fn help(&self) {
+        let old_t = unsafe { &*self.old };
+        let new_t = unsafe { &*self.new };
+        let mut local_copied = 0usize;
+        let mut local_ov: Vec<(u64, u64, [u32; W], u32, u64)> = Vec::new();
+        loop {
+            let si = self.next_stripe.fetch_add(1, Ordering::Relaxed);
+            if si >= self.n_stripes {
+                break;
+            }
+            let s_lo = si * self.stripe;
+            let s_hi = (s_lo + self.stripe).min(old_t.len);
+            let d_lo = s_lo << self.diff;
+            let d_hi = s_hi << self.diff;
+            for i in s_lo..s_hi {
+                let s = old_t.slot(i);
+                let mut m = s.meta.load(Ordering::Acquire);
+                let mut sp = 0u32;
+                while m == 1 {
+                    spin_or_yield(&mut sp);
+                    m = s.meta.load(Ordering::Acquire);
+                }
+                if m < 2 {
+                    continue;
+                }
+                let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+                let h = hash(lo, hi);
+                let mut j = (h >> new_t.shift) as usize;
+                if j >= d_lo && j < d_hi {
+                    while j < d_hi {
+                        let d = new_t.slot(j);
+                        if d.meta.load(Ordering::Relaxed) == 0 {
+                            d.lo.store(lo, Ordering::Relaxed);
+                            d.hi.store(hi, Ordering::Relaxed);
+                            for (x, y) in d.toks.iter().zip(s.toks.iter()) {
+                                x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
+                            }
+                            d.meta.store(m, Ordering::Relaxed);
+                            local_copied += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if j == d_hi {
+                        let mut tv = [0u32; W];
+                        for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                            *dst = src.load(Ordering::Relaxed);
+                        }
+                        local_ov.push((lo, hi, tv, m, h));
+                    }
+                } else {
+                    let mut tv = [0u32; W];
+                    for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                        *dst = src.load(Ordering::Relaxed);
+                    }
+                    local_ov.push((lo, hi, tv, m, h));
+                }
+            }
+            if !local_ov.is_empty() {
+                let mut g = self.overflow.lock().unwrap_or_else(|e| e.into_inner());
+                g.append(&mut local_ov);
+            }
+            self.done_stripes.fetch_add(1, Ordering::Release);
+        }
+        if local_copied != 0 {
+            self.copied.fetch_add(local_copied, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Grow-only, lock-free table of LEARNED chunk encodings (multi-token results
 /// the load-time table can't hold), shared by every thread using a tokenizer.
 /// `W` = uncompressed tokens stored inline per entry (`W = 3` also adaptively
 /// bit-packs 4..=6 tokens of <=20 bits into the same 32-byte slot using state 3!).
 pub struct SharedTable<const W: usize = 3> {
     cur: AtomicPtr<STable<W>>,
+    grow_job: AtomicPtr<GrowJob<W>>,
     retired: std::sync::Mutex<Vec<*mut STable<W>>>,
+    retired_jobs: std::sync::Mutex<Vec<*mut GrowJob<W>>>,
     growing: AtomicBool,
     max_bits: AtomicU32,
 }
@@ -888,7 +1018,9 @@ impl<const W: usize> SharedTable<W> {
     pub fn new(max_mib: usize) -> Self {
         let t = SharedTable {
             cur: AtomicPtr::new(Box::into_raw(STable::<W>::new(SHARED_MIN_BITS))),
+            grow_job: AtomicPtr::new(std::ptr::null_mut()),
             retired: std::sync::Mutex::new(Vec::new()),
+            retired_jobs: std::sync::Mutex::new(Vec::new()),
             growing: AtomicBool::new(false),
             max_bits: AtomicU32::new(SHARED_MIN_BITS),
         };
@@ -964,6 +1096,25 @@ impl<const W: usize> SharedTable<W> {
         self.put_n(lo, hi, h, &[], 2 | ((SPILLED as u32) << 2));
     }
 
+    #[cold]
+    #[inline(never)]
+    fn wait_or_help_grow(&self) {
+        while self.growing.load(Ordering::Acquire) {
+            let jp = self.grow_job.load(Ordering::Acquire);
+            if !jp.is_null() {
+                let job = unsafe { &*jp };
+                job.help();
+                let mut sp = 0u32;
+                while !job.finished.load(Ordering::Acquire) {
+                    spin_or_yield(&mut sp);
+                }
+                break;
+            }
+            // Initiator is allocating/madvise-ing the new table: yield instead of burning SMT/CPU.
+            std::thread::yield_now();
+        }
+    }
+
     fn put_n(&self, lo: u64, hi: u64, h: u64, toks: &[u32], pub_meta: u32) {
         if self.max_bits.load(Ordering::Relaxed) == 0 {
             return;
@@ -978,13 +1129,13 @@ impl<const W: usize> SharedTable<W> {
             }
         }
         if self.growing.load(Ordering::Acquire) {
-            return;
+            self.wait_or_help_grow();
         }
         let t = self.table();
         let mut i = (h >> t.shift) as usize;
         for _ in 0..PROBE_MAX {
             let s = t.slot(i);
-            let mut m = s.meta.load(Ordering::Relaxed);
+            let mut m = s.meta.load(Ordering::Acquire);
             if m == 0 {
                 match s.meta.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
                     Ok(_) => {
@@ -1008,6 +1159,11 @@ impl<const W: usize> SharedTable<W> {
                     Err(cur) => m = cur,
                 }
             }
+            let mut sp = 0u32;
+            while m == 1 {
+                spin_or_yield(&mut sp);
+                m = s.meta.load(Ordering::Acquire);
+            }
             if m >= 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
                 return;
             }
@@ -1026,9 +1182,10 @@ impl<const W: usize> SharedTable<W> {
         self.grow_to(old, old.bits() + 1);
     }
 
-    /// Disjoint-stripe sequential-order doubling: every home slot `h_old` maps
-    /// to `[h_old * scale .. (h_old + 1) * scale)`, so parallel threads own
-    /// strictly disjoint destination stripes with zero CAS and sequential streaming.
+    /// Cooperative lock-free disjoint-stripe doubling: every home slot `h_old`
+    /// maps to `[h_old * scale .. (h_old + 1) * scale)`, so all threads reaching
+    /// `put_n` during growth cooperatively copy disjoint 4096-slot stripes with
+    /// zero CAS and zero lost inserts.
     #[cold]
     #[inline(never)]
     fn grow_to(&self, old: &STable<W>, bits: u32) {
@@ -1042,132 +1199,59 @@ impl<const W: usize> SharedTable<W> {
         }
         #[cfg(test)]
         let t0 = std::time::Instant::now();
-        let new = STable::<W>::new(bits);
+        let newp = Box::into_raw(STable::<W>::new(bits));
         let diff = bits - old.bits();
-        let copied = if old.len >= 32768 && rayon::current_num_threads() > 1 {
-            use rayon::prelude::*;
-            struct RawTable<const W: usize>(*const STable<W>);
-            unsafe impl<const W: usize> Sync for RawTable<W> {}
-            impl<const W: usize> RawTable<W> {
-                #[inline(always)]
-                fn get(&self) -> &STable<W> {
-                    unsafe { &*self.0 }
-                }
-            }
-            let old_r = RawTable(old as *const STable<W>);
-            let new_r = RawTable(&*new as *const STable<W>);
-            let n_stripes = rayon::current_num_threads().min(old.len / 16384).max(1);
-            let stripe = (old.len / n_stripes).max(1);
-            let parts: Vec<(usize, Vec<(u64, u64, [u32; W], u32, u64)>)> = (0..n_stripes)
-                .into_par_iter()
-                .map(|si| {
-                    let old_t = old_r.get();
-                    let new_t = new_r.get();
-                    let s_lo = si * stripe;
-                    let s_hi = if si + 1 == n_stripes { old_t.len } else { s_lo + stripe };
-                    let d_lo = s_lo << diff;
-                    let d_hi = s_hi << diff;
-                    let mut n = 0usize;
-                    let mut ov = Vec::new();
-                    for i in s_lo..s_hi {
-                        let s = old_t.slot(i);
-                        let m = s.meta.load(Ordering::Acquire);
-                        if m < 2 {
-                            continue;
-                        }
-                        let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
-                        let h = hash(lo, hi);
-                        let mut j = (h >> new_t.shift) as usize;
-                        if j >= d_lo && j < d_hi {
-                            while j < d_hi {
-                                let d = new_t.slot(j);
-                                if d.meta.load(Ordering::Relaxed) == 0 {
-                                    d.lo.store(lo, Ordering::Relaxed);
-                                    d.hi.store(hi, Ordering::Relaxed);
-                                    for (x, y) in d.toks.iter().zip(s.toks.iter()) {
-                                        x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
-                                    }
-                                    d.meta.store(m, Ordering::Relaxed);
-                                    n += 1;
-                                    break;
-                                }
-                                j += 1;
-                            }
-                            if j == d_hi {
-                                let mut tv = [0u32; W];
-                                for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
-                                    *dst = src.load(Ordering::Relaxed);
-                                }
-                                ov.push((lo, hi, tv, m, h));
-                            }
-                        } else {
-                            let mut tv = [0u32; W];
-                            for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
-                                *dst = src.load(Ordering::Relaxed);
-                            }
-                            ov.push((lo, hi, tv, m, h));
-                        }
+        let stripe = 4096usize.min(old.len).max(1);
+        let n_stripes = old.len.div_ceil(stripe);
+        let jobp = Box::into_raw(Box::new(GrowJob {
+            old: old as *const STable<W>,
+            new: newp,
+            next_stripe: AtomicUsize::new(0),
+            done_stripes: AtomicUsize::new(0),
+            copied: AtomicUsize::new(0),
+            n_stripes,
+            stripe,
+            diff,
+            overflow: std::sync::Mutex::new(Vec::new()),
+            finished: AtomicBool::new(false),
+        }));
+        self.grow_job.store(jobp, Ordering::Release);
+        let job = unsafe { &*jobp };
+        job.help();
+        let mut sp = 0u32;
+        while job.done_stripes.load(Ordering::Acquire) < n_stripes {
+            spin_or_yield(&mut sp);
+        }
+        let new = unsafe { &*newp };
+        let mut total = job.copied.load(Ordering::Relaxed);
+        let ov = std::mem::take(&mut *job.overflow.lock().unwrap_or_else(|e| e.into_inner()));
+        for (lo, hi, tv, m, h) in ov {
+            let mut j = (h >> new.shift) as usize;
+            loop {
+                let d = new.slot(j);
+                if d.meta.load(Ordering::Relaxed) == 0 {
+                    d.lo.store(lo, Ordering::Relaxed);
+                    d.hi.store(hi, Ordering::Relaxed);
+                    for (x, &y) in d.toks.iter().zip(tv.iter()) {
+                        x.store(y, Ordering::Relaxed);
                     }
-                    (n, ov)
-                })
-                .collect();
-            let mut total = 0usize;
-            for (n, ov) in parts {
-                total += n;
-                for (lo, hi, tv, m, h) in ov {
-                    let mut j = (h >> new.shift) as usize;
-                    loop {
-                        let d = new.slot(j);
-                        if d.meta.load(Ordering::Relaxed) == 0 {
-                            d.lo.store(lo, Ordering::Relaxed);
-                            d.hi.store(hi, Ordering::Relaxed);
-                            for (x, &y) in d.toks.iter().zip(tv.iter()) {
-                                x.store(y, Ordering::Relaxed);
-                            }
-                            d.meta.store(m, Ordering::Relaxed);
-                            total += 1;
-                            break;
-                        }
-                        j = (j + 1) & new.mask;
-                    }
+                    d.meta.store(m, Ordering::Relaxed);
+                    total += 1;
+                    break;
                 }
+                j = (j + 1) & new.mask;
             }
-            total
-        } else {
-            let mut copied = 0usize;
-            for i in 0..old.len {
-                let s = old.slot(i);
-                let m = s.meta.load(Ordering::Acquire);
-                if m < 2 {
-                    continue;
-                }
-                let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
-                let mut j = (hash(lo, hi) >> new.shift) as usize;
-                loop {
-                    let d = new.slot(j);
-                    if d.meta.load(Ordering::Relaxed) == 0 {
-                        d.lo.store(lo, Ordering::Relaxed);
-                        d.hi.store(hi, Ordering::Relaxed);
-                        for (x, y) in d.toks.iter().zip(s.toks.iter()) {
-                            x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
-                        }
-                        d.meta.store(m, Ordering::Relaxed);
-                        copied += 1;
-                        break;
-                    }
-                    j = (j + 1) & new.mask;
-                }
-            }
-            copied
-        };
-        new.count.0.store(copied, Ordering::Relaxed);
+        }
+        new.count.0.store(total, Ordering::Relaxed);
         #[cfg(test)]
         if std::env::var("TT_DIAG").is_ok() {
-            eprintln!("grow -> 2^{} ({copied} entries) {:?}", new.bits(), t0.elapsed());
+            eprintln!("grow -> 2^{} ({total} entries) {:?}", new.bits(), t0.elapsed());
         }
-        let newp = Box::into_raw(new);
         self.cur.store(newp, Ordering::Release);
+        self.grow_job.store(std::ptr::null_mut(), Ordering::Release);
+        job.finished.store(true, Ordering::Release);
         self.retired.lock().unwrap_or_else(|e| e.into_inner()).push(cur);
+        self.retired_jobs.lock().unwrap_or_else(|e| e.into_inner()).push(jobp);
         self.growing.store(false, Ordering::Release);
     }
 }
@@ -1230,6 +1314,9 @@ impl<const W: usize> Drop for SharedTable<W> {
             drop(Box::from_raw(*self.cur.get_mut()));
             for p in self.retired.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
                 drop(Box::from_raw(p));
+            }
+            for jp in self.retired_jobs.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                drop(Box::from_raw(jp));
             }
         }
     }
@@ -1454,14 +1541,13 @@ pub fn pack32_at(b: &[u8], pos: usize, len: usize) -> [u64; 4] {
         // SAFETY: 32 bytes readable at pos; `len - 16` is in 0..=15.
         unsafe {
             let p = b.as_ptr().add(pos);
-            let lo = u128::from_le((p as *const u128).read_unaligned());
-            let hi = u128::from_le((p.add(16) as *const u128).read_unaligned())
-                & *KEY_MASK.get_unchecked(len - 16);
+            let (m0, m1) = *KEY_MASK64.get_unchecked(len - 16);
             [
-                lo as u64,
-                (lo >> 64) as u64,
-                hi as u64,
-                ((hi >> 64) as u64) | ((len as u64) << 56),
+                u64::from_le((p as *const u64).read_unaligned()),
+                u64::from_le((p.add(8) as *const u64).read_unaligned()),
+                u64::from_le((p.add(16) as *const u64).read_unaligned()) & m0,
+                (u64::from_le((p.add(24) as *const u64).read_unaligned()) & m1)
+                    | ((len as u64) << 56),
             ]
         }
     } else {
@@ -1514,17 +1600,18 @@ struct LTable {
 
 impl LTable {
     fn layout(n: usize) -> std::alloc::Layout {
-        std::alloc::Layout::from_size_align(64 * n, 64).expect("ltable layout")
+        let bytes = 64 * n;
+        #[cfg(target_os = "linux")]
+        let align = if bytes >= (2 << 20) { 2 << 20 } else { 64 };
+        #[cfg(not(target_os = "linux"))]
+        let align = 64;
+        std::alloc::Layout::from_size_align(bytes, align).expect("ltable layout")
     }
 
     fn new(bits: u32) -> Box<LTable> {
         let n = 1usize << bits;
         let layout = Self::layout(n);
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut LSlot;
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        advise_hugepage(ptr as *mut u8, layout.size());
+        let ptr = unsafe { alloc_zeroed_huge(layout) } as *mut LSlot;
         Box::new(LTable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
     }
 
@@ -1720,14 +1807,110 @@ impl LongView<'_> {
     }
 }
 
+struct LGrowJob {
+    old: *const LTable,
+    new: *mut LTable,
+    next_stripe: AtomicUsize,
+    done_stripes: AtomicUsize,
+    copied: AtomicUsize,
+    n_stripes: usize,
+    stripe: usize,
+    diff: u32,
+    overflow: std::sync::Mutex<Vec<([u64; 4], [u32; 7], u32, u64)>>,
+    finished: AtomicBool,
+}
+
+unsafe impl Send for LGrowJob {}
+unsafe impl Sync for LGrowJob {}
+
+impl LGrowJob {
+    #[inline(never)]
+    fn help(&self) {
+        let old_t = unsafe { &*self.old };
+        let new_t = unsafe { &*self.new };
+        let mut local_copied = 0usize;
+        let mut local_ov: Vec<([u64; 4], [u32; 7], u32, u64)> = Vec::new();
+        loop {
+            let si = self.next_stripe.fetch_add(1, Ordering::Relaxed);
+            if si >= self.n_stripes {
+                break;
+            }
+            let s_lo = si * self.stripe;
+            let s_hi = (s_lo + self.stripe).min(old_t.len);
+            let d_lo = s_lo << self.diff;
+            let d_hi = s_hi << self.diff;
+            for i in s_lo..s_hi {
+                let s = old_t.slot(i);
+                let mut m = s.meta.load(Ordering::Acquire);
+                let mut sp = 0u32;
+                while m == 1 {
+                    spin_or_yield(&mut sp);
+                    m = s.meta.load(Ordering::Acquire);
+                }
+                if m < 2 {
+                    continue;
+                }
+                let k = [
+                    s.k[0].load(Ordering::Relaxed),
+                    s.k[1].load(Ordering::Relaxed),
+                    s.k[2].load(Ordering::Relaxed),
+                    s.k[3].load(Ordering::Relaxed),
+                ];
+                let h = hash32(k);
+                let mut j = (h >> new_t.shift) as usize;
+                if j >= d_lo && j < d_hi {
+                    while j < d_hi {
+                        let d = new_t.slot(j);
+                        if d.meta.load(Ordering::Relaxed) == 0 {
+                            for x in 0..4 {
+                                d.k[x].store(k[x], Ordering::Relaxed);
+                            }
+                            for x in 0..7 {
+                                d.toks[x].store(s.toks[x].load(Ordering::Relaxed), Ordering::Relaxed);
+                            }
+                            d.meta.store(m, Ordering::Relaxed);
+                            local_copied += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if j == d_hi {
+                        let mut tv = [0u32; 7];
+                        for x in 0..7 {
+                            tv[x] = s.toks[x].load(Ordering::Relaxed);
+                        }
+                        local_ov.push((k, tv, m, h));
+                    }
+                } else {
+                    let mut tv = [0u32; 7];
+                    for x in 0..7 {
+                        tv[x] = s.toks[x].load(Ordering::Relaxed);
+                    }
+                    local_ov.push((k, tv, m, h));
+                }
+            }
+            if !local_ov.is_empty() {
+                let mut g = self.overflow.lock().unwrap_or_else(|e| e.into_inner());
+                g.append(&mut local_ov);
+            }
+            self.done_stripes.fetch_add(1, Ordering::Release);
+        }
+        if local_copied != 0 {
+            self.copied.fetch_add(local_copied, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Lock-free, lazy-allocated shared table for 16..=31 byte chunks.
 /// Allocates 0 bytes until the first 16..=31 byte chunk is stored, then starts
-/// at 128 KiB and doubles with zero-CAS disjoint stripes up to `max_mib`.
+/// at 128 KiB and doubles with cooperative lock-free disjoint stripes up to `max_mib`.
 /// Eliminates per-thread `LongCache` wipes and `SpillMap` RwLock contention
 /// on German/compound-word corpora while staying tiny on English.
 pub struct SharedLongTable {
     cur: AtomicPtr<LTable>,
+    grow_job: AtomicPtr<LGrowJob>,
     retired: std::sync::Mutex<Vec<*mut LTable>>,
+    retired_jobs: std::sync::Mutex<Vec<*mut LGrowJob>>,
     growing: AtomicBool,
     max_bits: AtomicU32,
 }
@@ -1739,7 +1922,9 @@ impl SharedLongTable {
     pub fn new(max_mib: usize) -> Self {
         let t = SharedLongTable {
             cur: AtomicPtr::new(std::ptr::null_mut()),
+            grow_job: AtomicPtr::new(std::ptr::null_mut()),
             retired: std::sync::Mutex::new(Vec::new()),
+            retired_jobs: std::sync::Mutex::new(Vec::new()),
             growing: AtomicBool::new(false),
             max_bits: AtomicU32::new(LONG_MIN_BITS),
         };
@@ -1807,6 +1992,25 @@ impl SharedLongTable {
         unsafe { v.get_into_at(k, v.slot_addr(h), out) }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn wait_or_help_grow(&self) {
+        while self.growing.load(Ordering::Acquire) {
+            let jp = self.grow_job.load(Ordering::Acquire);
+            if !jp.is_null() {
+                let job = unsafe { &*jp };
+                job.help();
+                let mut sp = 0u32;
+                while !job.finished.load(Ordering::Acquire) {
+                    spin_or_yield(&mut sp);
+                }
+                break;
+            }
+            // Initiator is allocating/madvise-ing the new table: yield instead of burning SMT/CPU.
+            std::thread::yield_now();
+        }
+    }
+
     /// Store 1..=11 tokens inline (1..=7 uncompressed, 8..=11 20-bit packed),
     /// or record a `SPILLED` marker and return `false` so caller uses SpillMap.
     pub fn put(&self, k: [u64; 4], h: u64, toks: &[u32]) -> bool {
@@ -1830,7 +2034,7 @@ impl SharedLongTable {
             }
         }
         if self.growing.load(Ordering::Acquire) {
-            return false;
+            self.wait_or_help_grow();
         }
         let t = unsafe { &*self.cur.load(Ordering::Acquire) };
         let (words, pub_meta, inline) = if !toks.is_empty() && toks.len() <= 7 {
@@ -1845,7 +2049,7 @@ impl SharedLongTable {
         let mut i = (h >> t.shift) as usize;
         for _ in 0..PROBE_MAX {
             let s = t.slot(i);
-            let mut m = s.meta.load(Ordering::Relaxed);
+            let mut m = s.meta.load(Ordering::Acquire);
             if m == 0 {
                 match s.meta.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
                     Ok(_) => {
@@ -1858,7 +2062,7 @@ impl SharedLongTable {
                         s.meta.store(pub_meta, Ordering::Release);
                         PENDING_LONG.with(|c| {
                             let v = c.get() + 1;
-                            if v >= 32 {
+                            if v >= 16 {
                                 t.count.0.fetch_add(v, Ordering::Relaxed);
                                 c.set(0);
                             } else {
@@ -1869,6 +2073,11 @@ impl SharedLongTable {
                     }
                     Err(cur) => m = cur,
                 }
+            }
+            let mut sp = 0u32;
+            while m == 1 {
+                spin_or_yield(&mut sp);
+                m = s.meta.load(Ordering::Acquire);
             }
             if m >= 2
                 && s.k[0].load(Ordering::Relaxed) == k[0]
@@ -1887,6 +2096,9 @@ impl SharedLongTable {
     #[inline(never)]
     fn init_table(&self) -> *mut LTable {
         if self.growing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            while self.growing.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
             return self.cur.load(Ordering::Acquire);
         }
         let cur = self.cur.load(Ordering::Acquire);
@@ -1912,141 +2124,56 @@ impl SharedLongTable {
             self.growing.store(false, Ordering::Release);
             return;
         }
-        let new = LTable::new(bits);
+        let newp = Box::into_raw(LTable::new(bits));
         let diff = bits - old.bits();
-        let copied = if old.len >= 16384 && rayon::current_num_threads() > 1 {
-            use rayon::prelude::*;
-            struct RawLTable(*const LTable);
-            unsafe impl Sync for RawLTable {}
-            impl RawLTable {
-                #[inline(always)]
-                fn get(&self) -> &LTable {
-                    unsafe { &*self.0 }
-                }
-            }
-            let old_r = RawLTable(old as *const LTable);
-            let new_r = RawLTable(&*new as *const LTable);
-            let n_stripes = rayon::current_num_threads().min(old.len / 8192).max(1);
-            let stripe = old.len / n_stripes;
-            let parts: Vec<(usize, Vec<([u64; 4], [u32; 7], u32, u64)>)> = (0..n_stripes)
-                .into_par_iter()
-                .map(|si| {
-                    let old_t = old_r.get();
-                    let new_t = new_r.get();
-                    let s_lo = si * stripe;
-                    let s_hi = if si + 1 == n_stripes { old_t.len } else { s_lo + stripe };
-                    let d_lo = s_lo << diff;
-                    let d_hi = s_hi << diff;
-                    let mut n = 0usize;
-                    let mut ov = Vec::new();
-                    for i in s_lo..s_hi {
-                        let s = old_t.slot(i);
-                        let m = s.meta.load(Ordering::Acquire);
-                        if m < 2 {
-                            continue;
-                        }
-                        let k = [
-                            s.k[0].load(Ordering::Relaxed),
-                            s.k[1].load(Ordering::Relaxed),
-                            s.k[2].load(Ordering::Relaxed),
-                            s.k[3].load(Ordering::Relaxed),
-                        ];
-                        let h = hash32(k);
-                        let mut j = (h >> new_t.shift) as usize;
-                        if j >= d_lo && j < d_hi {
-                            while j < d_hi {
-                                let d = new_t.slot(j);
-                                if d.meta.load(Ordering::Relaxed) == 0 {
-                                    for x in 0..4 {
-                                        d.k[x].store(k[x], Ordering::Relaxed);
-                                    }
-                                    for x in 0..7 {
-                                        d.toks[x].store(s.toks[x].load(Ordering::Relaxed), Ordering::Relaxed);
-                                    }
-                                    d.meta.store(m, Ordering::Relaxed);
-                                    n += 1;
-                                    break;
-                                }
-                                j += 1;
-                            }
-                            if j == d_hi {
-                                let mut tv = [0u32; 7];
-                                for x in 0..7 {
-                                    tv[x] = s.toks[x].load(Ordering::Relaxed);
-                                }
-                                ov.push((k, tv, m, h));
-                            }
-                        } else {
-                            let mut tv = [0u32; 7];
-                            for x in 0..7 {
-                                tv[x] = s.toks[x].load(Ordering::Relaxed);
-                            }
-                            ov.push((k, tv, m, h));
-                        }
+        let stripe = 2048usize.min(old.len).max(1);
+        let n_stripes = old.len.div_ceil(stripe);
+        let jobp = Box::into_raw(Box::new(LGrowJob {
+            old: old as *const LTable,
+            new: newp,
+            next_stripe: AtomicUsize::new(0),
+            done_stripes: AtomicUsize::new(0),
+            copied: AtomicUsize::new(0),
+            n_stripes,
+            stripe,
+            diff,
+            overflow: std::sync::Mutex::new(Vec::new()),
+            finished: AtomicBool::new(false),
+        }));
+        self.grow_job.store(jobp, Ordering::Release);
+        let job = unsafe { &*jobp };
+        job.help();
+        let mut sp = 0u32;
+        while job.done_stripes.load(Ordering::Acquire) < n_stripes {
+            spin_or_yield(&mut sp);
+        }
+        let new = unsafe { &*newp };
+        let mut total = job.copied.load(Ordering::Relaxed);
+        let ov = std::mem::take(&mut *job.overflow.lock().unwrap_or_else(|e| e.into_inner()));
+        for (k, tv, m, h) in ov {
+            let mut j = (h >> new.shift) as usize;
+            loop {
+                let d = new.slot(j);
+                if d.meta.load(Ordering::Relaxed) == 0 {
+                    for x in 0..4 {
+                        d.k[x].store(k[x], Ordering::Relaxed);
                     }
-                    (n, ov)
-                })
-                .collect();
-            let mut total = 0usize;
-            for (n, ov) in parts {
-                total += n;
-                for (k, tv, m, h) in ov {
-                    let mut j = (h >> new.shift) as usize;
-                    loop {
-                        let d = new.slot(j);
-                        if d.meta.load(Ordering::Relaxed) == 0 {
-                            for x in 0..4 {
-                                d.k[x].store(k[x], Ordering::Relaxed);
-                            }
-                            for x in 0..7 {
-                                d.toks[x].store(tv[x], Ordering::Relaxed);
-                            }
-                            d.meta.store(m, Ordering::Relaxed);
-                            total += 1;
-                            break;
-                        }
-                        j = (j + 1) & new.mask;
+                    for x in 0..7 {
+                        d.toks[x].store(tv[x], Ordering::Relaxed);
                     }
+                    d.meta.store(m, Ordering::Relaxed);
+                    total += 1;
+                    break;
                 }
+                j = (j + 1) & new.mask;
             }
-            total
-        } else {
-            let mut copied = 0usize;
-            for i in 0..old.len {
-                let s = old.slot(i);
-                let m = s.meta.load(Ordering::Acquire);
-                if m < 2 {
-                    continue;
-                }
-                let k = [
-                    s.k[0].load(Ordering::Relaxed),
-                    s.k[1].load(Ordering::Relaxed),
-                    s.k[2].load(Ordering::Relaxed),
-                    s.k[3].load(Ordering::Relaxed),
-                ];
-                let mut j = (hash32(k) >> new.shift) as usize;
-                loop {
-                    let d = new.slot(j);
-                    if d.meta.load(Ordering::Relaxed) == 0 {
-                        for x in 0..4 {
-                            d.k[x].store(k[x], Ordering::Relaxed);
-                        }
-                        for x in 0..7 {
-                            d.toks[x].store(s.toks[x].load(Ordering::Relaxed), Ordering::Relaxed);
-                        }
-                        d.meta.store(m, Ordering::Relaxed);
-                        copied += 1;
-                        break;
-                    }
-                    j = (j + 1) & new.mask;
-                }
-            }
-            copied
-        };
-        new.count.0.store(copied, Ordering::Relaxed);
-        let newp = Box::into_raw(new);
+        }
+        new.count.0.store(total, Ordering::Relaxed);
         self.cur.store(newp, Ordering::Release);
+        self.grow_job.store(std::ptr::null_mut(), Ordering::Release);
+        job.finished.store(true, Ordering::Release);
         self.retired.lock().unwrap_or_else(|e| e.into_inner()).push(cur);
+        self.retired_jobs.lock().unwrap_or_else(|e| e.into_inner()).push(jobp);
         self.growing.store(false, Ordering::Release);
     }
 }
@@ -2060,6 +2187,9 @@ impl Drop for SharedLongTable {
             }
             for p in self.retired.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
                 drop(Box::from_raw(p));
+            }
+            for jp in self.retired_jobs.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                drop(Box::from_raw(jp));
             }
         }
     }
@@ -2095,5 +2225,52 @@ mod long_table_tests {
         let h12 = hash32(k12);
         assert!(!t.put(k12, h12, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]));
         assert_eq!(t.get_into(k12, h12, &mut out), LongHit::Spilled);
+    }
+
+    #[test]
+    fn shared_long_table_concurrent_grow() {
+        let t = SharedLongTable::new(32);
+        let keys: Vec<([u64; 4], u64)> = (0..40_000u64)
+            .map(|i| {
+                let k = [
+                    i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    i.wrapping_mul(0xBF58_476D_1CE4_E5B9),
+                    i ^ 0x1234_5678,
+                    (20u64 << 56) | (i & 0xFFFF_FFFF),
+                ];
+                (k, hash32(k))
+            })
+            .collect();
+        std::thread::scope(|sc| {
+            for w in 0..8 {
+                let (t, keys) = (&t, &keys);
+                sc.spawn(move || {
+                    let mut out = Vec::new();
+                    for (j, &(k, h)) in keys.iter().enumerate() {
+                        if j % 8 == w || j < 200 {
+                            let n = 1 + (j % 11);
+                            let v: Vec<u32> = (0..n as u32).map(|x| ((j as u32) * 7 + x) & PACK20_MAX_TOK).collect();
+                            let _ = t.put(k, h, &v);
+                        }
+                        out.clear();
+                        if t.get_into(k, h, &mut out) == LongHit::Hit {
+                            let n = 1 + (j % 11);
+                            assert_eq!(out.len(), n);
+                            assert_eq!(out[0], ((j as u32) * 7) & PACK20_MAX_TOK);
+                        }
+                    }
+                });
+            }
+        });
+        let mut out = Vec::new();
+        let mut found = 0usize;
+        for (j, &(k, h)) in keys.iter().enumerate() {
+            out.clear();
+            if t.get_into(k, h, &mut out) == LongHit::Hit {
+                assert_eq!(out.len(), 1 + (j % 11));
+                found += 1;
+            }
+        }
+        assert!(found * 100 >= keys.len() * 99, "found only {found} of {}", keys.len());
     }
 }
