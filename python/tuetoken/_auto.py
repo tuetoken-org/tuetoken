@@ -536,6 +536,15 @@ class AutoTokenizer:
                normalize=False, basic_normalize=False, remove_diacritics=False, **_):
         if isinstance(ids, int):
             ids = [ids]
+        elif hasattr(ids, "ndim"):
+            # Zero-copy buffer fast path for 1D (or [1, N]) numpy arrays / torch CPU tensors
+            # (skips Python `.tolist()` int-boxing completely!).
+            if hasattr(ids, "detach"):
+                ids = ids.detach().cpu().numpy()
+            if ids.ndim == 2 and ids.shape[0] == 1:
+                ids = ids[0]
+            elif ids.ndim != 1:
+                ids = ids.tolist()
         elif hasattr(ids, "tolist"):
             ids = ids.tolist()
             if ids and isinstance(ids[0], list) and len(ids) == 1:
@@ -553,8 +562,9 @@ class AutoTokenizer:
                 text = self.basic_normalize(text, remove_diacritics=remove_diacritics)
         if output_offsets and self._is_whisper and self._whisper_ts_begin is not None:
             from . import _whisper as _wh
+            id_list = ids.tolist() if hasattr(ids, "tolist") else ids
             offsets = _wh.whisper_compute_offsets(
-                ids, self._core, self._whisper_ts_begin, float(time_precision), int(segment_size)
+                id_list, self._core, self._whisper_ts_begin, float(time_precision), int(segment_size)
             )
             return {"text": text, "offsets": offsets}
         return text
@@ -562,7 +572,12 @@ class AutoTokenizer:
     def batch_decode(self, sequences, skip_special_tokens=False, decode_with_timestamps=False,
                      output_offsets=False, time_precision=0.02, segment_size=1500,
                      normalize=False, basic_normalize=False, remove_diacritics=False, **_):
-        if hasattr(sequences, "tolist"):
+        if hasattr(sequences, "ndim"):
+            if hasattr(sequences, "detach"):
+                sequences = sequences.detach().cpu().numpy()
+            if sequences.ndim != 2:
+                sequences = sequences.tolist()
+        elif hasattr(sequences, "tolist"):
             sequences = sequences.tolist()
         elif sequences and not isinstance(sequences[0], list):
             sequences = [s.tolist() if hasattr(s, "tolist") else [int(i) for i in s] for s in sequences]
@@ -577,6 +592,7 @@ class AutoTokenizer:
                 texts = [self.basic_normalize(t, remove_diacritics=remove_diacritics) for t in texts]
         if output_offsets and self._is_whisper and self._whisper_ts_begin is not None:
             from . import _whisper as _wh
+            seq_lists = sequences.tolist() if hasattr(sequences, "tolist") else sequences
             return [
                 {
                     "text": t,
@@ -584,7 +600,7 @@ class AutoTokenizer:
                         s, self._core, self._whisper_ts_begin, float(time_precision), int(segment_size)
                     ),
                 }
-                for t, s in zip(texts, sequences)
+                for t, s in zip(texts, seq_lists)
             ]
         return texts
 

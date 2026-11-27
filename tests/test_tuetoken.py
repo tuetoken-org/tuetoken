@@ -1046,6 +1046,67 @@ def test_whisper():
     return ok, tot
 
 
+def test_zero_copy_buffer_decode():
+    """Verify 1D/2D integer buffer decode (uint32/int32/int64/uint64/uint16/int16)
+    and AutoTokenizer numpy fast decode without .tolist() boxing."""
+    print("=== zero-copy buffer decode (1D/2D numpy & array.array) ===")
+    import array
+    import numpy as np
+
+    ok = tot = 0
+    tok = tuetoken.Tokenizer.from_tiktoken("o200k_base")
+    samples = [
+        "",
+        "Hello, world!",
+        "Pure ASCII code: for i in range(100): x += i * 2\n" * 40,
+        "Mixed UTF-8: café, naïve, Zürich, 日本語, 🚀✨ — end!\n" * 15,
+    ]
+    for s in samples:
+        ids = tok.encode_ordinary(s)
+        for dt in (np.uint32, np.int32, np.int64, np.uint64):
+            arr = np.array(ids, dtype=dt)
+            tot += 1
+            ok += int(tok.decode(arr) == s)
+        tot += 1
+        ok += int(tok.decode(array.array("I", ids)) == s)
+    # 2D batch decode across dtypes (including large >65k tok parallel trigger)
+    row = tok.encode_ordinary("The quick brown fox jumps over the lazy dog. " * 20)[:128]
+    mat_expected = [tok.decode(row)] * 600
+    for dt in (np.uint32, np.int32, np.int64, np.uint64):
+        mat = np.tile(np.array(row, dtype=dt), (600, 1))
+        tot += 1
+        ok += int(tok.decode_batch(mat) == mat_expected)
+    # Narrow u16/i16 dtypes on gpt2 (pick ids < 32767 so int16 holds them)
+    tg = tuetoken.Tokenizer.from_tiktoken("gpt2")
+    gtext = "Hello world! The quick brown fox 123."
+    gids = tg.encode_ordinary(gtext)
+    assert max(gids) < 32768, gids
+    for dt in (np.uint16, np.int16):
+        tot += 1
+        ok += int(tg.decode(np.array(gids, dtype=dt)) == gtext)
+        tot += 1
+        ok += int(tg.decode_batch(np.array([gids, gids], dtype=dt)) == [gtext, gtext])
+    # Reject negative values cleanly (must raise, never wrap)
+    for bad in (np.array([-1, 2], dtype=np.int64), np.array([-5, 1], dtype=np.int32), np.array([[1, -2]], dtype=np.int64)):
+        tot += 1
+        try:
+            (tok.decode_batch if bad.ndim == 2 else tok.decode)(bad)
+        except Exception:
+            ok += 1
+    # AutoTokenizer numpy decode & batch_decode (1D, [1, N], 2D)
+    at = tuetoken.AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    qtext = "Hello <|im_end|> world — test!"
+    qids = at.encode(qtext)
+    qarr = np.array(qids, dtype=np.int64)
+    tot += 3
+    ok += int(at.decode(qarr) == at.decode(qids))
+    ok += int(at.decode(qarr.reshape(1, -1), skip_special_tokens=True) == at.decode(qids, skip_special_tokens=True))
+    ok += int(at.batch_decode(np.stack([qarr, qarr]), skip_special_tokens=True) == [at.decode(qids, skip_special_tokens=True)] * 2)
+    _line("buffer decode (1D/2D/dtypes/Auto)", ok, tot)
+    assert ok == tot, f"buffer decode: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -1053,7 +1114,7 @@ def main():
         test_normalization(), test_new_features(), test_rank_inversion(),
         test_auto(), test_kimi_tiktoken_model(), test_tekken_and_legacy_formats(),
         test_bytes_inputs(), test_warmup_and_fast_startup(),
-        test_review_regressions(), test_whisper(),
+        test_review_regressions(), test_whisper(), test_zero_copy_buffer_decode(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

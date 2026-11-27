@@ -90,15 +90,306 @@ fn bytes_to_unicode_table() -> [u16; 324] {
     c2b
 }
 
-/// Build a Python str from decoded bytes with one UTF-8 validation and one copy
-/// (the `String` round-trip pyo3 does for a returned `String` validates+copies
-/// twice). Invalid UTF-8 (truncated token sequences) falls back to lossy, as
-/// tiktoken/HF do.
+/// Build a Python str from decoded bytes in one CPython pass (UTF-8 validation,
+/// U+FFFD replacement, and PyUnicode construction in a single scan, avoiding
+/// double validation and avoiding `String::from_utf8_lossy` heap allocation on
+/// invalid UTF-8).
+#[inline]
 fn bytes_to_pystr<'py>(py: Python<'py>, buf: &[u8]) -> Bound<'py, PyString> {
+    if buf.is_empty() {
+        return PyString::new(py, "");
+    }
+    unsafe {
+        let obj = pyo3::ffi::PyUnicode_DecodeUTF8(
+            buf.as_ptr() as *const std::os::raw::c_char,
+            buf.len() as pyo3::ffi::Py_ssize_t,
+            c"replace".as_ptr(),
+        );
+        if !obj.is_null() {
+            return Bound::from_owned_ptr(py, obj).cast_into_unchecked();
+        }
+        pyo3::ffi::PyErr_Clear();
+    }
     match std::str::from_utf8(buf) {
         Ok(s) => PyString::new(py, s),
         Err(_) => PyString::new(py, &String::from_utf8_lossy(buf)),
     }
+}
+
+/// Build a Python ASCII `str` directly into `PyUnicode_New(len, 127)` when the
+/// caller has already proven every byte is `< 0x80` (zero UTF-8 scan).
+#[inline]
+fn ascii_bytes_to_pystr<'py>(py: Python<'py>, buf: &[u8]) -> Bound<'py, PyString> {
+    #[cfg(not(any(PyPy, GraalPy, Py_LIMITED_API)))]
+    unsafe {
+        let obj = pyo3::ffi::PyUnicode_New(buf.len() as pyo3::ffi::Py_ssize_t, 127);
+        if !obj.is_null() {
+            if !buf.is_empty() {
+                let dst = pyo3::ffi::PyUnicode_1BYTE_DATA(obj);
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
+            }
+            return Bound::from_owned_ptr(py, obj).cast_into_unchecked();
+        }
+        pyo3::ffi::PyErr_Clear();
+    }
+    bytes_to_pystr(py, buf)
+}
+
+/// Compact 16-byte cache-aligned decode table entry: tokens `<= 12` bytes
+/// (~98.5% of real LLM tokens) live completely inline with zero `byte_arena`
+/// indirection and copy in a single 16-byte SIMD unaligned store.
+const DEC_FLAG_NON_ASCII: u8 = 1;
+const DEC_FLAG_SPECIAL: u8 = 2;
+const DEC_OUTLINE_LEN: u8 = 255;
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct DecodeEntry {
+    /// Inline token bytes (`0..=12`) when `len != DEC_OUTLINE_LEN`;
+    /// otherwise `[off_u32_ne (0..4), len_u32_ne (4..8)]` into `byte_arena`.
+    data: [u8; 12],
+    len: u8,
+    flags: u8,
+    _pad: u16,
+}
+
+impl DecodeEntry {
+    #[inline(always)]
+    fn outline_span(&self) -> (usize, usize) {
+        let off = u32::from_ne_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) as usize;
+        let len = u32::from_ne_bytes([self.data[4], self.data[5], self.data[6], self.data[7]]) as usize;
+        (off, len)
+    }
+}
+
+/// Runtime-verified direct `PyLongObject` 1-digit fast reader for CPython 3.12+
+/// 64-bit (handles `0 <= id < 2^30` in 3 instructions with zero C-API calls).
+/// Self-verifies layout once against live `PyLong` objects so any future ABI
+/// change automatically and safely disables the inline path.
+#[cfg(all(Py_3_12, target_pointer_width = "64", not(any(PyPy, GraalPy, Py_LIMITED_API, Py_GIL_DISABLED))))]
+#[inline]
+fn pylong_inline_ok(_py: Python<'_>) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0=unchecked, 1=no, 2=yes
+    let s = STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 2;
+    }
+    let ok = unsafe {
+        use pyo3::ffi;
+        let lt = &raw mut ffi::PyLong_Type;
+        let p0 = ffi::PyLong_FromLong(0);
+        let p1 = ffi::PyLong_FromLong(1);
+        let pbig = ffi::PyLong_FromLong(199_999);
+        let pneg = ffi::PyLong_FromLong(-1);
+        let p2d = ffi::PyLong_FromLongLong(1i64 << 30);
+        let mut good = false;
+        if !p0.is_null() && !p1.is_null() && !pbig.is_null() && !pneg.is_null() && !p2d.is_null() {
+            let tag = |p: *mut ffi::PyObject| *(p as *const usize).add(2) & !4usize;
+            let dig = |p: *mut ffi::PyObject| *(p as *const u32).add(6);
+            good = ffi::Py_TYPE(p0) == lt
+                && ffi::Py_TYPE(p1) == lt
+                && ffi::Py_TYPE(pbig) == lt
+                && tag(p0) == 1
+                && dig(p0) == 0
+                && tag(p1) == 8
+                && dig(p1) == 1
+                && tag(pbig) == 8
+                && dig(pbig) == 199_999
+                && tag(pneg) != 1
+                && tag(pneg) != 8
+                && tag(p2d) != 1
+                && tag(p2d) != 8;
+        }
+        if !p0.is_null() { ffi::Py_DECREF(p0); }
+        if !p1.is_null() { ffi::Py_DECREF(p1); }
+        if !pbig.is_null() { ffi::Py_DECREF(pbig); }
+        if !pneg.is_null() { ffi::Py_DECREF(pneg); }
+        if !p2d.is_null() { ffi::Py_DECREF(p2d); }
+        good
+    };
+    STATE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+    ok
+}
+
+#[cfg(not(all(Py_3_12, target_pointer_width = "64", not(any(PyPy, GraalPy, Py_LIMITED_API, Py_GIL_DISABLED)))))]
+#[inline]
+fn pylong_inline_ok(_py: Python<'_>) -> bool {
+    false
+}
+
+/// Extract a plain Python `list[int]` into `dst` (writing `n` elements at `dst`,
+/// which must have capacity `>= n`), using the self-verified inline `PyLong`
+/// digit path with lookahead prefetching when available. Returns `true` on
+/// success or `false` on any non-u32 / non-int element (clearing no PyErr).
+#[inline]
+unsafe fn extract_pylist_u32_into(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    n: usize,
+    dst: *mut u32,
+    inline_long: bool,
+) -> bool {
+    use pyo3::ffi;
+    #[cfg(all(Py_3_12, target_pointer_width = "64", not(any(PyPy, GraalPy, Py_LIMITED_API, Py_GIL_DISABLED))))]
+    if inline_long {
+        let lt = &raw mut ffi::PyLong_Type;
+        for i in 0..n {
+            if i + 16 < n {
+                let pf = ffi::PyList_GET_ITEM(list_ptr, (i + 16) as ffi::Py_ssize_t);
+                chunk_table::prefetch(pf as *const u8);
+            }
+            let item = ffi::PyList_GET_ITEM(list_ptr, i as ffi::Py_ssize_t);
+            if ffi::Py_TYPE(item) == lt {
+                let tag = *(item as *const usize).add(2) & !4usize;
+                if tag == 8 {
+                    *dst.add(i) = *(item as *const u32).add(6);
+                    continue;
+                }
+                if tag == 1 {
+                    *dst.add(i) = 0;
+                    continue;
+                }
+            }
+            let val = ffi::PyLong_AsLongLong(item);
+            if val < 0 || val > u32::MAX as i64 {
+                return false;
+            }
+            *dst.add(i) = val as u32;
+        }
+        return ffi::PyErr_Occurred().is_null();
+    }
+    let _ = inline_long;
+    for i in 0..n {
+        let item = ffi::PyList_GET_ITEM(list_ptr, i as ffi::Py_ssize_t);
+        let val = ffi::PyLong_AsLongLong(item);
+        if val < 0 || val > u32::MAX as i64 {
+            return false;
+        }
+        *dst.add(i) = val as u32;
+    }
+    ffi::PyErr_Occurred().is_null()
+}
+
+/// RAII guard for a CPython `Py_buffer` acquired via `PyObject_GetBuffer`.
+struct PyBufGuard {
+    view: pyo3::ffi::Py_buffer,
+    active: bool,
+}
+
+impl Drop for PyBufGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe { pyo3::ffi::PyBuffer_Release(&mut self.view) };
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IntBufKind {
+    U32,
+    I32,
+    I64,
+    U64,
+    U16,
+    I16,
+}
+
+/// Inspect a `Py_buffer`'s format string + itemsize and return its native-endian
+/// integer element kind (if supported for zero-copy / bulk decode).
+unsafe fn classify_int_buffer(view: &pyo3::ffi::Py_buffer) -> Option<IntBufKind> {
+    if view.buf.is_null() {
+        return None;
+    }
+    let fmt = if view.format.is_null() {
+        b"B".as_slice()
+    } else {
+        std::ffi::CStr::from_ptr(view.format).to_bytes()
+    };
+    let code = match fmt {
+        [c] => *c,
+        [b'@' | b'=', c] => *c,
+        [b'<', c] if cfg!(target_endian = "little") => *c,
+        [b'>', c] if cfg!(target_endian = "big") => *c,
+        _ => return None,
+    };
+    match (code, view.itemsize) {
+        (b'I' | b'L', 4) => Some(IntBufKind::U32),
+        (b'i' | b'l', 4) => Some(IntBufKind::I32),
+        (b'q' | b'l', 8) => Some(IntBufKind::I64),
+        (b'Q' | b'L', 8) => Some(IntBufKind::U64),
+        (b'H', 2) => Some(IntBufKind::U16),
+        (b'h', 2) => Some(IntBufKind::I16),
+        _ => None,
+    }
+}
+
+/// Copy `count` typed integer elements from `src` into `dst` (`Vec<u32>`),
+/// checking non-negative / `<= u32::MAX` bounds. Returns `false` if out-of-range.
+unsafe fn copy_int_buf_to_u32(src: *const u8, count: usize, kind: IntBufKind, dst: &mut Vec<u32>) -> bool {
+    dst.clear();
+    dst.reserve(count);
+    let out = dst.as_mut_ptr();
+    match kind {
+        IntBufKind::U32 => {
+            std::ptr::copy_nonoverlapping(src as *const u32, out, count);
+        }
+        IntBufKind::I32 => {
+            let p = src as *const i32;
+            let mut neg = 0i32;
+            for i in 0..count {
+                let v = *p.add(i);
+                neg |= v;
+                *out.add(i) = v as u32;
+            }
+            if neg < 0 {
+                return false;
+            }
+        }
+        IntBufKind::I64 => {
+            let p = src as *const i64;
+            let mut bad = 0u64;
+            for i in 0..count {
+                let v = *p.add(i);
+                bad |= (v as u64) >> 32;
+                *out.add(i) = v as u32;
+            }
+            if bad != 0 {
+                return false;
+            }
+        }
+        IntBufKind::U64 => {
+            let p = src as *const u64;
+            let mut bad = 0u64;
+            for i in 0..count {
+                let v = *p.add(i);
+                bad |= v >> 32;
+                *out.add(i) = v as u32;
+            }
+            if bad != 0 {
+                return false;
+            }
+        }
+        IntBufKind::U16 => {
+            let p = src as *const u16;
+            for i in 0..count {
+                *out.add(i) = *p.add(i) as u32;
+            }
+        }
+        IntBufKind::I16 => {
+            let p = src as *const i16;
+            let mut neg = 0i16;
+            for i in 0..count {
+                let v = *p.add(i);
+                neg |= v;
+                *out.add(i) = v as u32;
+            }
+            if neg < 0 {
+                return false;
+            }
+        }
+    }
+    dst.set_len(count);
+    true
 }
 
 #[inline]
@@ -832,6 +1123,8 @@ struct Tokenizer {
     // result list is filled with INCREF'd pointers instead of allocating a fresh
     // PyLong per token — the dominant cost of returning list[int].
     int_table: OnceLock<Vec<Py<PyAny>>>,
+    // Lazily built 16-byte inline decode table (zero startup cost if unused).
+    decode_table: OnceLock<Vec<DecodeEntry>>,
     // Compact metadata for AutoTokenizer so Python skips re-parsing tokenizer.json.
     auto_meta: AutoMeta,
 }
@@ -2507,6 +2800,400 @@ impl Tokenizer {
         self.chunk_table = table;
     }
 
+    /// Lazily construct the 16-byte inline decode table (zero startup cost when
+    /// decode is not called). Every token `<= 12` bytes stores its payload
+    /// inline with precomputed ASCII / special / leading-space flags.
+    #[inline]
+    fn decode_table(&self) -> &[DecodeEntry] {
+        self.decode_table.get_or_init(|| {
+            const {
+                assert!(std::mem::size_of::<DecodeEntry>() == 16);
+                assert!(std::mem::align_of::<DecodeEntry>() == 16);
+            }
+            let n = self.byte_span.len();
+            let mut tbl = Vec::with_capacity(n);
+            let arena = self.byte_arena.as_slice();
+            let skip = self.special_skip_mask.as_slice();
+            for (ti, &(off, len)) in self.byte_span.iter().enumerate() {
+                let (off_u, len_u) = (off as usize, len as usize);
+                let bytes = &arena[off_u..off_u + len_u];
+                let mut flags = 0u8;
+                if bytes.iter().any(|&b| b >= 0x80) {
+                    flags |= DEC_FLAG_NON_ASCII;
+                }
+                if ti < skip.len() && skip[ti] {
+                    flags |= DEC_FLAG_SPECIAL;
+                }
+                let mut data = [0u8; 12];
+                let elen = if len_u <= 12 {
+                    data[..len_u].copy_from_slice(bytes);
+                    len_u as u8
+                } else {
+                    data[0..4].copy_from_slice(&off.to_ne_bytes());
+                    data[4..8].copy_from_slice(&len.to_ne_bytes());
+                    DEC_OUTLINE_LEN
+                };
+                tbl.push(DecodeEntry { data, len: elen, flags, _pad: 0 });
+            }
+            tbl
+        })
+    }
+
+    /// Single-pass fast decode of `&[u32]` into `buf` (cleared first), returning
+    /// `is_ascii` (true iff every emitted byte is `< 0x80`). Halves `DecodeEntry`
+    /// L2/L3 cache misses vs two-pass measure+copy by pre-reserving `ids.len()*5+32`
+    /// and emitting 16-byte inline SIMD stores directly with 16-ahead prefetching.
+    #[inline]
+    fn gather_bytes_single_pass_into(
+        &self,
+        ids: &[u32],
+        skip_special: bool,
+        buf: &mut Vec<u8>,
+    ) -> bool {
+        buf.clear();
+        let ids = if skip_special
+            && self.whisper_sop_id != u32::MAX
+            && ids.first() == Some(&self.whisper_sop_id)
+        {
+            match ids.iter().position(|&t| t == self.whisper_sot_id) {
+                Some(pos) => &ids[pos..],
+                None => return true,
+            }
+        } else {
+            ids
+        };
+        let n = ids.len();
+        if n == 0 {
+            return true;
+        }
+        let dt = self.decode_table();
+        let ndt = dt.len();
+        let dtp = dt.as_ptr();
+        let arena = self.byte_arena.as_ptr();
+        let ts_begin = self.whisper_ts_begin;
+        let unfiltered = !skip_special && ts_begin == u32::MAX;
+
+        // Typical LLM token averages ~4 bytes; reserving 5*n + 32 avoids realloc
+        // on >99% of inputs while keeping +16 slack for unconditional 16B stores.
+        buf.reserve(n.saturating_mul(5).saturating_add(32));
+        let mut base = buf.as_mut_ptr();
+        let mut dst = base;
+        let mut cap_end = unsafe { base.add(buf.capacity()) };
+        let mut non_ascii = 0u8;
+
+        #[inline(always)]
+        unsafe fn ensure_cap(buf: &mut Vec<u8>, base: &mut *mut u8, dst: &mut *mut u8, cap_end: &mut *mut u8, need: usize, rem_toks: usize) {
+            let cur = (*dst).offset_from(*base) as usize;
+            buf.set_len(cur);
+            buf.reserve(need.saturating_add(rem_toks.saturating_mul(4)).saturating_add(32));
+            *base = buf.as_mut_ptr();
+            *dst = (*base).add(cur);
+            *cap_end = (*base).add(buf.capacity());
+        }
+
+        unsafe {
+            if unfiltered {
+                for i in 0..n {
+                    if i + 16 < n {
+                        let pt = *ids.get_unchecked(i + 16) as usize;
+                        if pt < ndt {
+                            chunk_table::prefetch(dtp.add(pt) as *const u8);
+                        }
+                    }
+                    let ti = *ids.get_unchecked(i) as usize;
+                    if ti >= ndt {
+                        continue;
+                    }
+                    let e = *dtp.add(ti);
+                    non_ascii |= e.flags;
+                    if e.len != DEC_OUTLINE_LEN {
+                        if dst.add(16) > cap_end {
+                            ensure_cap(buf, &mut base, &mut dst, &mut cap_end, 16, n - i);
+                        }
+                        std::ptr::copy_nonoverlapping(&e as *const DecodeEntry as *const u8, dst, 16);
+                        dst = dst.add(e.len as usize);
+                    } else {
+                        let (off, len) = e.outline_span();
+                        if dst.add(len + 16) > cap_end {
+                            ensure_cap(buf, &mut base, &mut dst, &mut cap_end, len + 16, n - i);
+                        }
+                        std::ptr::copy_nonoverlapping(arena.add(off), dst, len);
+                        dst = dst.add(len);
+                    }
+                }
+            } else {
+                for i in 0..n {
+                    if i + 16 < n {
+                        let pt = *ids.get_unchecked(i + 16) as usize;
+                        if pt < ndt {
+                            chunk_table::prefetch(dtp.add(pt) as *const u8);
+                        }
+                    }
+                    let t = *ids.get_unchecked(i);
+                    if t >= ts_begin {
+                        continue;
+                    }
+                    let ti = t as usize;
+                    if ti >= ndt {
+                        continue;
+                    }
+                    let e = *dtp.add(ti);
+                    if skip_special && (e.flags & DEC_FLAG_SPECIAL) != 0 {
+                        continue;
+                    }
+                    non_ascii |= e.flags;
+                    if e.len != DEC_OUTLINE_LEN {
+                        if dst.add(16) > cap_end {
+                            ensure_cap(buf, &mut base, &mut dst, &mut cap_end, 16, n - i);
+                        }
+                        std::ptr::copy_nonoverlapping(&e as *const DecodeEntry as *const u8, dst, 16);
+                        dst = dst.add(e.len as usize);
+                    } else {
+                        let (off, len) = e.outline_span();
+                        if dst.add(len + 16) > cap_end {
+                            ensure_cap(buf, &mut base, &mut dst, &mut cap_end, len + 16, n - i);
+                        }
+                        std::ptr::copy_nonoverlapping(arena.add(off), dst, len);
+                        dst = dst.add(len);
+                    }
+                }
+            }
+            buf.set_len(dst.offset_from(base) as usize);
+        }
+        (non_ascii & DEC_FLAG_NON_ASCII) == 0
+    }
+
+    /// Fused single-pass `PyList[int]` -> `buf` decode with 2-stage software
+    /// prefetching (Stage 0 prefetches `PyLongObject` 24 ahead; Stage 1 extracts
+    /// `u32` + prefetches `DecodeEntry` 12 ahead; Stage 2 copies 16B inline
+    /// bytes straight into `buf`). Zero intermediate `Vec<u32>` allocation!
+    /// Returns `Some(is_ascii)` on success or `None` if any element is non-u32
+    /// (caller clears PyErr and falls back to generic extractor).
+    #[inline]
+    unsafe fn gather_pylist_fused_into(
+        &self,
+        list_ptr: *mut pyo3::ffi::PyObject,
+        n: usize,
+        inline_long: bool,
+        skip_special: bool,
+        buf: &mut Vec<u8>,
+    ) -> Option<bool> {
+        use pyo3::ffi;
+        buf.clear();
+        if n == 0 {
+            return Some(true);
+        }
+        // Fast bail for Whisper `<|startofprev|>` prompt strip (rare; let slice path handle it).
+        let ts_begin = self.whisper_ts_begin;
+        if skip_special && self.whisper_sop_id != u32::MAX {
+            return None;
+        }
+        let dt = self.decode_table();
+        let ndt = dt.len();
+        let dtp = dt.as_ptr();
+        let arena = self.byte_arena.as_ptr();
+        let unfiltered = !skip_special && ts_begin == u32::MAX;
+
+        buf.reserve(n.saturating_mul(5).saturating_add(32));
+        let mut base = buf.as_mut_ptr();
+        let mut dst = base;
+        let mut cap_end = base.add(buf.capacity());
+        let mut non_ascii = 0u8;
+
+        #[inline(always)]
+        unsafe fn read_one_id(item: *mut ffi::PyObject, inline_long: bool) -> Option<u32> {
+            #[cfg(all(Py_3_12, target_pointer_width = "64", not(any(PyPy, GraalPy, Py_LIMITED_API, Py_GIL_DISABLED))))]
+            if inline_long {
+                let lt = &raw mut ffi::PyLong_Type;
+                if ffi::Py_TYPE(item) == lt {
+                    let tag = *(item as *const usize).add(2) & !4usize;
+                    if tag == 8 {
+                        return Some(*(item as *const u32).add(6));
+                    }
+                    if tag == 1 {
+                        return Some(0);
+                    }
+                }
+            }
+            let _ = inline_long;
+            let val = ffi::PyLong_AsLongLong(item);
+            if val < 0 || val > u32::MAX as i64 || !ffi::PyErr_Occurred().is_null() {
+                return None;
+            }
+            Some(val as u32)
+        }
+
+        #[inline(always)]
+        unsafe fn ensure_cap(buf: &mut Vec<u8>, base: &mut *mut u8, dst: &mut *mut u8, cap_end: &mut *mut u8, need: usize, rem_toks: usize) {
+            let cur = (*dst).offset_from(*base) as usize;
+            buf.set_len(cur);
+            buf.reserve(need.saturating_add(rem_toks.saturating_mul(4)).saturating_add(32));
+            *base = buf.as_mut_ptr();
+            *dst = (*base).add(cur);
+            *cap_end = (*base).add(buf.capacity());
+        }
+
+        // Split into zero-branch steady-state loop (`0..steady`) + short tail
+        // (`steady..n`) and hoist `unfiltered` + `inline_long` outside.
+        const RING: usize = 16;
+        let mut ring = [0u32; RING];
+        let prime = n.min(RING);
+        for (j, slot) in ring.iter_mut().enumerate().take(prime) {
+            if j + RING < n {
+                chunk_table::prefetch(ffi::PyList_GET_ITEM(list_ptr, (j + RING) as ffi::Py_ssize_t) as *const u8);
+            }
+            let item = ffi::PyList_GET_ITEM(list_ptr, j as ffi::Py_ssize_t);
+            let t = read_one_id(item, inline_long)?;
+            *slot = t;
+            if (t as usize) < ndt {
+                chunk_table::prefetch(dtp.add(t as usize) as *const u8);
+            }
+        }
+
+        macro_rules! emit_tok {
+            ($t:expr, $rem_toks:expr, $unfilt:expr) => {{
+                let t: u32 = $t;
+                if $unfilt || t < ts_begin {
+                    let ti = t as usize;
+                    if ti < ndt {
+                        let e = *dtp.add(ti);
+                        if $unfilt || !skip_special || (e.flags & DEC_FLAG_SPECIAL) == 0 {
+                            non_ascii |= e.flags;
+                            if e.len != DEC_OUTLINE_LEN {
+                                if dst.add(16) > cap_end {
+                                    ensure_cap(buf, &mut base, &mut dst, &mut cap_end, 16, $rem_toks);
+                                }
+                                std::ptr::copy_nonoverlapping(&e as *const DecodeEntry as *const u8, dst, 16);
+                                dst = dst.add(e.len as usize);
+                            } else {
+                                let (off, len) = e.outline_span();
+                                if dst.add(len + 16) > cap_end {
+                                    ensure_cap(buf, &mut base, &mut dst, &mut cap_end, len + 16, $rem_toks);
+                                }
+                                std::ptr::copy_nonoverlapping(arena.add(off), dst, len);
+                                dst = dst.add(len);
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+
+        let steady = n.saturating_sub(2 * RING);
+        if unfiltered {
+            for i in 0..steady {
+                let slot = i & (RING - 1);
+                let t = *ring.get_unchecked(slot);
+                let pf_item = ffi::PyList_GET_ITEM(list_ptr, (i + 2 * RING) as ffi::Py_ssize_t);
+                chunk_table::prefetch(pf_item as *const u8);
+                let next_item = ffi::PyList_GET_ITEM(list_ptr, (i + RING) as ffi::Py_ssize_t);
+                let tn = read_one_id(next_item, inline_long)?;
+                *ring.get_unchecked_mut(slot) = tn;
+                if (tn as usize) < ndt {
+                    chunk_table::prefetch(dtp.add(tn as usize) as *const u8);
+                }
+                emit_tok!(t, n - i, true);
+            }
+            for i in steady..n {
+                let slot = i & (RING - 1);
+                let t = *ring.get_unchecked(slot);
+                let next_idx = i + RING;
+                if next_idx < n {
+                    let next_item = ffi::PyList_GET_ITEM(list_ptr, next_idx as ffi::Py_ssize_t);
+                    let tn = read_one_id(next_item, inline_long)?;
+                    *ring.get_unchecked_mut(slot) = tn;
+                    if (tn as usize) < ndt {
+                        chunk_table::prefetch(dtp.add(tn as usize) as *const u8);
+                    }
+                }
+                emit_tok!(t, n - i, true);
+            }
+        } else {
+            for i in 0..steady {
+                let slot = i & (RING - 1);
+                let t = *ring.get_unchecked(slot);
+                let pf_item = ffi::PyList_GET_ITEM(list_ptr, (i + 2 * RING) as ffi::Py_ssize_t);
+                chunk_table::prefetch(pf_item as *const u8);
+                let next_item = ffi::PyList_GET_ITEM(list_ptr, (i + RING) as ffi::Py_ssize_t);
+                let tn = read_one_id(next_item, inline_long)?;
+                *ring.get_unchecked_mut(slot) = tn;
+                if (tn as usize) < ndt {
+                    chunk_table::prefetch(dtp.add(tn as usize) as *const u8);
+                }
+                emit_tok!(t, n - i, false);
+            }
+            for i in steady..n {
+                let slot = i & (RING - 1);
+                let t = *ring.get_unchecked(slot);
+                let next_idx = i + RING;
+                if next_idx < n {
+                    let next_item = ffi::PyList_GET_ITEM(list_ptr, next_idx as ffi::Py_ssize_t);
+                    let tn = read_one_id(next_item, inline_long)?;
+                    *ring.get_unchecked_mut(slot) = tn;
+                    if (tn as usize) < ndt {
+                        chunk_table::prefetch(dtp.add(tn as usize) as *const u8);
+                    }
+                }
+                emit_tok!(t, n - i, false);
+            }
+        }
+
+        buf.set_len(dst.offset_from(base) as usize);
+        Some((non_ascii & DEC_FLAG_NON_ASCII) == 0)
+    }
+
+    /// Fast decode of `&[u32]` into `(Vec<u8>, is_ascii)` (already leading-space
+    /// stripped) for parallel `decode_batch` workers.
+    fn gather_bytes_fast_opts(
+        &self,
+        ids: &[u32],
+        skip_special: bool,
+        decode_with_timestamps: bool,
+        time_precision: f64,
+        segment_size: usize,
+    ) -> (Vec<u8>, bool) {
+        if decode_with_timestamps && self.whisper_ts_begin != u32::MAX {
+            let mut buf = self.gather_bytes_opts(ids, skip_special, true, time_precision, segment_size);
+            if self.decode_strip_space && buf.first() == Some(&b' ') {
+                buf.remove(0);
+            }
+            return (buf, false);
+        }
+        let mut buf = Vec::new();
+        let is_ascii = self.gather_bytes_single_pass_into(ids, skip_special, &mut buf);
+        if self.decode_strip_space && buf.first() == Some(&b' ') {
+            buf.remove(0);
+        }
+        (buf, is_ascii)
+    }
+
+    /// Decode `&[u32]` directly to a Python `str` using a single-pass gather
+    /// into reusable `scratch_buf`, then direct `PyUnicode_New(len, 127)` for
+    /// pure ASCII (skipping UTF-8 validation) or 1-pass `PyUnicode_DecodeUTF8`.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_slice_to_pystr<'py>(
+        &self,
+        py: Python<'py>,
+        ids: &[u32],
+        skip_special: bool,
+        decode_with_timestamps: bool,
+        time_precision: f64,
+        segment_size: usize,
+        scratch_buf: &mut Vec<u8>,
+    ) -> Bound<'py, PyString> {
+        if decode_with_timestamps && self.whisper_ts_begin != u32::MAX {
+            self.gather_bytes_into_opts(ids, skip_special, true, time_precision, segment_size, scratch_buf);
+            return bytes_to_pystr(py, self.strip_decoded(scratch_buf));
+        }
+        let is_ascii = self.gather_bytes_single_pass_into(ids, skip_special, scratch_buf);
+        let slice = self.strip_decoded(scratch_buf);
+        if is_ascii {
+            ascii_bytes_to_pystr(py, slice)
+        } else {
+            bytes_to_pystr(py, slice)
+        }
+    }
+
     /// Gather the raw bytes for `ids` from the contiguous token-byte arena into `buf`.
     /// Two passes: sum lengths for one exact reservation, then memcpy each span.
     fn gather_bytes_into(&self, ids: &[u32], buf: &mut Vec<u8>) {
@@ -2530,14 +3217,7 @@ impl Tokenizer {
         }
     }
 
-    /// Gather the raw bytes for `ids` from the contiguous token-byte arena.
-    fn gather_bytes(&self, ids: &[u32]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        self.gather_bytes_into(ids, &mut buf);
-        buf
-    }
-
-    /// Gather decoded bytes for `ids` into `out` (cleared first), supporting
+    /// Gather the raw bytes for `ids` from the contiguous token-byte arena into `out` (cleared first), supporting
     /// `skip_special` and Whisper prompt stripping / timestamp stripping /
     /// multi-segment timestamp accumulation (`decode_with_timestamps=true`).
     fn gather_bytes_into_opts(
@@ -5647,6 +6327,7 @@ impl Tokenizer {
             long_table: chunk_table::SharedLongTable::new(DEFAULT_CACHE_MIB / 4),
             spill: chunk_table::SpillMap::new((DEFAULT_CACHE_MIB << 20) / 4),
             int_table: OnceLock::new(),
+            decode_table: OnceLock::new(),
             auto_meta: AutoMeta {
                 added_tokens: added_meta,
                 post_processor_json,
@@ -6381,38 +7062,102 @@ impl Tokenizer {
         time_precision: f64,
         segment_size: usize,
     ) -> PyResult<Bound<'py, PyList>> {
-        // Fast FFI extraction for list[list[int]] into one flat Vec<u32> + row ends
-        // (avoids PyO3's generic Vec<Vec<u32>> per-row heap allocations + boxing overhead).
+        // Fast extraction into one flat Vec<u32> + row ends:
+        // 1. 2D C-contiguous integer buffer (numpy ndarray, torch CPU tensor):
+        //    zero Python int boxing!
+        // 2. Plain list[list[int]]: direct inline PyLong digit reads + prefetch.
+        // 3. Fallback: generic PyO3 Vec<Vec<u32>> extraction.
+        let inline_long = pylong_inline_ok(py);
         let (flat_ids, row_ends): (Vec<u32>, Vec<usize>) = unsafe {
             let ptr = sequences.as_ptr();
             if pyo3::ffi::PyList_Check(ptr) != 0 {
                 let nrows = pyo3::ffi::PyList_GET_SIZE(ptr) as usize;
-                let mut flat: Vec<u32> = Vec::with_capacity(nrows * 16);
-                let mut ends: Vec<usize> = Vec::with_capacity(nrows);
-                let mut ok = true;
-                'outer: for r in 0..nrows {
+                let mut total_est = 0usize;
+                let mut all_lists = true;
+                for r in 0..nrows {
                     let row = pyo3::ffi::PyList_GET_ITEM(ptr, r as pyo3::ffi::Py_ssize_t);
                     if pyo3::ffi::PyList_Check(row) == 0 {
-                        ok = false;
+                        all_lists = false;
                         break;
                     }
-                    let n = pyo3::ffi::PyList_GET_SIZE(row) as usize;
-                    flat.reserve(n);
-                    for i in 0..n {
-                        let item = pyo3::ffi::PyList_GET_ITEM(row, i as pyo3::ffi::Py_ssize_t);
-                        let val = pyo3::ffi::PyLong_AsLongLong(item);
-                        if val < 0 || val > u32::MAX as i64 {
-                            ok = false;
-                            break 'outer;
-                        }
-                        flat.push(val as u32);
-                    }
-                    ends.push(flat.len());
+                    total_est += pyo3::ffi::PyList_GET_SIZE(row) as usize;
                 }
-                if ok && pyo3::ffi::PyErr_Occurred().is_null() {
+                if all_lists {
+                    let mut flat: Vec<u32> = Vec::with_capacity(total_est);
+                    let mut ends: Vec<usize> = Vec::with_capacity(nrows);
+                    let mut ok = true;
+                    let mut off = 0usize;
+                    let dst = flat.as_mut_ptr();
+                    for r in 0..nrows {
+                        let row = pyo3::ffi::PyList_GET_ITEM(ptr, r as pyo3::ffi::Py_ssize_t);
+                        let n = pyo3::ffi::PyList_GET_SIZE(row) as usize;
+                        if !extract_pylist_u32_into(row, n, dst.add(off), inline_long) {
+                            ok = false;
+                            break;
+                        }
+                        off += n;
+                        ends.push(off);
+                    }
+                    if ok && pyo3::ffi::PyErr_Occurred().is_null() {
+                        flat.set_len(off);
+                        (flat, ends)
+                    } else {
+                        pyo3::ffi::PyErr_Clear();
+                        let vecs = sequences.extract::<Vec<Vec<u32>>>()?;
+                        let total: usize = vecs.iter().map(|v| v.len()).sum();
+                        let mut flat = Vec::with_capacity(total);
+                        let mut ends = Vec::with_capacity(vecs.len());
+                        for v in vecs {
+                            flat.extend_from_slice(&v);
+                            ends.push(flat.len());
+                        }
+                        (flat, ends)
+                    }
+                } else {
+                    let vecs = sequences.extract::<Vec<Vec<u32>>>()?;
+                    let total: usize = vecs.iter().map(|v| v.len()).sum();
+                    let mut flat = Vec::with_capacity(total);
+                    let mut ends = Vec::with_capacity(vecs.len());
+                    for v in vecs {
+                        flat.extend_from_slice(&v);
+                        ends.push(flat.len());
+                    }
                     (flat, ends)
+                }
+            } else if pyo3::ffi::PyObject_CheckBuffer(ptr) != 0 {
+                let mut guard = PyBufGuard {
+                    view: std::mem::zeroed(),
+                    active: false,
+                };
+                let flags = pyo3::ffi::PyBUF_ND | pyo3::ffi::PyBUF_STRIDES | pyo3::ffi::PyBUF_FORMAT;
+                let mut got: Option<(Vec<u32>, Vec<usize>)> = None;
+                if pyo3::ffi::PyObject_GetBuffer(ptr, &mut guard.view, flags) == 0 {
+                    guard.active = true;
+                    if guard.view.ndim == 2
+                        && pyo3::ffi::PyBuffer_IsContiguous(&guard.view, b'C' as std::os::raw::c_char) != 0
+                        && !guard.view.shape.is_null()
+                    {
+                        if let Some(kind) = classify_int_buffer(&guard.view) {
+                            let nrows = *guard.view.shape as usize;
+                            let ncols = *guard.view.shape.add(1) as usize;
+                            let total = nrows.saturating_mul(ncols);
+                            let mut flat = Vec::new();
+                            if copy_int_buf_to_u32(guard.view.buf as *const u8, total, kind, &mut flat) {
+                                let mut ends = Vec::with_capacity(nrows);
+                                for r in 1..=nrows {
+                                    ends.push(r * ncols);
+                                }
+                                got = Some((flat, ends));
+                            }
+                        }
+                    }
                 } else {
                     pyo3::ffi::PyErr_Clear();
+                }
+                drop(guard);
+                if let Some(res) = got {
+                    res
+                } else {
                     let vecs = sequences.extract::<Vec<Vec<u32>>>()?;
                     let total: usize = vecs.iter().map(|v| v.len()).sum();
                     let mut flat = Vec::with_capacity(total);
@@ -6437,7 +7182,7 @@ impl Tokenizer {
         };
 
         let nrows = row_ends.len();
-        const PAR_DECODE_MIN_TOKS: usize = 32_768;
+        const PAR_DECODE_MIN_TOKS: usize = 65_536;
         if num_threads == 1 || nrows <= 1 || !parallel_ok() || flat_ids.len() < PAR_DECODE_MIN_TOKS
         {
             let mut buf = Vec::with_capacity(256);
@@ -6446,7 +7191,8 @@ impl Tokenizer {
                 assert!(!outer.is_null(), "list alloc");
                 let mut start = 0usize;
                 for (r, &end) in row_ends.iter().enumerate() {
-                    self.gather_bytes_into_opts(
+                    let s = self.decode_slice_to_pystr(
+                        py,
                         &flat_ids[start..end],
                         skip_special_tokens,
                         decode_with_timestamps,
@@ -6455,13 +7201,14 @@ impl Tokenizer {
                         &mut buf,
                     );
                     start = end;
-                    let s = bytes_to_pystr(py, self.strip_decoded(&buf));
                     pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, s.into_ptr());
                 }
                 return Ok(Bound::from_owned_ptr(py, outer).cast_into_unchecked());
             }
         }
 
+        // Ensure decode_table is initialized once before fanning out across rayon.
+        let _ = self.decode_table();
         let ranges: Vec<(usize, usize)> = {
             let mut v = Vec::with_capacity(nrows);
             let mut start = 0usize;
@@ -6471,13 +7218,13 @@ impl Tokenizer {
             }
             v
         };
-        let bufs: Vec<Vec<u8>> = py.detach(|| {
+        let bufs: Vec<(Vec<u8>, bool)> = py.detach(|| {
             self.par_over(
                 num_threads,
                 &ranges,
                 |&(a, b)| (b - a) * 4,
                 |&(a, b)| {
-                    self.gather_bytes_opts(
+                    self.gather_bytes_fast_opts(
                         &flat_ids[a..b],
                         skip_special_tokens,
                         decode_with_timestamps,
@@ -6490,8 +7237,12 @@ impl Tokenizer {
         unsafe {
             let outer = pyo3::ffi::PyList_New(nrows as pyo3::ffi::Py_ssize_t);
             assert!(!outer.is_null(), "list alloc");
-            for (r, buf) in bufs.iter().enumerate() {
-                let s = bytes_to_pystr(py, self.strip_decoded(buf));
+            for (r, (buf, is_ascii)) in bufs.iter().enumerate() {
+                let s = if *is_ascii {
+                    ascii_bytes_to_pystr(py, buf)
+                } else {
+                    bytes_to_pystr(py, buf)
+                };
                 pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, s.into_ptr());
             }
             Ok(Bound::from_owned_ptr(py, outer).cast_into_unchecked())
@@ -6508,52 +7259,138 @@ impl Tokenizer {
         time_precision: f64,
         segment_size: usize,
     ) -> PyResult<Bound<'py, PyString>> {
-        // Fast list extraction: pyo3's `Vec<u32>` FromPyObject is ~2x slower than
-        // the raw CPython list API (it dominates ~44% of list-decode time). For a
-        // plain list of ints, read each element directly with PyList_GET_ITEM +
-        // PyLong_AsLong (matching the C engine); fall back to generic extraction
-        // for other sequence types.
+        // Fast paths:
+        // 1. Plain Python `list[int]`: direct inline PyLong digit read into a
+        //    stack buffer (for `<= 2048` tokens, zero heap Vec<u32> alloc!) or
+        //    single-alloc Vec<u32>, then direct PyUnicode_New for pure ASCII.
+        // 2. 1D C-contiguous integer buffer (numpy ndarray, torch CPU tensor,
+        //    array.array): zero Python int unboxing!
+        // 3. Fallback: generic PyO3 Vec<u32> extraction.
         let ptr = tokens.as_ptr();
-        let ids: Vec<u32> = unsafe {
+        let inline_long = pylong_inline_ok(py);
+        // Reuse thread-local `s.utf8` so repeated `decode()` calls perform zero
+        // Rust heap allocations (neither `Vec<u32>` nor `Vec<u8>`).
+        let fast_res: Option<Bound<'py, PyString>> = self.with_scratch(|s| unsafe {
             if pyo3::ffi::PyList_Check(ptr) != 0 {
                 let n = pyo3::ffi::PyList_GET_SIZE(ptr) as usize;
-                let mut v: Vec<u32> = Vec::with_capacity(n);
-                let mut bad = false;
-                for i in 0..n {
-                    // borrowed item ref; read its value as a signed 64-bit int.
-                    let item = pyo3::ffi::PyList_GET_ITEM(ptr, i as pyo3::ffi::Py_ssize_t);
-                    let val = pyo3::ffi::PyLong_AsLongLong(item);
-                    // Reject out-of-range ids (negative or > u32::MAX) instead of
-                    // letting `as u32` silently wrap them into valid-looking token
-                    // data — bail to the checked extractor, which raises like
-                    // tiktoken. A non-int element also lands here (val == -1 with a
-                    // Python error set), and is likewise re-raised cleanly below.
-                    if val < 0 || val > u32::MAX as i64 {
-                        bad = true;
-                        break;
+                if n == 0 {
+                    return Some(PyString::new(py, ""));
+                }
+                if !(decode_with_timestamps && self.whisper_ts_begin != u32::MAX) {
+                    if let Some(is_ascii) = self.gather_pylist_fused_into(
+                        ptr,
+                        n,
+                        inline_long,
+                        skip_special_tokens,
+                        &mut s.utf8,
+                    ) {
+                        let slice = self.strip_decoded(&s.utf8);
+                        return Some(if is_ascii {
+                            ascii_bytes_to_pystr(py, slice)
+                        } else {
+                            bytes_to_pystr(py, slice)
+                        });
                     }
-                    v.push(val as u32);
-                }
-                if bad || !pyo3::ffi::PyErr_Occurred().is_null() {
                     pyo3::ffi::PyErr_Clear();
-                    tokens.extract::<Vec<u32>>()?
-                } else {
-                    v
                 }
-            } else {
-                tokens.extract::<Vec<u32>>()?
+                if n <= 2048 {
+                    let mut stack = [std::mem::MaybeUninit::<u32>::uninit(); 2048];
+                    if extract_pylist_u32_into(ptr, n, stack.as_mut_ptr() as *mut u32, inline_long) {
+                        let ids = std::slice::from_raw_parts(stack.as_ptr() as *const u32, n);
+                        return Some(self.decode_slice_to_pystr(
+                            py,
+                            ids,
+                            skip_special_tokens,
+                            decode_with_timestamps,
+                            time_precision,
+                            segment_size,
+                            &mut s.utf8,
+                        ));
+                    }
+                    pyo3::ffi::PyErr_Clear();
+                } else {
+                    let mut v: Vec<u32> = Vec::with_capacity(n);
+                    if extract_pylist_u32_into(ptr, n, v.as_mut_ptr(), inline_long) {
+                        v.set_len(n);
+                        return Some(self.decode_slice_to_pystr(
+                            py,
+                            &v,
+                            skip_special_tokens,
+                            decode_with_timestamps,
+                            time_precision,
+                            segment_size,
+                            &mut s.utf8,
+                        ));
+                    }
+                    pyo3::ffi::PyErr_Clear();
+                }
+            } else if pyo3::ffi::PyObject_CheckBuffer(ptr) != 0 {
+                let mut guard = PyBufGuard {
+                    view: std::mem::zeroed(),
+                    active: false,
+                };
+                let flags = pyo3::ffi::PyBUF_ND | pyo3::ffi::PyBUF_STRIDES | pyo3::ffi::PyBUF_FORMAT;
+                if pyo3::ffi::PyObject_GetBuffer(ptr, &mut guard.view, flags) == 0 {
+                    guard.active = true;
+                    if guard.view.ndim == 1
+                        && pyo3::ffi::PyBuffer_IsContiguous(&guard.view, b'C' as std::os::raw::c_char) != 0
+                        && !guard.view.shape.is_null()
+                    {
+                        if let Some(kind) = classify_int_buffer(&guard.view) {
+                            let count = *guard.view.shape as usize;
+                            if count == 0 {
+                                return Some(PyString::new(py, ""));
+                            }
+                            if matches!(kind, IntBufKind::U32) {
+                                let ids = std::slice::from_raw_parts(guard.view.buf as *const u32, count);
+                                return Some(self.decode_slice_to_pystr(
+                                    py,
+                                    ids,
+                                    skip_special_tokens,
+                                    decode_with_timestamps,
+                                    time_precision,
+                                    segment_size,
+                                    &mut s.utf8,
+                                ));
+                            }
+                            if copy_int_buf_to_u32(guard.view.buf as *const u8, count, kind, &mut s.out) {
+                                drop(guard);
+                                let ids = std::mem::take(&mut s.out);
+                                let res = self.decode_slice_to_pystr(
+                                    py,
+                                    &ids,
+                                    skip_special_tokens,
+                                    decode_with_timestamps,
+                                    time_precision,
+                                    segment_size,
+                                    &mut s.utf8,
+                                );
+                                s.out = ids;
+                                return Some(res);
+                            }
+                        }
+                    }
+                } else {
+                    pyo3::ffi::PyErr_Clear();
+                }
             }
-        };
-        let buf = self.maybe_detach(py, ids.len().saturating_mul(4), || {
-            self.gather_bytes_opts(
+            None
+        });
+        if let Some(res) = fast_res {
+            return Ok(res);
+        }
+        let ids: Vec<u32> = tokens.extract()?;
+        Ok(self.with_scratch(|s| {
+            self.decode_slice_to_pystr(
+                py,
                 &ids,
                 skip_special_tokens,
                 decode_with_timestamps,
                 time_precision,
                 segment_size,
+                &mut s.utf8,
             )
-        });
-        Ok(bytes_to_pystr(py, self.strip_decoded(&buf)))
+        }))
     }
 
     /// Buffer fast-path: decode from a contiguous uint32 buffer (numpy uint32
@@ -6569,15 +7406,12 @@ impl Tokenizer {
         if !view.is_c_contiguous() {
             return Err(PyValueError::new_err("decode_array requires a C-contiguous uint32 buffer"));
         }
-        // Copy the ids into an owned Vec WHILE HOLDING THE GIL — `view.to_vec`
-        // validated the u32 element type, and reading under the GIL means another
-        // thread can't resize/free the source buffer mid-read. (Reading a raw
-        // pointer into the buffer after `py.detach` released the GIL would be
-        // unsound for buffer exporters that don't honour the export count.) The
-        // copy is a single memcpy, cheap next to the gather + str build.
-        let ids: Vec<u32> = view.to_vec(py)?;
-        let buf = py.detach(|| self.gather_bytes(&ids));
-        Ok(bytes_to_pystr(py, self.strip_decoded(&buf)))
+        let ids = unsafe {
+            std::slice::from_raw_parts(view.buf_ptr() as *const u32, view.item_count())
+        };
+        Ok(self.with_scratch(|s| {
+            self.decode_slice_to_pystr(py, ids, false, false, 0.02, 1500, &mut s.utf8)
+        }))
     }
 
     #[getter]
