@@ -152,6 +152,21 @@ pub fn prefetch(p: *const u8) {
     let _ = p;
 }
 
+/// Portable write-intent prefetch hint (for `Py_INCREF` RMW on `PyLongObject`).
+#[inline(always)]
+pub fn prefetch_write(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pstl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
 #[inline(always)]
 pub fn hash(lo: u64, hi: u64) -> u64 {
     // ONE multiply: callers index with the TOP bits, and every top bit of a

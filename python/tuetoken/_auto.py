@@ -629,7 +629,7 @@ class AutoTokenizer:
                  truncation=False, max_length=None, return_tensors=None,
                  return_attention_mask=True, return_token_type_ids=False, **_):
         single = isinstance(text, str)
-        texts = [text] if single else list(text)
+        texts = [text] if single else (text if type(text) is list else list(text))
         pairs = ([text_pair] if single else list(text_pair)) if text_pair is not None else [None] * len(texts)
 
         # All-Rust fast path for the tensor output (single-sequence post-processor):
@@ -791,39 +791,312 @@ class AutoTokenizer:
         cache[tmpl_str] = tmpl
         return tmpl
 
+    def _fast_chat_compiler(self, tmpl_str):
+        """Self-deriving, Jinja-verified transition-graph renderer for role-based
+        chat templates (ChatML/Qwen, Llama-3, Phi-3.5, SmolLM2, Mistral, Gemma, ...).
+
+        Learns `(start[role], trans[(prev, cur)], end[(last, add_gen)])` directly
+        from Jinja2 probe renders and exhaustively cross-checks against Jinja2 on
+        multi-turn, whitespace-padded, and empty-content conversations. Returns a
+        fast renderer `(messages, add_gen) -> str | None` (returning None to fall
+        back to Jinja2 on any unusual input) or None if the template is dynamic.
+        """
+        cache = self.__dict__.setdefault("_fast_chat_cache", {})
+        if tmpl_str in cache:
+            return cache[tmpl_str]
+
+        # Bail immediately if template uses time/random/string-mutating filters or
+        # reasoning/thinking switches that could depend on message content.
+        bad_markers = (
+            "strftime", "now(", "date_string", ".strip(", ".lstrip(", ".rstrip(",
+            ".replace(", ".split(", ".lower(", ".upper(", "think", "reasoning",
+        )
+        low = tmpl_str.lower()
+        if any(m in low for m in bad_markers):
+            cache[tmpl_str] = None
+            return None
+
+        tmpl = self._compiled_template(tmpl_str)
+        bos = self.bos_token or ""
+        eos = self.eos_token or ""
+        unk = self.unk_token or ""
+        pad = self.pad_token or ""
+
+        def jrender(msgs, add_gen=False):
+            return tmpl.render(
+                messages=msgs, tools=None, add_generation_prompt=add_gen,
+                bos_token=bos, eos_token=eos, unk_token=unk, pad_token=pad,
+            )
+
+        def split_sentinels(s, sents):
+            parts = []
+            pos = 0
+            for tok in sents:
+                idx = s.find(tok, pos)
+                if idx < 0 or s.find(tok, idx + len(tok)) >= 0:
+                    return None
+                parts.append(s[pos:idx])
+                pos = idx + len(tok)
+            parts.append(s[pos:])
+            return parts
+
+        S0, U1, A1, U2, A2 = "__TTS0__", "__TTU1__", "__TTA1__", "__TTU2__", "__TTA2__"
+        try:
+            r_suau = jrender([
+                {"role": "system", "content": S0},
+                {"role": "user", "content": U1},
+                {"role": "assistant", "content": A1},
+                {"role": "user", "content": U2},
+            ], False)
+            r_uau = jrender([
+                {"role": "user", "content": U1},
+                {"role": "assistant", "content": A1},
+                {"role": "user", "content": U2},
+            ], False)
+            r_sua = jrender([
+                {"role": "system", "content": S0},
+                {"role": "user", "content": U1},
+                {"role": "assistant", "content": A1},
+            ], False)
+            r_suau_g = jrender([
+                {"role": "system", "content": S0},
+                {"role": "user", "content": U1},
+                {"role": "assistant", "content": A1},
+                {"role": "user", "content": U2},
+            ], True)
+            r_sua_g = jrender([
+                {"role": "system", "content": S0},
+                {"role": "user", "content": U1},
+                {"role": "assistant", "content": A1},
+            ], True)
+        except Exception:
+            cache[tmpl_str] = None
+            return None
+
+        p_suau = split_sentinels(r_suau, (S0, U1, A1, U2))
+        p_uau = split_sentinels(r_uau, (U1, A1, U2))
+        p_sua = split_sentinels(r_sua, (S0, U1, A1))
+        p_suau_g = split_sentinels(r_suau_g, (S0, U1, A1, U2))
+        p_sua_g = split_sentinels(r_sua_g, (S0, U1, A1))
+        if not (p_suau and p_uau and p_sua and p_suau_g and p_sua_g):
+            cache[tmpl_str] = None
+            return None
+
+        start = {"system": p_suau[0], "user": p_uau[0]}
+        trans = {
+            ("system", "user"): p_suau[1],
+            ("user", "assistant"): p_suau[2],
+            ("assistant", "user"): p_suau[3],
+        }
+        end = {
+            ("user", False): p_suau[4],
+            ("user", True): p_suau_g[4],
+            ("assistant", False): p_sua[3],
+            ("assistant", True): p_sua_g[3],
+        }
+
+        # Optional consecutive same-role transitions (user->user, assistant->assistant)
+        for rname, s1, s2 in (("user", U1, U2), ("assistant", A1, A2)):
+            try:
+                base_msgs = [{"role": "user", "content": U1}] if rname == "assistant" else []
+                probe = base_msgs + [{"role": rname, "content": s1}, {"role": rname, "content": s2}]
+                sents = ([U1] if rname == "assistant" else []) + [s1, s2]
+                rp = split_sentinels(jrender(probe, False), sents)
+                if rp is not None:
+                    trans[(rname, rname)] = rp[-2]
+            except Exception:
+                pass
+
+        def render_graph(msgs, add_gen):
+            m0 = msgs[0]
+            r0 = m0["role"]
+            st = start.get(r0)
+            if st is None:
+                return None
+            out = [st, m0["content"]]
+            prev = r0
+            for m in msgs[1:]:
+                role = m["role"]
+                tr = trans.get((prev, role))
+                if tr is None:
+                    return None
+                out.append(tr)
+                out.append(m["content"])
+                prev = role
+            en = end.get((prev, add_gen))
+            if en is None:
+                return None
+            out.append(en)
+            return "".join(out)
+
+        # Exhaustive differential verification against Jinja2 across shapes & edge content.
+        probes = [
+            [{"role": "user", "content": "hi"}],
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+            [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}],
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}],
+            [
+                {"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"},
+                {"role": "user", "content": "q3"},
+            ],
+            [
+                {"role": "system", "content": "  keep spaces \n "},
+                {"role": "user", "content": "\n  keep spaces  \t"},
+                {"role": "assistant", "content": "  reply \n"},
+            ],
+        ]
+        for pm in probes:
+            for ag in (False, True):
+                try:
+                    expected = jrender(pm, ag)
+                except Exception:
+                    cache[tmpl_str] = None
+                    return None
+                got = render_graph(pm, ag)
+                if got != expected:
+                    cache[tmpl_str] = None
+                    return None
+
+        # Check whether empty string contents also match (e.g. Phi-3.5 omits empty system).
+        allow_empty = True
+        try:
+            empty_probe = [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": ""},
+                {"role": "assistant", "content": ""},
+            ]
+            if render_graph(empty_probe, False) != jrender(empty_probe, False):
+                allow_empty = False
+        except Exception:
+            allow_empty = False
+
+        # Build the ultra-fast inline closure for verified plain conversations.
+        _start, _trans, _end = start, trans, end
+        _allow_empty = allow_empty
+
+        def fast_render(msgs, add_gen):
+            n = len(msgs)
+            if n == 0:
+                return None
+            m0 = msgs[0]
+            if type(m0) is not dict or len(m0) != 2:
+                return None
+            r0 = m0.get("role")
+            c0 = m0.get("content")
+            if type(c0) is not str or (not _allow_empty and not c0):
+                return None
+            st = _start.get(r0)
+            if st is None:
+                return None
+            if n == 1:
+                en = _end.get((r0, add_gen))
+                return (st + c0 + en) if en is not None else None
+            out = [st, c0]
+            prev = r0
+            for i in range(1, n):
+                m = msgs[i]
+                if type(m) is not dict or len(m) != 2:
+                    return None
+                role = m.get("role")
+                c = m.get("content")
+                if type(c) is not str or (not _allow_empty and not c):
+                    return None
+                tr = _trans.get((prev, role))
+                if tr is None:
+                    return None
+                out.append(tr)
+                out.append(c)
+                prev = role
+            en = _end.get((prev, add_gen))
+            if en is None:
+                return None
+            out.append(en)
+            return "".join(out)
+
+        cache[tmpl_str] = fast_render
+        return fast_render
+
     def apply_chat_template(self, conversation, tools=None, add_generation_prompt=False,
-                            tokenize=True, return_tensors=None, return_dict=True, **kwargs):
+                            tokenize=True, padding=False, truncation=False, max_length=None,
+                            return_tensors=None, return_dict=True, **kwargs):
         tmpl_str = self._chat_template_str(tools)
         if not tmpl_str:
             raise ValueError("this tokenizer has no chat_template")
-        template = self._compiled_template(tmpl_str)
-        rendered = template.render(
-            messages=conversation, tools=tools,
-            add_generation_prompt=add_generation_prompt,
-            bos_token=self.bos_token or "", eos_token=self.eos_token or "",
-            unk_token=self.unk_token or "", pad_token=self.pad_token or "",
-            **kwargs,
-        )
+
+        is_batch = isinstance(conversation, (list, tuple)) and len(conversation) > 0 and isinstance(conversation[0], (list, tuple))
+        add_gen = bool(add_generation_prompt)
+        fast = self._fast_chat_compiler(tmpl_str) if (tools is None and not kwargs) else None
+
+        def render_one(conv):
+            if fast is not None:
+                res = fast(conv, add_gen)
+                if res is not None:
+                    return res
+            template = self._compiled_template(tmpl_str)
+            return template.render(
+                messages=conv, tools=tools,
+                add_generation_prompt=add_gen,
+                bos_token=self.bos_token or "", eos_token=self.eos_token or "",
+                unk_token=self.unk_token or "", pad_token=self.pad_token or "",
+                **kwargs,
+            )
+
+        if is_batch:
+            rendered = [render_one(c) for c in conversation]
+            if not tokenize:
+                return rendered
+            # Chat templates already embed their special tokens -> add_special_tokens=False.
+            out = self(
+                rendered,
+                add_special_tokens=False,
+                padding=padding,
+                truncation=truncation,
+                max_length=max_length,
+                return_tensors=return_tensors,
+                return_attention_mask=return_dict,
+            )
+            if return_dict:
+                return _ChatDict(out)
+            return out["input_ids"]
+
+        rendered = render_one(conversation)
         if not tokenize:
             return rendered
-        # chat templates already embed their special tokens -> don't add more
-        ids = self.encode(rendered, add_special_tokens=False)
 
-        def _wrap(seq):
+        # Fast path for the common single-conversation call (no padding/truncation).
+        if not padding and not truncation:
+            ids = self._core.encode_special(rendered)
             if return_tensors not in ("np", "pt"):
-                return seq
+                if return_dict:
+                    return _ChatDict(input_ids=ids, attention_mask=[1] * len(ids))
+                return ids
             import numpy as np
-            arr = np.array([seq])               # batch-of-1, shape [1, len]
+            arr = np.array([ids])               # batch-of-1, shape [1, len]
             if return_tensors == "pt":
                 import torch
-                return torch.as_tensor(arr)
+                t_ids = torch.as_tensor(arr)
+                if return_dict:
+                    return _ChatDict(input_ids=t_ids, attention_mask=torch.ones_like(t_ids))
+                return t_ids
+            if return_dict:
+                return _ChatDict(input_ids=arr, attention_mask=np.ones_like(arr))
             return arr
 
-        # transformers >=5.0 returns {input_ids, attention_mask} by default;
-        # return_dict=False gives the bare ids (list, or a single tensor row).
+        out = self(
+            [rendered],
+            add_special_tokens=False,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+            return_tensors=return_tensors,
+            return_attention_mask=return_dict,
+        )
+        if return_tensors not in ("np", "pt"):
+            out = {k: v[0] for k, v in out.items()}
         if return_dict:
-            return _ChatDict(input_ids=_wrap(ids), attention_mask=_wrap([1] * len(ids)))
-        return _wrap(ids)
+            return _ChatDict(out)
+        return out["input_ids"]
 
     def __repr__(self):
         return f"AutoTokenizer(vocab_size={self.vocab_size}, core={self._core!r})"

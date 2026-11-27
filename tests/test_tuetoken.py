@@ -1107,6 +1107,45 @@ def test_zero_copy_buffer_decode():
     return ok, tot
 
 
+def test_fast_and_batch_chat_templates():
+    """Verify self-deriving fast chat compiler + batch apply_chat_template parity vs transformers."""
+    print("=== fast & batch apply_chat_template parity vs transformers ===")
+    import numpy as np
+    from transformers import AutoTokenizer as HFAuto
+    from tuetoken import AutoTokenizer as TTAuto
+
+    ok = tot = 0
+    for repo in ("Qwen/Qwen2.5-0.5B-Instruct", "microsoft/Phi-3.5-mini-instruct"):
+        hf = HFAuto.from_pretrained(repo)
+        tt = TTAuto.from_pretrained(repo)
+        convs = [
+            [{"role": "user", "content": "Hello world!"}],
+            [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Yo"}, {"role": "user", "content": "Bye"}],
+            [{"role": "system", "content": ""}, {"role": "user", "content": "empty sys"}],
+            [{"role": "user", "content": "  spaces \n "}],
+        ]
+        n_ok = n_tot = 0
+        for c in convs:
+            for ag in (False, True):
+                n_tot += 2
+                n_ok += int(tt.apply_chat_template(c, add_generation_prompt=ag, tokenize=False)
+                            == hf.apply_chat_template(c, add_generation_prompt=ag, tokenize=False))
+                n_ok += int(tt.apply_chat_template(c, add_generation_prompt=ag, return_dict=False)
+                            == hf.apply_chat_template(c, add_generation_prompt=ag, tokenize=True, return_dict=False))
+        # Batch apply_chat_template (list[list[dict]]) with padding + numpy tensors
+        b_tt = tt.apply_chat_template(convs, add_generation_prompt=True, padding=True, return_tensors="np")
+        b_hf = hf.apply_chat_template(convs, add_generation_prompt=True, tokenize=True, padding=True, return_tensors="np", return_dict=True)
+        n_tot += 3
+        n_ok += int(np.array_equal(b_tt["input_ids"], b_hf["input_ids"]))
+        n_ok += int(np.array_equal(b_tt["attention_mask"], b_hf["attention_mask"]))
+        n_ok += int(tt.apply_chat_template(convs, tokenize=False)
+                    == [hf.apply_chat_template(c, tokenize=False) for c in convs])
+        ok += n_ok; tot += n_tot
+        _line(repo, n_ok, n_tot)
+    assert ok == tot, f"chat templates: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -1115,6 +1154,7 @@ def main():
         test_auto(), test_kimi_tiktoken_model(), test_tekken_and_legacy_formats(),
         test_bytes_inputs(), test_warmup_and_fast_startup(),
         test_review_regressions(), test_whisper(), test_zero_copy_buffer_decode(),
+        test_fast_and_batch_chat_templates(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

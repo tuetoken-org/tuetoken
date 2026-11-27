@@ -1138,6 +1138,10 @@ struct Tokenizer {
 enum SpecialPrefilter {
     None,
     Prefix2(u8, u8),
+    /// All patterns are `>= 2` bytes and share a common first byte `b0`, while
+    /// the second byte must have its bit set in `b1_mask` (e.g. Qwen2.5 `<`
+    /// followed only by `/`, `t`, `|`, bypassing `x < 5` without AC).
+    Prefix1Mask(u8, [u64; 4]),
     Bytes1(u8),
     Bytes2(u8, u8),
     Bytes3(u8, u8, u8),
@@ -1150,6 +1154,7 @@ impl SpecialPrefilter {
         let mut common2: Option<(u8, u8)> = None;
         let mut all_ge2 = true;
         let mut same2 = true;
+        let mut b1_mask = [0u64; 4];
         for p in patterns {
             let b = p.as_bytes();
             if b.is_empty() {
@@ -1157,11 +1162,15 @@ impl SpecialPrefilter {
             }
             if b.len() < 2 {
                 all_ge2 = false;
-            } else if same2 {
-                match common2 {
-                    None => common2 = Some((b[0], b[1])),
-                    Some(pair) if pair != (b[0], b[1]) => same2 = false,
-                    _ => {}
+            } else {
+                let b1 = b[1] as usize;
+                b1_mask[b1 >> 6] |= 1u64 << (b1 & 63);
+                if same2 {
+                    match common2 {
+                        None => common2 = Some((b[0], b[1])),
+                        Some(pair) if pair != (b[0], b[1]) => same2 = false,
+                        _ => {}
+                    }
                 }
             }
             let b0 = b[0];
@@ -1174,6 +1183,9 @@ impl SpecialPrefilter {
             if all_ge2 && same2 {
                 return Self::Prefix2(b0, b1);
             }
+        }
+        if n_first == 1 && all_ge2 {
+            return Self::Prefix1Mask(first_bytes[0], b1_mask);
         }
         match n_first {
             1 => Self::Bytes1(first_bytes[0]),
@@ -1197,6 +1209,23 @@ impl SpecialPrefilter {
                     let off = memchr::memchr(b0, &hay[pos..limit])?;
                     let idx = pos + off;
                     if hay[idx + 1] == b1 {
+                        return Some(idx);
+                    }
+                    pos = idx + 1;
+                }
+                None
+            }
+            Self::Prefix1Mask(b0, mask) => {
+                if hay.len() < 2 {
+                    return None;
+                }
+                let mut pos = 0usize;
+                let limit = hay.len() - 1;
+                while pos < limit {
+                    let off = memchr::memchr(b0, &hay[pos..limit])?;
+                    let idx = pos + off;
+                    let b1 = hay[idx + 1] as usize;
+                    if (mask[b1 >> 6] >> (b1 & 63)) & 1 != 0 {
                         return Some(idx);
                     }
                     pos = idx + 1;
@@ -2196,6 +2225,7 @@ struct FastBatch<'py> {
     items: Vec<FastItem>,
     total_len: usize,
     max_len: usize,
+    has_bytes: bool,
     _py: Python<'py>,
 }
 
@@ -2230,6 +2260,7 @@ fn try_extract_fast_batch<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> Opti
             items: Vec::with_capacity(n),
             total_len: 0,
             max_len: 0,
+            has_bytes: false,
             _py: py,
         };
         let ascii_off = std::mem::size_of::<ffi::PyASCIIObject>();
@@ -2303,6 +2334,7 @@ fn try_extract_fast_batch<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> Opti
                 }
                 let ptr = ffi::PyBytes_AS_STRING(p) as *const u8;
                 ffi::Py_INCREF(p);
+                batch.has_bytes = true;
                 batch.items.push(FastItem {
                     obj: p,
                     ptr,
@@ -2434,6 +2466,7 @@ struct TokenBuffer {
 /// Raw parts of the Vec a TokenBuffer owns (element type decides the layout
 /// it is freed with).
 enum Owned {
+    U8(*mut u8, usize, usize),
     U16(*mut u16, usize, usize),
     U32(*mut u32, usize, usize),
     I64(*mut i64, usize, usize),
@@ -2449,6 +2482,12 @@ impl TokenBuffer {
         let mut v = std::mem::ManuallyDrop::new(v);
         let (p, l, c) = (v.as_mut_ptr(), v.len(), v.capacity());
         TokenBuffer { ptr: p as *mut u8, bytes: l * 4, owned: Owned::U32(p, l, c) }
+    }
+
+    fn new_u8(v: Vec<u8>) -> Self {
+        let mut v = std::mem::ManuallyDrop::new(v);
+        let (p, l, c) = (v.as_mut_ptr(), v.len(), v.capacity());
+        TokenBuffer { ptr: p, bytes: l, owned: Owned::U8(p, l, c) }
     }
 
     fn new_u16(v: Vec<u16>) -> Self {
@@ -2469,6 +2508,7 @@ impl Drop for TokenBuffer {
         // SAFETY: the raw parts came from a Vec of that element type we own.
         unsafe {
             match self.owned {
+                Owned::U8(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
                 Owned::U16(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
                 Owned::U32(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
                 Owned::I64(p, l, c) => drop(Vec::from_raw_parts(p, l, c)),
@@ -2592,6 +2632,99 @@ impl Tokenizer {
         })
     }
 
+    /// Fill `list[base_idx .. base_idx + ids.len()]` with owned `PyLong` refs
+    /// from `table` using a 2-stage 16-slot software-prefetched ring:
+    /// - Stage 0 (`i + 32`): prefetch `&table[ids[i + 32]]`
+    /// - Stage 1 (`i + 16`): resolve pointer `p = table[ids[i + 16]]` & issue
+    ///   write-intent prefetch `prefetch_write(p)` for `p->ob_refcnt`
+    /// - Stage 2 (`i`): `Py_INCREF(p)` (now L1d-resident!) + `PyList_SET_ITEM`.
+    ///
+    /// Eliminates the ~67% L2/L3 `ob_refcnt` RMW stall observed on Zen 4 / M4.
+    #[inline]
+    unsafe fn fill_pylist_prefetched(
+        table: &[Py<PyAny>],
+        ids: &[u32],
+        list: *mut pyo3::ffi::PyObject,
+        base_idx: usize,
+    ) {
+        use pyo3::ffi;
+        let n = ids.len();
+        if n == 0 {
+            return;
+        }
+        let tlen = table.len();
+        let tp = table.as_ptr();
+        let ip = ids.as_ptr();
+
+        // Short slice: straight loop with simple lookahead prefetch.
+        if n < 24 {
+            for i in 0..n {
+                let t = *ip.add(i) as usize;
+                let obj = if t < tlen {
+                    let p = (*tp.add(t)).as_ptr();
+                    ffi::Py_INCREF(p);
+                    p
+                } else {
+                    ffi::PyLong_FromUnsignedLong(t as _)
+                };
+                ffi::PyList_SET_ITEM(list, (base_idx + i) as ffi::Py_ssize_t, obj);
+            }
+            return;
+        }
+
+        // Bit 0 of a tagged usize pointer is 1 iff freshly allocated via
+        // `PyLong_FromUnsignedLong` (already owns refcount 1, no Py_INCREF).
+        #[inline(always)]
+        unsafe fn resolve_and_pf(tp: *const Py<PyAny>, tlen: usize, t: u32) -> usize {
+            let ti = t as usize;
+            if ti < tlen {
+                let p = (*tp.add(ti)).as_ptr();
+                chunk_table::prefetch_write(p as *const u8);
+                p as usize
+            } else {
+                (ffi::PyLong_FromUnsignedLong(t as _) as usize) | 1
+            }
+        }
+
+        const RING: usize = 16;
+        let mut ring = [0usize; RING];
+        for (j, slot) in ring.iter_mut().enumerate() {
+            let pt = *ip.add(j + RING) as usize;
+            if pt < tlen {
+                chunk_table::prefetch(tp.add(pt) as *const u8);
+            }
+            *slot = resolve_and_pf(tp, tlen, *ip.add(j));
+        }
+
+        let steady = n.saturating_sub(2 * RING);
+        for i in 0..steady {
+            let slot = i & (RING - 1);
+            let tagged = *ring.get_unchecked(slot);
+            let pt = *ip.add(i + 2 * RING) as usize;
+            if pt < tlen {
+                chunk_table::prefetch(tp.add(pt) as *const u8);
+            }
+            *ring.get_unchecked_mut(slot) = resolve_and_pf(tp, tlen, *ip.add(i + RING));
+            let p = (tagged & !1usize) as *mut ffi::PyObject;
+            if (tagged & 1) == 0 {
+                ffi::Py_INCREF(p);
+            }
+            ffi::PyList_SET_ITEM(list, (base_idx + i) as ffi::Py_ssize_t, p);
+        }
+        for i in steady..n {
+            let slot = i & (RING - 1);
+            let tagged = *ring.get_unchecked(slot);
+            if i + RING < n {
+                *ring.get_unchecked_mut(slot) = resolve_and_pf(tp, tlen, *ip.add(i + RING));
+            }
+            let p = (tagged & !1usize) as *mut ffi::PyObject;
+            if (tagged & 1) == 0 {
+                ffi::Py_INCREF(p);
+            }
+            ffi::PyList_SET_ITEM(list, (base_idx + i) as ffi::Py_ssize_t, p);
+        }
+    }
+
     /// `ids` -> Python list[int], reusing the pre-built int objects.
     fn to_pylist<'py>(&self, py: Python<'py>, ids: &[u32]) -> Bound<'py, PyList> {
         let table = self.ints(py);
@@ -2600,20 +2733,9 @@ impl Tokenizer {
         unsafe {
             let list = pyo3::ffi::PyList_New(ids.len() as pyo3::ffi::Py_ssize_t);
             if list.is_null() {
-                // allocation failure: fall back to the generic conversion path
                 return PyList::new(py, ids).expect("list alloc");
             }
-            for (i, &t) in ids.iter().enumerate() {
-                let obj = match table.get(t as usize) {
-                    Some(o) => {
-                        let p = o.as_ptr();
-                        pyo3::ffi::Py_INCREF(p);
-                        p
-                    }
-                    None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
-                };
-                pyo3::ffi::PyList_SET_ITEM(list, i as pyo3::ffi::Py_ssize_t, obj);
-            }
+            Self::fill_pylist_prefetched(table, ids, list, 0);
             Bound::from_owned_ptr(py, list).cast_into_unchecked()
         }
     }
@@ -2621,6 +2743,9 @@ impl Tokenizer {
     /// Python list-of-lists from one contiguous token buffer + per-doc counts.
     fn data_to_pylists<'py>(&self, py: Python<'py>, data: &[u32], doc_counts: &[usize]) -> Bound<'py, PyList> {
         let table = self.ints(py);
+        let tlen = table.len();
+        let tp = table.as_ptr();
+        let dlen = data.len();
         let mut off = 0usize;
         // SAFETY: each new list's slots are filled exactly once with owned refs.
         unsafe {
@@ -2629,16 +2754,27 @@ impl Tokenizer {
             for (d, &c) in doc_counts.iter().enumerate() {
                 let inner = pyo3::ffi::PyList_New(c as pyo3::ffi::Py_ssize_t);
                 assert!(!inner.is_null(), "list alloc");
-                for (k, &t) in data[off..off + c].iter().enumerate() {
-                    let obj = match table.get(t as usize) {
-                        Some(o) => {
-                            let p = o.as_ptr();
+                if c >= 24 {
+                    Self::fill_pylist_prefetched(table, &data[off..off + c], inner, 0);
+                } else {
+                    for k in 0..c {
+                        let gi = off + k;
+                        if gi + 16 < dlen {
+                            let pt = *data.get_unchecked(gi + 16) as usize;
+                            if pt < tlen {
+                                chunk_table::prefetch(tp.add(pt) as *const u8);
+                            }
+                        }
+                        let t = *data.get_unchecked(gi);
+                        let obj = if (t as usize) < tlen {
+                            let p = (*tp.add(t as usize)).as_ptr();
                             pyo3::ffi::Py_INCREF(p);
                             p
-                        }
-                        None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
-                    };
-                    pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj);
+                        } else {
+                            pyo3::ffi::PyLong_FromUnsignedLong(t as _)
+                        };
+                        pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj);
+                    }
                 }
                 off += c;
                 pyo3::ffi::PyList_SET_ITEM(outer, d as pyo3::ffi::Py_ssize_t, inner);
@@ -3999,7 +4135,7 @@ impl Tokenizer {
     /// completely even on NFC/NFD/NFKC/NFKD models (Qwen2.5/3, MiniMax, EXAONE);
     /// non-ASCII items normalize per-worker in `s.utf8` with zero upfront copy.
     #[allow(clippy::too_many_arguments)]
-    fn encode_fast_slice_piped(
+    fn encode_fast_slice_piped<const SPECIAL: bool>(
         &self,
         items: &[FastItem],
         base_doc: usize,
@@ -4019,6 +4155,7 @@ impl Tokenizer {
         let mut lview = self.long_table.view();
         let mut ubuf = std::mem::take(&mut s.utf8);
         let need_norm = !self.normalizer.is_identity();
+        let has_special = SPECIAL && self.special_ac.is_some();
         let flush = |buf: &[std::mem::MaybeUninit<PipeRec>],
                      ends: &[u32],
                      segs: &[(usize, usize, usize, usize, usize, usize)],
@@ -4086,6 +4223,22 @@ impl Tokenizer {
                     bad_wide(base_doc + ldi);
                     continue;
                 }
+                if has_special && self.special_prefilter.find_first(&ubuf[uoff..]).is_some() {
+                    if cnt > 0 {
+                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                        cnt = 0;
+                        segs.clear();
+                    }
+                    let txt = unsafe { std::str::from_utf8_unchecked(&ubuf[uoff..]) };
+                    let before = s.out.len();
+                    self.encode_special_into(txt, s);
+                    doc_counts[ldi] += s.out.len() - before;
+                    if !want_output {
+                        s.out.clear();
+                    }
+                    ubuf.truncate(uoff);
+                    continue;
+                }
                 if need_norm {
                     // SAFETY: `append_wide_utf8` succeeded so `ubuf[uoff..]` is valid UTF-8.
                     let norm_owned = {
@@ -4132,6 +4285,21 @@ impl Tokenizer {
                 continue;
             }
             let d = unsafe { std::slice::from_raw_parts(it.ptr, raw_len) };
+            if has_special && tag != FAST_RAW && self.special_prefilter.find_first(d).is_some() {
+                if cnt > 0 {
+                    flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                    cnt = 0;
+                    segs.clear();
+                }
+                let txt = unsafe { std::str::from_utf8_unchecked(d) };
+                let before = s.out.len();
+                self.encode_special_into(txt, s);
+                doc_counts[ldi] += s.out.len() - before;
+                if !want_output {
+                    s.out.clear();
+                }
+                continue;
+            }
             let mut check_utf8 = tag == FAST_RAW;
             if need_norm && tag != FAST_ASCII {
                 let txt = if tag == FAST_RAW {
@@ -4416,7 +4584,7 @@ impl Tokenizer {
     /// document is `< SPLIT_MIN` (`256 KiB`), `normalizer.is_ascii_identity()`,
     /// `items_pipe_ok()`, and `sep.is_none()`. Eliminates `Vec<Src>`, `norm`,
     /// `items`, `trusted`, and `item_counts` (~24 MB on 400K-line corpora).
-    fn encode_fast_short_t<O: OutTok>(
+    fn encode_fast_short_t<O: OutTok, const SPECIAL: bool>(
         &self,
         items: &[FastItem],
         total_len: usize,
@@ -4466,7 +4634,7 @@ impl Tokenizer {
                     s.out.reserve(cap);
                     chunk_table::advise_hugepage(s.out.as_mut_ptr() as *mut u8, cap * 4);
                 }
-                self.encode_fast_slice_piped(
+                self.encode_fast_slice_piped::<SPECIAL>(
                     items,
                     0,
                     want_output,
@@ -4496,7 +4664,7 @@ impl Tokenizer {
                     let (lo, hi) = tasks[k];
                     // SAFETY: tasks partition `0..n` into disjoint `[lo..hi)` slices.
                     let dc_slice = unsafe { std::slice::from_raw_parts_mut(dc_ptr.get().add(lo), hi - lo) };
-                    self.encode_fast_slice_piped(
+                    self.encode_fast_slice_piped::<SPECIAL>(
                         &items[lo..hi],
                         lo,
                         want_output,
@@ -5627,7 +5795,12 @@ impl Tokenizer {
             Ok(mut s) => {
                 s.dyn_cache.claim(self.uid);
                 s.long_cache.claim(self.uid);
-                s.out = Vec::with_capacity(text.len() / 3 + 8);
+                let need = text.len() / 3 + 8;
+                if s.out.capacity() < need {
+                    s.out = Vec::with_capacity(need);
+                } else {
+                    s.out.clear();
+                }
                 self.encode_into(text, mode, prepend, &mut s);
                 std::mem::take(&mut s.out)
             }
@@ -5841,7 +6014,7 @@ impl Tokenizer {
     fn build_special_post_lists<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyText>,
+        texts_obj: &Bound<'py, PyAny>,
         prefix: &[u32],
         suffix: &[u32],
         budget: Option<usize>,
@@ -5849,18 +6022,60 @@ impl Tokenizer {
         want_mask: bool,
         num_threads: usize,
     ) -> PyResult<(Bound<'py, PyList>, Option<Bound<'py, PyList>>)> {
-        const FLAT_SERIAL_MAX: usize = 131_072;
-        let wide = wide_texts(py, &texts, num_threads)?;
-        let views = text_views(&texts, &wide);
-        let total: usize = views.iter().map(|t| t.len()).sum();
-        let nrows = views.len();
-        let chunks: Vec<(Vec<u32>, Vec<usize>)> =
-            if num_threads == 1 || nrows <= 1 || !parallel_ok() || total < FLAT_SERIAL_MAX {
-                let one = self.maybe_detach(py, total, || self.encode_special_serial_flat(&views, total));
-                vec![one]
+        // FastBatch zero-plan pipelined path for plain list/tuple of str (< SPLIT_MIN)
+        // when normalizer is ASCII-identity and BlockScan applies.
+        let fast_flat: Option<(Vec<u32>, Vec<usize>)> =
+            if self.normalizer.is_ascii_identity() && self.items_pipe_ok() {
+                if let Some(batch) = try_extract_fast_batch(py, texts_obj) {
+                    if !batch.has_bytes && batch.max_len < SPLIT_MIN {
+                        let slice = &batch.items;
+                        let total_len = batch.total_len;
+                        let res = self.maybe_detach(py, total_len, || {
+                            self.encode_fast_short_t::<u32, true>(slice, total_len, num_threads, true)
+                        });
+                        match res {
+                            Ok(v) => {
+                                drop(batch);
+                                Some(v)
+                            }
+                            Err(b) => return Err(bad_fast_to_pyerr(py, &batch, b)),
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
-                py.detach(|| self.encode_special_par_chunks(&views, num_threads))
+                None
             };
+
+        type FlatChunks = Vec<(Vec<u32>, Vec<usize>)>;
+        let (nrows, chunks): (usize, FlatChunks) = if let Some((data, counts)) = fast_flat {
+            let nrows = counts.len();
+            let mut ends = Vec::with_capacity(nrows);
+            let mut acc = 0usize;
+            for c in counts {
+                acc += c;
+                ends.push(acc);
+            }
+            (nrows, vec![(data, ends)])
+        } else {
+            const FLAT_SERIAL_MAX: usize = 131_072;
+            let texts: Vec<PyText> = texts_obj.extract()?;
+            let wide = wide_texts(py, &texts, num_threads)?;
+            let views = text_views(&texts, &wide);
+            let total: usize = views.iter().map(|t| t.len()).sum();
+            let nrows = views.len();
+            let chunks =
+                if num_threads == 1 || nrows <= 1 || !parallel_ok() || total < FLAT_SERIAL_MAX {
+                    let one = self.maybe_detach(py, total, || self.encode_special_serial_flat(&views, total));
+                    vec![one]
+                } else {
+                    py.detach(|| self.encode_special_par_chunks(&views, num_threads))
+                };
+            (nrows, chunks)
+        };
 
         let table = self.ints(py);
         let one_ptr = if let Some(o) = table.get(1) {
@@ -5869,16 +6084,6 @@ impl Tokenizer {
             unsafe { pyo3::ffi::PyLong_FromLong(1) }
         };
         let one_owned = table.get(1).is_none();
-        let obj = |t: u32| unsafe {
-            match table.get(t as usize) {
-                Some(o) => {
-                    let p = o.as_ptr();
-                    pyo3::ffi::Py_INCREF(p);
-                    p
-                }
-                None => pyo3::ffi::PyLong_FromUnsignedLong(t as _),
-            }
-        };
         // SAFETY: each new list's slots are filled exactly once with owned refs.
         unsafe {
             let outer = pyo3::ffi::PyList_New(nrows as pyo3::ffi::Py_ssize_t);
@@ -5902,8 +6107,12 @@ impl Tokenizer {
                     let n = prefix.len() + content.len() + suffix.len();
                     let inner = pyo3::ffi::PyList_New(n as pyo3::ffi::Py_ssize_t);
                     assert!(!inner.is_null(), "list alloc");
-                    for (k, &t) in prefix.iter().chain(content).chain(suffix.iter()).enumerate() {
-                        pyo3::ffi::PyList_SET_ITEM(inner, k as pyo3::ffi::Py_ssize_t, obj(t));
+                    if !prefix.is_empty() {
+                        Self::fill_pylist_prefetched(table, prefix, inner, 0);
+                    }
+                    Self::fill_pylist_prefetched(table, content, inner, prefix.len());
+                    if !suffix.is_empty() {
+                        Self::fill_pylist_prefetched(table, suffix, inner, prefix.len() + content.len());
                     }
                     pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, inner);
                     if !m_outer.is_null() {
@@ -5957,7 +6166,7 @@ impl Tokenizer {
                 if batch.max_len < SPLIT_MIN {
                     let slice = &batch.items;
                     let total_len = batch.total_len;
-                    let res = py.detach(|| self.encode_fast_short_t::<O>(slice, total_len, num_threads, true));
+                    let res = py.detach(|| self.encode_fast_short_t::<O, false>(slice, total_len, num_threads, true));
                     let (d, c) = match res {
                         Ok(v) => v,
                         Err(b) => return Err(bad_fast_to_pyerr(py, &batch, b)),
@@ -6514,8 +6723,27 @@ impl Tokenizer {
     }
 
     fn encode_ordinary<'py>(&self, py: Python<'py>, text: &str) -> Bound<'py, PyList> {
-        let ids = self.maybe_detach(py, text.len(), || self.encode_one(text, Merge::Auto));
-        self.to_pylist(py, &ids)
+        if text.len() < Self::DETACH_MIN {
+            return self.with_scratch(|s| {
+                s.out.clear();
+                self.encode_into(text, Merge::Auto, true, s);
+                self.to_pylist(py, &s.out)
+            });
+        }
+        let ids = py.detach(|| self.encode_one(text, Merge::Auto));
+        let list = self.to_pylist(py, &ids);
+        // Recycle `ids` allocation back into thread-local scratch so repeated
+        // single-prompt calls (4KB–128KB) avoid per-call Vec malloc/free.
+        if ids.capacity() <= (1 << 20) {
+            let _ = SCRATCH.try_with(|cell| {
+                if let Ok(mut s) = cell.try_borrow_mut() {
+                    if ids.capacity() > s.out.capacity() {
+                        s.out = ids;
+                    }
+                }
+            });
+        }
+        list
     }
 
     /// Like `encode_ordinary` but WITHOUT the SentencePiece metaspace prepend —
@@ -6523,7 +6751,14 @@ impl Tokenizer {
     /// `prepend_scheme="first"`. Identical to `encode_ordinary` for non-metaspace
     /// models.
     fn encode_ordinary_no_prefix<'py>(&self, py: Python<'py>, text: &str) -> Bound<'py, PyList> {
-        let ids = self.maybe_detach(py, text.len(), || self.encode_one_p(text, Merge::Auto, false));
+        if text.len() < Self::DETACH_MIN {
+            return self.with_scratch(|s| {
+                s.out.clear();
+                self.encode_into(text, Merge::Auto, false, s);
+                self.to_pylist(py, &s.out)
+            });
+        }
+        let ids = py.detach(|| self.encode_one_p(text, Merge::Auto, false));
         self.to_pylist(py, &ids)
     }
 
@@ -6565,7 +6800,14 @@ impl Tokenizer {
     /// each gap, splice the special ids — all in one Rust pass. Same ids as the
     /// Python fragment loop, but no per-fragment Python↔Rust crossing.
     fn encode_special<'py>(&self, py: Python<'py>, text: &str) -> Bound<'py, PyList> {
-        let ids = self.maybe_detach(py, text.len(), || self.encode_special_one(text));
+        if text.len() < Self::DETACH_MIN {
+            return self.with_scratch(|s| {
+                s.out.clear();
+                self.encode_special_into(text, s);
+                self.to_pylist(py, &s.out)
+            });
+        }
+        let ids = py.detach(|| self.encode_special_one(text));
         self.to_pylist(py, &ids)
     }
 
@@ -6573,7 +6815,7 @@ impl Tokenizer {
     /// AutoTokenizer's `__call__` on a list is one Rust pass instead of a Python
     /// loop. `num_threads` 0 = all cores.
     #[pyo3(signature = (texts, num_threads = 0))]
-    fn encode_special_batch<'py>(&self, py: Python<'py>, texts: Vec<PyText>, num_threads: usize) -> PyResult<Bound<'py, PyList>> {
+    fn encode_special_batch<'py>(&self, py: Python<'py>, texts: &Bound<'py, PyAny>, num_threads: usize) -> PyResult<Bound<'py, PyList>> {
         let (seqs, _) = self.build_special_post_lists(py, texts, &[], &[], None, false, false, num_threads)?;
         Ok(seqs)
     }
@@ -6588,7 +6830,7 @@ impl Tokenizer {
     fn encode_special_post<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyText>,
+        texts: &Bound<'py, PyAny>,
         prefix: Vec<u32>,
         suffix: Vec<u32>,
         budget: Option<usize>,
@@ -6616,7 +6858,7 @@ impl Tokenizer {
     fn encode_special_post_masked<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyText>,
+        texts: &Bound<'py, PyAny>,
         prefix: Vec<u32>,
         suffix: Vec<u32>,
         budget: Option<usize>,
@@ -6772,7 +7014,7 @@ impl Tokenizer {
                 if batch.max_len < SPLIT_MIN {
                     let slice = &batch.items;
                     let total_len = batch.total_len;
-                    let res = py.detach(|| self.encode_fast_short_t::<u32>(slice, total_len, num_threads, true));
+                    let res = py.detach(|| self.encode_fast_short_t::<u32, false>(slice, total_len, num_threads, true));
                     let (data, counts) = match res {
                         Ok(v) => v,
                         Err(b) => return Err(bad_fast_to_pyerr(py, &batch, b)),
@@ -6803,7 +7045,7 @@ impl Tokenizer {
                 if batch.max_len < SPLIT_MIN {
                     let slice = &batch.items;
                     let total_len = batch.total_len;
-                    let res = py.detach(|| self.encode_fast_short_t::<u32>(slice, total_len, num_threads, false));
+                    let res = py.detach(|| self.encode_fast_short_t::<u32, false>(slice, total_len, num_threads, false));
                     return match res {
                         Ok((_, counts)) => Ok(counts),
                         Err(b) => Err(bad_fast_to_pyerr(py, &batch, b)),
@@ -6835,44 +7077,110 @@ impl Tokenizer {
     fn encode_batch<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyText>,
+        texts: &Bound<'py, PyAny>,
         max_length: Option<usize>,
         pad_id: u32,
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let seqs: Vec<Vec<u32>> =
-            { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_one(t, Merge::Auto))) };
-        let rows = seqs.len();
-        let width = max_length.unwrap_or_else(|| seqs.iter().map(|s| s.len()).max().unwrap_or(0));
+        let fast_flat: Option<(Vec<u32>, Vec<usize>)> =
+            if self.normalizer.is_ascii_identity() && self.items_pipe_ok() {
+                if let Some(batch) = try_extract_fast_batch(py, texts) {
+                    if !batch.has_bytes && batch.max_len < SPLIT_MIN {
+                        let slice = &batch.items;
+                        let total_len = batch.total_len;
+                        let res = self.maybe_detach(py, total_len, || {
+                            self.encode_fast_short_t::<u32, false>(slice, total_len, num_threads, true)
+                        });
+                        match res {
+                            Ok(v) => {
+                                drop(batch);
+                                Some(v)
+                            }
+                            Err(b) => return Err(bad_fast_to_pyerr(py, &batch, b)),
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-        // Pad/truncate into flat row-major buffers (built without numpy).
-        let mut ids_flat = vec![pad_id; rows * width];
-        let mut mask_flat = vec![0u8; rows * width];
-        for (r, seq) in seqs.iter().enumerate() {
-            let len = seq.len().min(width);
-            let base = r * width;
-            ids_flat[base..base + len].copy_from_slice(&seq[..len]);
-            for m in &mut mask_flat[base..base + len] {
-                *m = 1;
+        let (data, counts) = if let Some(v) = fast_flat {
+            v
+        } else {
+            let texts: Vec<PyText> = texts.extract()?;
+            let wide = wide_texts(py, &texts, num_threads)?;
+            let seqs: Vec<Vec<u32>> = py.detach(|| {
+                self.par_texts(num_threads, &texts, &wide, |t| self.encode_one(t, Merge::Auto))
+            });
+            let total: usize = seqs.iter().map(|s| s.len()).sum();
+            let mut flat = Vec::with_capacity(total);
+            let mut counts = Vec::with_capacity(seqs.len());
+            for s in seqs {
+                counts.push(s.len());
+                flat.extend_from_slice(&s);
             }
-        }
+            (flat, counts)
+        };
 
-        // Hand the buffers to numpy in a single copy each (the `.copy()` detaches
-        // the array from the temporary PyBytes, leaving a writable, owned array).
+        let rows = counts.len();
+        let width = max_length.unwrap_or_else(|| counts.iter().copied().max().unwrap_or(0));
+        let (ids_flat, mask_flat) = py.detach(|| {
+            let total = rows * width;
+            let mut offs = Vec::with_capacity(rows + 1);
+            let mut acc = 0usize;
+            for &c in &counts {
+                offs.push(acc);
+                acc += c;
+            }
+            offs.push(acc);
+            let mut ids_flat: Vec<u32> = Vec::with_capacity(total);
+            let mut mask_flat: Vec<u8> = Vec::with_capacity(total);
+            if width > 0 {
+                type FillRowU32<'a> = (
+                    usize,
+                    (&'a mut [std::mem::MaybeUninit<u32>], &'a mut [std::mem::MaybeUninit<u8>]),
+                );
+                let fill_row = |(r, (irow, mrow)): FillRowU32<'_>| {
+                    let seq = &data[offs[r]..offs[r + 1]];
+                    let len = seq.len().min(width);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(seq.as_ptr(), irow.as_mut_ptr() as *mut u32, len);
+                        std::ptr::write_bytes(mrow.as_mut_ptr() as *mut u8, 1u8, len);
+                        for k in len..width {
+                            irow.get_unchecked_mut(k).write(pad_id);
+                        }
+                        std::ptr::write_bytes((mrow.as_mut_ptr() as *mut u8).add(len), 0u8, width - len);
+                    }
+                };
+                let iu = &mut ids_flat.spare_capacity_mut()[..total];
+                let mu = &mut mask_flat.spare_capacity_mut()[..total];
+                if parallel_ok() && rows > 1 && total >= 32_768 {
+                    iu.par_chunks_mut(width).zip(mu.par_chunks_mut(width)).enumerate().for_each(fill_row);
+                } else {
+                    iu.chunks_mut(width).zip(mu.chunks_mut(width)).enumerate().for_each(fill_row);
+                }
+                unsafe {
+                    ids_flat.set_len(total);
+                    mask_flat.set_len(total);
+                }
+            }
+            (ids_flat, mask_flat)
+        });
+
+        // Zero-copy views over owned TokenBuffers (eliminates PyBytes + .copy() double-copy).
         let np = py.import("numpy").map_err(|_| {
             PyValueError::new_err("encode_batch requires numpy (pip install numpy)")
         })?;
-        let ids_u8 = unsafe {
-            std::slice::from_raw_parts(ids_flat.as_ptr() as *const u8, ids_flat.len() * 4)
-        };
         let ids_arr = np
-            .call_method1("frombuffer", (PyBytes::new(py, ids_u8), "uint32"))?
-            .call_method1("reshape", ((rows, width),))?
-            .call_method0("copy")?;
+            .call_method1("frombuffer", (Bound::new(py, TokenBuffer::new(ids_flat))?, "uint32"))?
+            .call_method1("reshape", ((rows, width),))?;
         let mask_arr = np
-            .call_method1("frombuffer", (PyBytes::new(py, &mask_flat), "uint8"))?
-            .call_method1("reshape", ((rows, width),))?
-            .call_method0("copy")?;
+            .call_method1("frombuffer", (Bound::new(py, TokenBuffer::new_u8(mask_flat))?, "uint8"))?
+            .call_method1("reshape", ((rows, width),))?;
 
         let out = PyDict::new(py);
         out.set_item("input_ids", ids_arr)?;
@@ -6959,7 +7267,7 @@ impl Tokenizer {
     fn encode_special_padded<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<PyText>,
+        texts: &Bound<'py, PyAny>,
         prefix: Vec<i64>,
         suffix: Vec<i64>,
         max_length: Option<usize>,
@@ -6971,20 +7279,81 @@ impl Tokenizer {
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         let n_special = prefix.len() + suffix.len();
-        let contents: Vec<Vec<u32>> =
-            { let wide = wide_texts(py, &texts, num_threads)?; py.detach(|| self.par_texts(num_threads, &texts, &wide, |t| self.encode_special_one(t))) };
-        let rows = contents.len();
+        // FastBatch zero-plan pipelined path when normalizer is ASCII-identity & BlockScan applies.
+        let fast_flat: Option<(Vec<u32>, Vec<usize>)> =
+            if self.normalizer.is_ascii_identity() && self.items_pipe_ok() {
+                if let Some(batch) = try_extract_fast_batch(py, texts) {
+                    if !batch.has_bytes && batch.max_len < SPLIT_MIN {
+                        let slice = &batch.items;
+                        let total_len = batch.total_len;
+                        let res = self.maybe_detach(py, total_len, || {
+                            self.encode_fast_short_t::<u32, true>(slice, total_len, num_threads, true)
+                        });
+                        match res {
+                            Ok(v) => {
+                                drop(batch);
+                                Some(v)
+                            }
+                            Err(b) => return Err(bad_fast_to_pyerr(py, &batch, b)),
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let chunks: Vec<(Vec<u32>, Vec<usize>)> = if let Some((data, counts)) = fast_flat {
+            let mut ends = Vec::with_capacity(counts.len());
+            let mut acc = 0usize;
+            for c in counts {
+                acc += c;
+                ends.push(acc);
+            }
+            vec![(data, ends)]
+        } else {
+            const FLAT_SERIAL_MAX: usize = 131_072;
+            let texts: Vec<PyText> = texts.extract()?;
+            let wide = wide_texts(py, &texts, num_threads)?;
+            let views = text_views(&texts, &wide);
+            let total: usize = views.iter().map(|t| t.len()).sum();
+            let nrows = views.len();
+            if num_threads == 1 || nrows <= 1 || !parallel_ok() || total < FLAT_SERIAL_MAX {
+                let one = self.maybe_detach(py, total, || self.encode_special_serial_flat(&views, total));
+                vec![one]
+            } else {
+                py.detach(|| self.encode_special_par_chunks(&views, num_threads))
+            }
+        };
+
+        // Build borrowed per-row slices across the flat chunk buffers (zero per-row Vec allocs).
+        let row_slices: Vec<&[u32]> = {
+            let nrows: usize = chunks.iter().map(|(_, e)| e.len()).sum();
+            let mut v = Vec::with_capacity(nrows);
+            for (buf, ends) in &chunks {
+                let mut start = 0usize;
+                for &end in ends {
+                    v.push(&buf[start..end]);
+                    start = end;
+                }
+            }
+            v
+        };
+        let rows = row_slices.len();
         // content length per row after truncation (reserving the specials).
         let trunc_cap = if truncation {
             max_length.map(|ml| ml.saturating_sub(n_special))
         } else {
             None
         };
-        let content_len = |c: &Vec<u32>| trunc_cap.map_or(c.len(), |cap| c.len().min(cap));
+        let content_len = |c: &[u32]| trunc_cap.map_or(c.len(), |cap| c.len().min(cap));
         let width = if pad_to_max {
             max_length.unwrap_or(0)
         } else {
-            contents.iter().map(|c| n_special + content_len(c)).max().unwrap_or(0)
+            row_slices.iter().map(|c| n_special + content_len(c)).max().unwrap_or(0)
         };
 
         // Fill both [rows, width] int64 matrices in parallel, one row per task,
@@ -6995,30 +7364,38 @@ impl Tokenizer {
             let mut mask: Vec<i64> = Vec::with_capacity(total);
             if width > 0 {
                 let fill_row = |(r, (irow, mrow)): FillRowItem<'_>| {
-                    let c = &contents[r];
+                    let c = row_slices[r];
                     // clamp content so prefix+content+suffix never overruns the row.
                     let cl = content_len(c).min(width.saturating_sub(n_special));
                     let cslice: &[u32] = if trunc_left && cl < c.len() { &c[c.len() - cl..] } else { &c[..cl] };
                     let used = (n_special + cl).min(width);
                     let off = if pad_left { width - used } else { 0 };
-                    let mut w = 0usize;
-                    for x in irow.iter_mut().take(off) { x.write(pad_id); }
-                    for x in mrow.iter_mut().take(off) { x.write(0); }
-                    w += off;
-                    for v in prefix.iter().copied().chain(cslice.iter().map(|&x| x as i64)).chain(suffix.iter().copied()) {
-                        if w >= width { break; }
-                        irow[w].write(v);
-                        mrow[w].write(1);
-                        w += 1;
+                    // Contiguous per-array fills so LLVM auto-vectorizes pad/mask/u32->i64.
+                    for x in &mut irow[..off] { x.write(pad_id); }
+                    for x in &mut mrow[..off] { x.write(0); }
+                    let mut w = off;
+                    let plen = prefix.len().min(width - w);
+                    for (dst, &v) in irow[w..w + plen].iter_mut().zip(&prefix[..plen]) {
+                        dst.write(v);
                     }
-                    for k in w..width {
-                        irow[k].write(pad_id);
-                        mrow[k].write(0);
+                    w += plen;
+                    let clen = cslice.len().min(width - w);
+                    for (dst, &v) in irow[w..w + clen].iter_mut().zip(&cslice[..clen]) {
+                        dst.write(v as i64);
                     }
+                    w += clen;
+                    let slen = suffix.len().min(width - w);
+                    for (dst, &v) in irow[w..w + slen].iter_mut().zip(&suffix[..slen]) {
+                        dst.write(v);
+                    }
+                    w += slen;
+                    for x in &mut mrow[off..w] { x.write(1); }
+                    for x in &mut irow[w..width] { x.write(pad_id); }
+                    for x in &mut mrow[w..width] { x.write(0); }
                 };
                 let iu = &mut ids.spare_capacity_mut()[..total];
                 let mu = &mut mask.spare_capacity_mut()[..total];
-                if parallel_ok() && rows > 1 {
+                if parallel_ok() && rows > 1 && total >= 32_768 {
                     iu.par_chunks_mut(width).zip(mu.par_chunks_mut(width)).enumerate().for_each(fill_row);
                 } else {
                     iu.chunks_mut(width).zip(mu.chunks_mut(width)).enumerate().for_each(fill_row);
@@ -8436,8 +8813,18 @@ mod perf {
         assert_eq!(p_whisper.find_first(b"a < b <|0.00|> c"), Some(6));
         assert_eq!(p_whisper.find_first(b"<"), None);
 
-        let p_one = SpecialPrefilter::from_patterns(&[
+        let p_mask = SpecialPrefilter::from_patterns(&[
             "<s>".to_string(),
+            "<|im_start|>".to_string(),
+        ]);
+        assert!(matches!(p_mask, SpecialPrefilter::Prefix1Mask(b'<', _)));
+        assert_eq!(p_mask.find_first(b"no angle brackets here"), None);
+        assert_eq!(p_mask.find_first(b"x < 5 and a < b"), None);
+        assert_eq!(p_mask.find_first(b"hi <s>"), Some(3));
+        assert_eq!(p_mask.find_first(b"x < 5 <|im_start|>"), Some(6));
+
+        let p_one = SpecialPrefilter::from_patterns(&[
+            "<".to_string(),
             "<|im_start|>".to_string(),
         ]);
         assert_eq!(p_one, SpecialPrefilter::Bytes1(b'<'));
