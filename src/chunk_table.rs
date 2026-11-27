@@ -37,8 +37,37 @@ pub static DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 pub struct ChunkTable {
     entries: HugeVec<Entry>,
+    bloom: Vec<u64>,
+    bloom_shift: u32,
     shift: u32,
     mask: usize,
+}
+
+/// Branch-minimal, zero-memcpy, page-boundary-safe packer for `1 <= len <= 15`
+/// using at most 2 overlapping in-bounds GPR loads (zero stack buffer, zero
+/// Store-To-Load Forwarding stall).
+///
+/// SAFETY: `p .. p+len` must be readable; `1 <= len <= 15`.
+#[inline(always)]
+pub unsafe fn pack_short_safe(p: *const u8, len: usize) -> (u64, u64) {
+    debug_assert!(len >= 1 && len <= MAX_KEY);
+    let (lo, hi_bytes) = if len >= 8 {
+        let lo = u64::from_le((p as *const u64).read_unaligned());
+        let hi_raw = u64::from_le((p.add(len - 8) as *const u64).read_unaligned());
+        let hi_bytes = if len > 8 { hi_raw >> ((16 - len) * 8) } else { 0 };
+        (lo, hi_bytes)
+    } else if len >= 4 {
+        let a = u32::from_le((p as *const u32).read_unaligned()) as u64;
+        let b = u32::from_le((p.add(len - 4) as *const u32).read_unaligned()) as u64;
+        (a | (b << ((len - 4) * 8)), 0)
+    } else if len >= 2 {
+        let a = u16::from_le((p as *const u16).read_unaligned()) as u64;
+        let b = *p.add(len - 1) as u64;
+        (a | (b << ((len - 1) * 8)), 0)
+    } else {
+        (*p as u64, 0)
+    };
+    (lo, hi_bytes | ((len as u64) << 56))
 }
 
 /// Pack ≤ 15 bytes into the (lo, hi) key. Caller guarantees 1 ≤ len ≤ 15.
@@ -46,11 +75,8 @@ pub struct ChunkTable {
 pub fn pack(chunk: &[u8]) -> (u64, u64) {
     let n = chunk.len();
     debug_assert!(n >= 1 && n <= MAX_KEY);
-    let mut buf = [0u8; 16];
-    buf[..n].copy_from_slice(chunk);
-    let lo = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let hi = u64::from_le_bytes(buf[8..16].try_into().unwrap()) | ((n as u64) << 56);
-    (lo, hi)
+    // SAFETY: chunk has `n` readable bytes with 1 <= n <= MAX_KEY.
+    unsafe { pack_short_safe(chunk.as_ptr(), n) }
 }
 
 /// Pack `len` bytes starting at `p` when at least 16 bytes are readable from `p`
@@ -68,26 +94,17 @@ pub unsafe fn pack_wide(p: *const u8, len: usize) -> (u64, u64) {
 }
 
 /// `pack_wide` for chunk `b[pos..pos + len]` (1 <= len <= MAX_KEY) wherever it
-/// lies: within 16 bytes of the end of `b` the key is built from a zero-padded
-/// copy — the same key, since bytes past `len` are masked off anyway. (Those
-/// chunks — the last ones of every text — used to skip every table.)
+/// lies: within 16 bytes of the end of `b`, uses inline zero-memcpy overlapping
+/// GPR loads (`pack_short_safe`) with zero stack spill / STLF stall.
 #[inline(always)]
 pub fn pack_at(b: &[u8], pos: usize, len: usize) -> (u64, u64) {
     if pos + 16 <= b.len() {
         // SAFETY: 16 bytes readable at pos.
         unsafe { pack_wide(b.as_ptr().add(pos), len) }
     } else {
-        pack_tail(&b[pos..pos + len])
+        // SAFETY: pos + len <= b.len(), 1 <= len <= MAX_KEY.
+        unsafe { pack_short_safe(b.as_ptr().add(pos), len) }
     }
-}
-
-#[cold]
-#[inline(never)]
-pub fn pack_tail(c: &[u8]) -> (u64, u64) {
-    let mut t = [0u8; 16];
-    t[..c.len()].copy_from_slice(c);
-    // SAFETY: t is 16 bytes; c.len() in 1..=MAX_KEY.
-    unsafe { pack_wide(t.as_ptr(), c.len()) }
 }
 
 static KEY_MASK64: [(u64, u64); 16] = {
@@ -100,18 +117,6 @@ static KEY_MASK64: [(u64, u64); 16] = {
     }
     m
 };
-
-/// `pack_wide` for any `len`; meaningful only for 1 <= len <= 15 (callers
-/// discard it otherwise). Pure 64-bit GPR path with zero XMM domain crossings.
-///
-/// SAFETY: `p .. p+16` must be readable.
-#[inline(always)]
-pub unsafe fn pack_wide_any(p: *const u8, len: usize) -> (u64, u64) {
-    let (m0, m1) = *KEY_MASK64.get_unchecked(len & 15);
-    let lo = u64::from_le((p as *const u64).read_unaligned()) & m0;
-    let hi = (u64::from_le((p.add(8) as *const u64).read_unaligned()) & m1) | ((len as u64) << 56);
-    (lo, hi)
-}
 
 /// Portable read-prefetch hint (no-op where unsupported).
 #[inline(always)]
@@ -139,31 +144,48 @@ pub fn hash(lo: u64, hi: u64) -> u64 {
 
 impl ChunkTable {
     pub fn empty() -> Self {
-        ChunkTable { entries: HugeVec::zeroed(2), shift: 63, mask: 1 }
+        ChunkTable {
+            entries: HugeVec::zeroed(2),
+            bloom: vec![0u64; 2],
+            bloom_shift: 63,
+            shift: 63,
+            mask: 1,
+        }
     }
 
     /// Build from verified (key bytes, token) pairs. Duplicate keys keep the first.
+    /// Also builds an L2-resident k=4 pure-GPR Blocked Bloom filter (~10.5 bits/entry,
+    /// ~1% FPR: 256 KiB for o200k, 128 KiB for cl100k, 64 KiB for gpt2) so ~99% of
+    /// non-vocab cold misses never touch the 12.6 MiB `entries` table in L3/DRAM.
     pub fn build(pairs: &[(&[u8], u32)]) -> Self {
         let mut cap = 16usize;
         #[cfg(test)]
         let dense = DENSE.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         let dense = false;
-        // Load factor <= 1/2. (The hot loop now probes the shared table, which
-        // is seeded with these same entries; this table is the exact fallback.)
         let spread = 2usize;
         while if dense { cap * 3 < pairs.len() * 4 } else { cap < pairs.len() * spread } {
             cap <<= 1;
         }
         let bits = cap.trailing_zeros();
+        let bloom_words = (cap >> 4).max(2);
+        let bloom_bits = bloom_words.trailing_zeros();
         let mut t = ChunkTable {
             entries: HugeVec::zeroed(cap),
+            bloom: vec![0u64; bloom_words],
+            bloom_shift: 64 - bloom_bits,
             shift: 64 - bits,
             mask: cap - 1,
         };
         for (k, v) in pairs {
             let (lo, hi) = pack(k);
-            let mut i = (hash(lo, hi) >> t.shift) as usize;
+            let h = hash(lo, hi);
+            let bw = (h >> t.bloom_shift) as usize;
+            t.bloom[bw] |= (1u64 << ((h >> 24) & 63))
+                | (1u64 << ((h >> 30) & 63))
+                | (1u64 << ((h >> 36) & 63))
+                | (1u64 << ((h >> 42) & 63));
+            let mut i = (h >> t.shift) as usize;
             loop {
                 let e = &mut t.entries[i];
                 if e.hi == 0 {
@@ -191,6 +213,17 @@ impl ChunkTable {
 
     #[inline(always)]
     pub fn get_h(&self, lo: u64, hi: u64, h: u64) -> Option<u32> {
+        // SAFETY: bloom_shift in 1..=63, so (h >> bloom_shift) < bloom.len().
+        let w = unsafe { *self.bloom.get_unchecked((h >> self.bloom_shift) as usize) };
+        if ((w >> ((h >> 24) & 63))
+            & (w >> ((h >> 30) & 63))
+            & (w >> ((h >> 36) & 63))
+            & (w >> ((h >> 42) & 63))
+            & 1)
+            == 0
+        {
+            return None;
+        }
         let mut i = (h >> self.shift) as usize;
         loop {
             // SAFETY: i is always masked to < entries.len().

@@ -2506,7 +2506,7 @@ impl Tokenizer {
                     let lview = self.long_table.view();
                     let bufp = buf.as_mut_ptr();
                     let first_a = a;
-                    a = self.fill_recs(bytes, &ends, 0, k, a, bufp, view, lview);
+                    a = Self::fill_recs(bytes, &ends, 0, k, a, bufp, view, lview);
                     // SAFETY: fill_recs wrote buf[..k].
                     let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
                     self.flush_recs(bytes, n, sl, &ends[..k], first_a, s, view, lview);
@@ -2591,7 +2591,6 @@ impl Tokenizer {
     /// prefetch their `SharedLongTable` 64B slot out-of-line.
     #[inline(never)]
     fn fill_recs(
-        &self,
         bytes: &[u8],
         ends: &[u32],
         lo: usize,
@@ -2607,24 +2606,26 @@ impl Tokenizer {
         while j > lo && ends[j - 1] as usize + 16 > n {
             j -= 1;
         }
-        for c in lo..j {
-            let e = unsafe { *ends.get_unchecked(c) } as usize;
+        let mut out = unsafe { bufp.add(lo) };
+        for &e_u32 in &ends[lo..j] {
+            let e = e_u32 as usize;
             let len = e - a;
             if len.wrapping_sub(1) < chunk_table::MAX_KEY {
-                // SAFETY: a < e <= ends[j - 1] and ends[j - 1] + 16 <= n.
-                let (klo, khi) = unsafe { chunk_table::pack_wide_any(bp.add(a), len) };
+                // SAFETY: a < e <= ends[j - 1] and ends[j - 1] + 16 <= n, 1 <= len <= MAX_KEY.
+                let (klo, khi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
                 let p = view.slot_addr(chunk_table::hash(klo, khi));
                 chunk_table::prefetch(p as *const u8);
                 // SAFETY: callers' buffers hold CAP + SCAN_SLACK >= hi records.
-                unsafe { (*bufp.add(c)).write(PipeRec { lo: klo, hi: khi, p }) };
+                unsafe { (*out).write(PipeRec { lo: klo, hi: khi, p }) };
             } else {
                 let v = Self::fill_rec_long(bytes, a, len, lview);
-                unsafe { (*bufp.add(c)).write(v) };
+                unsafe { (*out).write(v) };
             }
+            out = unsafe { out.add(1) };
             a = e;
         }
-        for c in j..hi {
-            let e = ends[c] as usize;
+        for &e_u32 in &ends[j..hi] {
+            let e = e_u32 as usize;
             let len = e - a;
             let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY {
                 let (klo, khi) = chunk_table::pack_at(bytes, a, len);
@@ -2635,7 +2636,8 @@ impl Tokenizer {
                 Self::fill_rec_long(bytes, a, len, lview)
             };
             // SAFETY: as above.
-            unsafe { (*bufp.add(c)).write(v) };
+            unsafe { (*out).write(v) };
+            out = unsafe { out.add(1) };
             a = e;
         }
         a
@@ -2657,6 +2659,8 @@ impl Tokenizer {
     /// Phase 2 of the pipeline for records of one buffer `bytes` (len `n`).
     /// `ends` has the same length as `buf` and `first_a` is the start offset of
     /// `buf[0]`; neither is touched on the 99%+ inline hit path.
+    /// Uses pointer-only loop induction (`rp`, `end_rp`, `wp`) so zero `k` or
+    /// `dst`-base stack reloads remain in the hot hit path.
     #[inline(always)]
     fn flush_recs(
         &self,
@@ -2669,15 +2673,21 @@ impl Tokenizer {
         view: chunk_table::View<'_, 3>,
         lview: chunk_table::LongView<'_>,
     ) {
-        s.out.reserve(6 * buf.len() + 16);
-        let mut w = s.out.len();
-        let mut dst = s.out.as_mut_ptr();
-        for (k, r) in buf.iter().enumerate() {
+        let len = buf.len();
+        s.out.reserve(6 * len + 16);
+        let mut base_out = s.out.as_mut_ptr();
+        let mut wp = unsafe { base_out.add(s.out.len()) };
+        let base_rp = buf.as_ptr();
+        let mut rp = base_rp;
+        let end_rp = unsafe { base_rp.add(len) };
+        while rp < end_rp {
+            let r = unsafe { *rp };
             let empty_slot = if r.p != 0 {
-                // SAFETY: capacity >= w + 6 * remaining entries (reserved).
-                match unsafe { view.emit_inline_at(r.lo, r.hi, r.p, dst.add(w)) } {
+                // SAFETY: capacity >= current_len + 6 * remaining entries (reserved).
+                match unsafe { view.emit_inline_at(r.lo, r.hi, r.p, wp) } {
                     chunk_table::InlineHit::Hit(c) => {
-                        w += c;
+                        wp = unsafe { wp.add(c) };
+                        rp = unsafe { rp.add(1) };
                         continue;
                     }
                     chunk_table::InlineHit::Empty => true,
@@ -2686,6 +2696,8 @@ impl Tokenizer {
             } else {
                 false
             };
+            let k = unsafe { rp.offset_from(base_rp) as usize };
+            let w = unsafe { wp.offset_from(base_out) as usize };
             // SAFETY: [0, w) initialized.
             unsafe { s.out.set_len(w) };
             let a = if k == 0 { first_a } else { ends[k - 1] as usize };
@@ -2697,12 +2709,13 @@ impl Tokenizer {
             } else {
                 self.emit_chunk_cold(bytes, a, e, n, s);
             }
-            s.out.reserve(6 * (buf.len() - k) + 16);
-            w = s.out.len();
-            dst = s.out.as_mut_ptr();
+            s.out.reserve(6 * (len - k) + 16);
+            base_out = s.out.as_mut_ptr();
+            wp = unsafe { base_out.add(s.out.len()) };
+            rp = unsafe { rp.add(1) };
         }
-        // SAFETY: [0, w) initialized.
-        unsafe { s.out.set_len(w) };
+        // SAFETY: [0, wp - base_out) initialized.
+        unsafe { s.out.set_len(wp.offset_from(base_out) as usize) };
     }
 
     /// Phase 2 fallback for buffers > 4 GiB (explicit 64-bit spans).
@@ -2835,7 +2848,7 @@ impl Tokenizer {
                         break;
                     }
                     let first_a = a;
-                    a = self.fill_recs(d, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
+                    a = Self::fill_recs(d, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
                     segs.push((cnt, k1, ii, first_a, uoff, ulen));
                     cnt = k1;
                     if cnt >= CAP {
@@ -2874,7 +2887,7 @@ impl Tokenizer {
                     break;
                 }
                 let first_a = a;
-                a = self.fill_recs(d, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
+                a = Self::fill_recs(d, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
                 segs.push((cnt, k1, ii, first_a, 0, 0));
                 cnt = k1;
                 if cnt >= CAP {
@@ -3380,7 +3393,7 @@ impl Tokenizer {
                         // Pass `avail` (the full macro-chunk tail) so `pack_wide_any`
                         // reads 16 bytes directly without calling `pack_tail` on the
                         // last 16 bytes of every short document!
-                        a = self.fill_recs(avail, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
+                        a = Self::fill_recs(avail, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
                         segs.push((cnt, k1, di, first_a, p, doc_end));
                         cnt = k1;
                         if cnt >= CAP {
@@ -5373,11 +5386,10 @@ mod perf {
                 for (c, &e) in ends[..k].iter().enumerate() {
                     let e = e as usize;
                     let len = e - a;
-                    if a + 16 > n { a = e; continue; }
-                    let (lo, hi) = unsafe { chunk_table::pack_wide_any(bp.add(a), len) };
+                    if a + 16 > n || len.wrapping_sub(1) >= 15 { a = e; continue; }
+                    let (lo, hi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
                     let p = view.slot_addr(chunk_table::hash(lo, hi));
                     chunk_table::prefetch(p as *const u8);
-                    let p = std::hint::select_unpredictable(len.wrapping_sub(1) < 15, p, 0);
                     recs[c] = (a, e, lo, hi, p);
                     a = e;
                 }
