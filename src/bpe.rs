@@ -16,9 +16,10 @@ const DENSE_OVERFLOW: u16 = u16::MAX - 1;
 
 pub struct MergeMap {
     /// Packed 8-byte open-addressing table: `(t1 << 43) | (t2 << 22) | (rank + 1)`.
-    /// 4x smaller than baseline 16B/3x table (4 MiB for o200k, 1 MiB for gpt2).
+    /// 4x smaller than baseline 16B/3x table (2 MiB for o200k, 512 KiB for gpt2),
+    /// backed by 2 MiB-aligned Linux THP via `HugeVec<u64>`.
     /// Empty sentinel is 0 (rank + 1 >= 1, so every live entry is non-zero).
-    packed: Vec<u64>,
+    packed: crate::chunk_table::HugeVec<u64>,
     /// Fallback 16-byte table (empty for all normal vocabularies < 2M tokens).
     entries: Vec<Entry>,
     mask: usize,
@@ -50,6 +51,11 @@ pub struct MergeMap {
     /// (true for 100% of gpt2 / cl100k / o200k), `linear_off != u32::MAX` and
     /// `target(rank)` is one ADD with zero memory loads; otherwise `targets[rank]`.
     linear_off: u32,
+    /// True iff every merge target has token ID >= 256 (true for all standard
+    /// ByteLevel BPEs), letting the inner merge loop skip the `merged >= 256` check.
+    all_targets_ge_256: bool,
+    /// Number of token IDs covered by `can_lr` (`can_lr.len() * 4`).
+    vocab_n: usize,
     targets: Vec<u32>,
 }
 
@@ -92,6 +98,7 @@ impl MergeMap {
         } else {
             u32::MAX
         };
+        let all_targets_ge_256 = merges.iter().all(|&(_, _, tg)| tg >= 256);
         let targets = if linear_off == u32::MAX {
             merges.iter().map(|&(_, _, tg)| tg).collect()
         } else {
@@ -102,11 +109,9 @@ impl MergeMap {
         let mut dense = vec![DENSE_NONE; 1 << 16];
         let mut has_dense_overflow = false;
         let mut packed = if use_packed {
-            let mut v = vec![0u64; cap];
-            crate::chunk_table::advise_hugepage(v.as_mut_ptr() as *mut u8, cap * 8);
-            v
+            crate::chunk_table::HugeVec::<u64>::zeroed(cap)
         } else {
-            Vec::new()
+            crate::chunk_table::HugeVec::empty()
         };
         let mut entries = if use_packed {
             Vec::new()
@@ -188,6 +193,8 @@ impl MergeMap {
             bloom,
             bloom_shift,
             linear_off,
+            all_targets_ge_256,
+            vocab_n,
             targets,
         }
     }
@@ -195,7 +202,7 @@ impl MergeMap {
     /// Precompute direct raw-byte pair ranks (`dense_byte`) and per-byte `can_lr`
     /// flags for ByteLevel models so cold BPE reads straight from `&[u8]`.
     pub fn init_byte_tables(&mut self, singleton: &[i32; 256]) -> bool {
-        if self.packed.is_empty() || singleton.iter().any(|&t| t < 0) {
+        if self.packed.is_empty() || singleton.iter().any(|&t| t < 0 || (t as usize) >= self.vocab_n) {
             return false;
         }
         let mut db = vec![DENSE_NONE; 1 << 16];
@@ -271,6 +278,14 @@ impl MergeMap {
         (unsafe { *self.can_lr.get_unchecked(b) } >> (((t as usize) & 3) * 2)) & 3
     }
 
+    /// Bounds-check-free `lr_bits` for tokens guaranteed `< self.vocab_n`
+    /// (all merge targets and validated ByteLevel singletons).
+    #[inline(always)]
+    unsafe fn lr_bits_unchecked(&self, t: u32) -> u8 {
+        let b = (t as usize) >> 2;
+        (*self.can_lr.get_unchecked(b) >> (((t as usize) & 3) * 2)) & 3
+    }
+
     #[inline(always)]
     fn can_merge(&self, t1: u32, t2: u32) -> bool {
         let b1 = (t1 as usize) >> 2;
@@ -297,7 +312,18 @@ impl MergeMap {
 
     #[inline(always)]
     fn probe_packed_kh(&self, kh: u64, mut idx: usize) -> u32 {
+        // Probe 0 unrolled: merges are inserted in rank order so >95% of hot
+        // hits resolve at the home slot with zero loop/mask overhead.
+        let e0 = unsafe { *self.packed.get_unchecked(idx) };
+        let d0 = e0 ^ kh;
+        if d0.wrapping_sub(1) < (1u64 << PACK_RANK_BITS) - 1 {
+            return (d0 as u32) - 1;
+        }
+        if e0 == 0 {
+            return u32::MAX;
+        }
         loop {
+            idx = (idx + 1) & self.mask;
             // SAFETY: idx is masked to < packed.len().
             let e = unsafe { *self.packed.get_unchecked(idx) };
             let diff = e ^ kh;
@@ -307,7 +333,6 @@ impl MergeMap {
             if e == 0 {
                 return u32::MAX;
             }
-            idx = (idx + 1) & self.mask;
         }
     }
 
@@ -859,7 +884,7 @@ macro_rules! merge_bytes_ll_body {
             return;
         }
         let mut tok_buf = std::mem::MaybeUninit::<[u32; MAX_SMALL]>::uninit();
-        let mut lr_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL]>::uninit();
+        let mut lr_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL + 1]>::uninit();
         let tok = tok_buf.as_mut_ptr() as *mut u32;
         let lr = lr_buf.as_mut_ptr() as *mut u8;
         let blr = $map.byte_lr.as_ptr();
@@ -915,6 +940,10 @@ macro_rules! merge_bytes_ll_body {
             $out.set_len(base + n);
             return;
         }
+        // Sentinels: prev[0] == MAX_SMALL and next[last] == n both map to lr == 0,
+        // eliminating both boundary branches from `do_l` and `do_r` in the hot loop.
+        *lr.add(n) = 0;
+        *lr.add(MAX_SMALL) = 0;
         let mut prev_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL + 1]>::uninit();
         let mut next_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL]>::uninit();
         let prev = prev_buf.as_mut_ptr() as *mut u8;
@@ -930,54 +959,75 @@ macro_rules! merge_bytes_ll_body {
             std::ptr::copy_nonoverlapping(INIT_PREV.as_ptr(), prev, 64);
             std::ptr::copy_nonoverlapping(INIT_NEXT.as_ptr(), next, 64);
         }
+        let fast_target = $map.linear_off != u32::MAX && $map.all_targets_ge_256;
+        let lin_off = $map.linear_off;
         loop {
             let rank = best >> 6;
             let bi = (best & 63) as usize;
-            let merged = $map.target(rank);
+            let merged = if fast_target { rank.wrapping_add(lin_off) } else { $map.target(rank) };
             let r = *next.add(bi) as usize;
             let rr = *next.add(r) as usize;
             *tok.add(bi) = merged;
             *next.add(bi) = rr as u8;
             *prev.add(rr) = bi as u8;
-            if bi == 0 && rr == n {
+            // Single 99.99%-not-taken check (avoids 25%-mispredicted `bi == 0` branch).
+            if (bi | (rr ^ n)) == 0 {
                 break;
             }
             let l = *prev.add(bi) as usize;
             let lmask = if bi != 0 { 1u64 << l } else { 0 };
             active &= !((1u64 << r) | (1u64 << bi) | lmask);
-            let mlr = $map.lr_bits(merged);
+            let mlr = $map.lr_bits_unchecked(merged);
             *lr.add(bi) = mlr;
             if mlr != 0 {
-                let do_l = bi != 0 && (mlr & 2) != 0 && (*lr.add(l) & 1) != 0;
-                let do_r = rr < n && (mlr & 1) != 0 && (*lr.add(rr) & 2) != 0;
-                let (rl, rr_val) = if merged >= 256 {
-                    let mut idx_l = usize::MAX;
-                    let mut idx_r = usize::MAX;
-                    let mut kh_l = 0u64;
-                    let mut kh_r = 0u64;
-                    if do_l {
-                        kh_l = MergeMap::pack_key(*tok.add(l), merged);
+                // Sentinel lr[MAX_SMALL] == 0 (when bi == 0) and lr[n] == 0 (when rr == n).
+                let do_l = ((mlr >> 1) & *lr.add(l) & 1) != 0;
+                let do_r = (mlr & (*lr.add(rr) >> 1) & 1) != 0;
+                let (rl, rr_val) = if fast_target || merged >= 256 {
+                    if do_l && do_r {
+                        let kh_l = MergeMap::pack_key(*tok.add(l), merged);
+                        let kh_r = MergeMap::pack_key(merged, *tok.add(rr));
                         let hl = MergeMap::hash_packed(kh_l);
-                        if $map.bloom_may_contain(hl) {
-                            idx_l = (hl >> $map.shift) as usize;
-                        }
-                    }
-                    if do_r {
-                        kh_r = MergeMap::pack_key(merged, *tok.add(rr));
                         let hr = MergeMap::hash_packed(kh_r);
-                        if $map.bloom_may_contain(hr) {
-                            idx_r = (hr >> $map.shift) as usize;
+                        // Issue both L2 Bloom loads concurrently with zero intervening branch!
+                        let ok_l = $map.bloom_may_contain(hl);
+                        let ok_r = $map.bloom_may_contain(hr);
+                        let idx_l = (hl >> $map.shift) as usize;
+                        let idx_r = (hr >> $map.shift) as usize;
+                        if ok_l && ok_r {
+                            $map.prefetch_idx(idx_l);
+                            $map.prefetch_idx(idx_r);
+                            ($map.probe_packed_kh(kh_l, idx_l), $map.probe_packed_kh(kh_r, idx_r))
+                        } else {
+                            (
+                                if ok_l { $map.probe_packed_kh(kh_l, idx_l) } else { u32::MAX },
+                                if ok_r { $map.probe_packed_kh(kh_r, idx_r) } else { u32::MAX },
+                            )
                         }
-                    }
-                    if idx_l != usize::MAX && idx_r != usize::MAX {
-                        $map.prefetch_idx(idx_l);
-                        $map.prefetch_idx(idx_r);
-                        ($map.probe_packed_kh(kh_l, idx_l), $map.probe_packed_kh(kh_r, idx_r))
-                    } else {
+                    } else if do_l {
+                        let kh_l = MergeMap::pack_key(*tok.add(l), merged);
+                        let hl = MergeMap::hash_packed(kh_l);
                         (
-                            if idx_l != usize::MAX { $map.probe_packed_kh(kh_l, idx_l) } else { u32::MAX },
-                            if idx_r != usize::MAX { $map.probe_packed_kh(kh_r, idx_r) } else { u32::MAX },
+                            if $map.bloom_may_contain(hl) {
+                                $map.probe_packed_kh(kh_l, (hl >> $map.shift) as usize)
+                            } else {
+                                u32::MAX
+                            },
+                            u32::MAX,
                         )
+                    } else if do_r {
+                        let kh_r = MergeMap::pack_key(merged, *tok.add(rr));
+                        let hr = MergeMap::hash_packed(kh_r);
+                        (
+                            u32::MAX,
+                            if $map.bloom_may_contain(hr) {
+                                $map.probe_packed_kh(kh_r, (hr >> $map.shift) as usize)
+                            } else {
+                                u32::MAX
+                            },
+                        )
+                    } else {
+                        (u32::MAX, u32::MAX)
                     }
                 } else {
                     (

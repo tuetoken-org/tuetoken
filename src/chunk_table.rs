@@ -36,7 +36,7 @@ pub static DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 
 pub struct ChunkTable {
-    entries: Vec<Entry>,
+    entries: HugeVec<Entry>,
     shift: u32,
     mask: usize,
 }
@@ -139,7 +139,7 @@ pub fn hash(lo: u64, hi: u64) -> u64 {
 
 impl ChunkTable {
     pub fn empty() -> Self {
-        ChunkTable { entries: vec![Entry::default(); 2], shift: 63, mask: 1 }
+        ChunkTable { entries: HugeVec::zeroed(2), shift: 63, mask: 1 }
     }
 
     /// Build from verified (key bytes, token) pairs. Duplicate keys keep the first.
@@ -157,7 +157,7 @@ impl ChunkTable {
         }
         let bits = cap.trailing_zeros();
         let mut t = ChunkTable {
-            entries: vec![Entry::default(); cap],
+            entries: HugeVec::zeroed(cap),
             shift: 64 - bits,
             mask: cap - 1,
         };
@@ -250,6 +250,80 @@ unsafe fn alloc_zeroed_huge(layout: std::alloc::Layout) -> *mut u8 {
     }
     advise_hugepage(ptr, layout.size());
     ptr
+}
+
+/// Owned contiguous buffer for `Copy` elements that aligns `>= 2 MiB`
+/// allocations to 2 MiB on Linux and issues `MADV_HUGEPAGE` *before* first
+/// touch, backing long-lived random-access hash tables (`ChunkTable`,
+/// `MergeMap::packed`) with genuine 2 MiB Transparent Huge Pages.
+/// On non-Linux targets uses normal 64B-aligned heap allocation.
+pub struct HugeVec<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+
+unsafe impl<T: Copy + Send> Send for HugeVec<T> {}
+unsafe impl<T: Copy + Sync> Sync for HugeVec<T> {}
+
+impl<T: Copy> HugeVec<T> {
+    #[inline]
+    fn layout(cap: usize) -> std::alloc::Layout {
+        let sz = std::mem::size_of::<T>();
+        assert!(sz > 0, "HugeVec does not support ZSTs");
+        let bytes = cap.checked_mul(sz).expect("HugeVec size overflow");
+        #[cfg(target_os = "linux")]
+        let align = if bytes >= (2 << 20) {
+            2 << 20
+        } else {
+            std::mem::align_of::<T>().max(64)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let align = std::mem::align_of::<T>().max(64);
+        std::alloc::Layout::from_size_align(bytes, align).expect("HugeVec layout")
+    }
+
+    #[inline]
+    pub fn empty() -> Self {
+        HugeVec { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0, cap: 0 }
+    }
+
+    /// Allocate `len` all-zero elements (with Linux 2 MiB THP before zeroing).
+    #[inline]
+    pub fn zeroed(len: usize) -> Self {
+        if len == 0 {
+            return Self::empty();
+        }
+        let layout = Self::layout(len);
+        // SAFETY: caller guarantees all-zero bit pattern is valid for `T`.
+        let ptr = unsafe { alloc_zeroed_huge(layout) } as *mut T;
+        HugeVec { ptr, len, cap: len }
+    }
+}
+
+impl<T: Copy> std::ops::Deref for HugeVec<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        // SAFETY: ptr is non-null & aligned (dangling when cap == 0); [0..len) initialized.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T: Copy> std::ops::DerefMut for HugeVec<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<T: Copy> Drop for HugeVec<T> {
+    fn drop(&mut self) {
+        if self.cap != 0 {
+            // SAFETY: allocated with Self::layout(self.cap).
+            unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.cap)) };
+        }
+    }
 }
 
 /// Per-thread 2-way set-associative cache for the chunks the static table can't
