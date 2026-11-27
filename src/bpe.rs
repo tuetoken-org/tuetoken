@@ -518,7 +518,7 @@ impl MergeMap {
     /// + `vpandq` + `vpcmpeqq` + `vpcompressq` extracts the matching rank in
     /// registers with 1 branch across all 8 slots and zero wrap masking.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,bmi1")]
+    #[target_feature(enable = "avx512f,bmi1,bmi2")]
     #[inline]
     unsafe fn probe_bucket_avx512(&self, kh: u64, b: usize) -> u32 {
         use std::arch::x86_64::*;
@@ -543,7 +543,7 @@ impl MergeMap {
     /// x86_64 AVX2 8-wide branchless 64B-bucket probe: 2 aligned 32B loads +
     /// register OR-reduce with 1 branch across all 8 slots and zero wrap masking.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,bmi1")]
+    #[target_feature(enable = "avx2,bmi1,bmi2")]
     #[inline]
     unsafe fn probe_bucket_avx2(&self, kh: u64, b: usize) -> u32 {
         use std::arch::x86_64::*;
@@ -606,13 +606,12 @@ impl MergeMap {
         }
     }
 
+    /// Branch-free bucket prefetch for callers guaranteed `!self.buckets.is_empty()`.
     #[inline(always)]
-    fn prefetch_bucket(&self, b: usize) {
-        if !self.buckets.is_empty() {
-            // SAFETY: b < buckets.len() (computed via hash_packed >> bshift).
-            let p = unsafe { self.buckets.as_ptr().add(b) as *const u8 };
-            crate::chunk_table::prefetch(p);
-        }
+    unsafe fn prefetch_bucket_packed(&self, b: usize) {
+        debug_assert!(!self.buckets.is_empty());
+        let p = self.buckets.as_ptr().add(b) as *const u8;
+        crate::chunk_table::prefetch(p);
     }
 
     #[cold]
@@ -659,6 +658,213 @@ impl MergeMap {
             (u32::MAX, 0)
         } else {
             (r, self.target(r))
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,bmi1,bmi2")]
+    unsafe fn verify_self_enc_avx512(
+        &self,
+        byte_arena: &[u8],
+        byte_span: &[(u32, u32)],
+        prod: &[(u32, u32, u32)],
+        start: usize,
+        out: &mut [bool],
+    ) {
+        self.verify_self_enc_inner(byte_arena, byte_span, prod, start, out, |kh, b| {
+            self.probe_bucket_avx512(kh, b)
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2")]
+    unsafe fn verify_self_enc_avx2(
+        &self,
+        byte_arena: &[u8],
+        byte_span: &[(u32, u32)],
+        prod: &[(u32, u32, u32)],
+        start: usize,
+        out: &mut [bool],
+    ) {
+        self.verify_self_enc_inner(byte_arena, byte_span, prod, start, out, |kh, b| {
+            self.probe_bucket_avx2(kh, b)
+        });
+    }
+
+    #[inline(always)]
+    fn verify_self_enc_inner(
+        &self,
+        byte_arena: &[u8],
+        byte_span: &[(u32, u32)],
+        prod: &[(u32, u32, u32)],
+        start: usize,
+        out: &mut [bool],
+        probe: impl Fn(u64, usize) -> u32,
+    ) {
+        const LEAF: u32 = u32::MAX;
+        const AMBIG: u32 = u32::MAX - 1;
+        let packed = !self.buckets.is_empty();
+        let lookup_fast = |t1: u32, t2: u32| -> u32 {
+            if (t1 | t2) < DENSE_N {
+                return unsafe { self.lookup_dense(t1, t2) };
+            } else if !self.can_merge(t1, t2) {
+                return u32::MAX;
+            }
+            if packed {
+                let kh = Self::pack_key(t1, t2);
+                let h = Self::hash_packed(kh);
+                let b = self.bucket_of(t1, t2, h);
+                if !self.bloom_may_contain_b(h, b) {
+                    return u32::MAX;
+                }
+                return probe(kh, b);
+            }
+            let h = Self::hash_key(Self::key(t1, t2));
+            if !self.bloom_may_contain(h) {
+                return u32::MAX;
+            }
+            self.probe_table(t1, t2, (h >> self.shift) as usize)
+        };
+        for (off, dst) in out.iter_mut().enumerate() {
+            let tg = (start + off) as u32;
+            let (t1, t2, r) = prod[tg as usize];
+            if r >= AMBIG {
+                *dst = false;
+                continue;
+            }
+            let (o1, l1) = byte_span[t1 as usize];
+            let (o2, l2) = byte_span[t2 as usize];
+            let (og, lg) = byte_span[tg as usize];
+            if l1 == 0 || l2 == 0 || l1 + l2 != lg || (lg as usize) > crate::chunk_table::MAX_KEY {
+                *dst = false;
+                continue;
+            }
+            if byte_arena[o1 as usize..(o1 + l1) as usize]
+                != byte_arena[og as usize..(og + l1) as usize]
+                || byte_arena[o2 as usize..(o2 + l2) as usize]
+                    != byte_arena[(og + l1) as usize..(og + lg) as usize]
+            {
+                *dst = false;
+                continue;
+            }
+            let root_r = lookup_fast(t1, t2);
+            if root_r != r || self.target(root_r) != tg {
+                *dst = false;
+                continue;
+            }
+            let mut u_tok = [0u32; 16];
+            let mut u_nxt = [0u32; 16];
+            let mut nu = 0usize;
+            let mut cur = t1;
+            let mut nxt_r = r;
+            let mut ok = true;
+            loop {
+                if nu >= 16 {
+                    ok = false;
+                    break;
+                }
+                u_tok[nu] = cur;
+                u_nxt[nu] = nxt_r;
+                nu += 1;
+                let (_, rc, cr) = prod[cur as usize];
+                if cr == LEAF {
+                    break;
+                }
+                if cr == AMBIG || cr >= nxt_r {
+                    ok = false;
+                    break;
+                }
+                cur = rc;
+                nxt_r = cr;
+            }
+            if !ok {
+                *dst = false;
+                continue;
+            }
+            let mut v_tok = [0u32; 16];
+            let mut v_nxt = [0u32; 16];
+            let mut nv = 0usize;
+            let mut cur = t2;
+            let mut nxt_r = r;
+            loop {
+                if nv >= 16 {
+                    ok = false;
+                    break;
+                }
+                v_tok[nv] = cur;
+                v_nxt[nv] = nxt_r;
+                nv += 1;
+                let (lc, _, cr) = prod[cur as usize];
+                if cr == LEAF {
+                    break;
+                }
+                if cr == AMBIG || cr >= nxt_r {
+                    ok = false;
+                    break;
+                }
+                cur = lc;
+                nxt_r = cr;
+            }
+            if !ok {
+                *dst = false;
+                continue;
+            }
+            let mut i = nu - 1;
+            let mut j = nv - 1;
+            while (i | j) != 0 {
+                let lu = u_nxt[i];
+                let rv = v_nxt[j];
+                let mr = lookup_fast(u_tok[i], v_tok[j]);
+                if lu <= rv {
+                    if mr < lu {
+                        ok = false;
+                        break;
+                    }
+                    i -= 1;
+                } else {
+                    if mr <= rv {
+                        ok = false;
+                        break;
+                    }
+                    j -= 1;
+                }
+            }
+            *dst = ok;
+        }
+    }
+
+    /// Target-feature-specialized batch DAG self-encoding verifier for `build_chunk_table`:
+    /// verifies tokens `start..start+out.len()` in one SIMD-dispatched loop (eliminating
+    /// ~740K per-probe runtime `bpe_x86_tier()` dispatches and out-of-line bucket calls).
+    pub fn verify_self_enc_range(
+        &self,
+        byte_arena: &[u8],
+        byte_span: &[(u32, u32)],
+        prod: &[(u32, u32, u32)],
+        start: usize,
+        out: &mut [bool],
+    ) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.verify_self_enc_inner(byte_arena, byte_span, prod, start, out, |kh, b| unsafe {
+                self.probe_bucket_neon(kh, b)
+            });
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            match bpe_x86_tier() {
+                3 => unsafe { self.verify_self_enc_avx512(byte_arena, byte_span, prod, start, out) },
+                2 => unsafe { self.verify_self_enc_avx2(byte_arena, byte_span, prod, start, out) },
+                _ => self.verify_self_enc_inner(byte_arena, byte_span, prod, start, out, |kh, b| {
+                    self.probe_bucket_scalar(kh, b)
+                }),
+            }
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            self.verify_self_enc_inner(byte_arena, byte_span, prod, start, out, |kh, b| {
+                self.probe_bucket_scalar(kh, b)
+            });
         }
     }
 }
@@ -834,9 +1040,15 @@ fn bpe_x86_tier() -> u8 {
     if t != 0 {
         return t;
     }
-    let detected = if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("bmi1") {
+    let detected = if std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("bmi1")
+        && std::is_x86_feature_detected!("bmi2")
+    {
         3
-    } else if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi1") {
+    } else if std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("bmi1")
+        && std::is_x86_feature_detected!("bmi2")
+    {
         2
     } else if std::is_x86_feature_detected!("bmi1") {
         1
@@ -941,8 +1153,9 @@ macro_rules! merge_small_ll_body {
                 break;
             }
             let l = *prev.add(bi) as usize;
-            let lmask = if bi != 0 { 1u64 << l } else { 0 };
-            active &= !((1u64 << r) | (1u64 << bi) | lmask);
+            // When bi == 0, prev[0] == MAX_SMALL == 64; wrapping_shl(64) == 1 << 0 == 1 << bi,
+            // which is already cleared (becomes 3 parallel BMI2 `shlx` with zero cmove).
+            active &= !((1u64 << r) | (1u64 << bi) | 1u64.wrapping_shl(l as u32));
             let mlr = $map.lr_bits(merged);
             if mlr != 0 {
                 let do_l = bi != 0 && (mlr & 2) != 0 && ($map.lr_bits(*tok.add(l)) & 1) != 0;
@@ -971,8 +1184,8 @@ macro_rules! merge_small_ll_body {
                         }
                     }
                     if idx_l != usize::MAX && idx_r != usize::MAX {
-                        $map.prefetch_bucket(idx_l);
-                        $map.prefetch_bucket(idx_r);
+                        $map.prefetch_bucket_packed(idx_l);
+                        $map.prefetch_bucket_packed(idx_r);
                         ($map.$probe(kh_l, idx_l), $map.$probe(kh_r, idx_r))
                     } else {
                         (
@@ -1018,13 +1231,13 @@ macro_rules! merge_small_ll_body {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,bmi1")]
+#[target_feature(enable = "avx512f,bmi1,bmi2")]
 unsafe fn merge_small_ll_avx512(tokens: &mut Vec<u32>, map: &MergeMap) {
     merge_small_ll_body!(tokens, map, probe_bucket_avx512)
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi1")]
+#[target_feature(enable = "avx2,bmi1,bmi2")]
 unsafe fn merge_small_ll_avx2(tokens: &mut Vec<u32>, map: &MergeMap) {
     merge_small_ll_body!(tokens, map, probe_bucket_avx2)
 }
@@ -1256,8 +1469,9 @@ macro_rules! merge_bytes_ll_body {
                 break;
             }
             let l = *prev.add(bi) as usize;
-            let lmask = if bi != 0 { 1u64 << l } else { 0 };
-            active &= !((1u64 << r) | (1u64 << bi) | lmask);
+            // When bi == 0, prev[0] == MAX_SMALL == 64; wrapping_shl(64) == 1 << 0 == 1 << bi,
+            // which is already cleared (becomes 3 parallel BMI2 `shlx` with zero cmove).
+            active &= !((1u64 << r) | (1u64 << bi) | 1u64.wrapping_shl(l as u32));
             let mlr = $map.lr_bits_unchecked(merged);
             *lr.add(bi) = mlr;
             let (rl, rr_val) = if mlr != 0 {
@@ -1274,7 +1488,7 @@ macro_rules! merge_bytes_ll_body {
                         let kh_r = MergeMap::pack_key(merged, tr);
                         let hr = MergeMap::hash_packed(kh_r);
                         let b_r = $map.bucket_of(merged, tr, hr);
-                        $map.prefetch_bucket(b_r);
+                        $map.prefetch_bucket_packed(b_r);
                         let rl = $map.lookup_dense(tl, merged);
                         let rr_v = if $map.bloom_may_contain_b(hr, b_r) {
                             $map.$probe(kh_r, b_r)
@@ -1286,7 +1500,7 @@ macro_rules! merge_bytes_ll_body {
                         let kh_l = MergeMap::pack_key(tl, merged);
                         let hl = MergeMap::hash_packed(kh_l);
                         let b_l = $map.bucket_of(tl, merged, hl);
-                        $map.prefetch_bucket(b_l);
+                        $map.prefetch_bucket_packed(b_l);
                         let rr_v = $map.lookup_dense(merged, tr);
                         let rl = if $map.bloom_may_contain_b(hl, b_l) {
                             $map.$probe(kh_l, b_l)
@@ -1301,8 +1515,8 @@ macro_rules! merge_bytes_ll_body {
                         let hr = MergeMap::hash_packed(kh_r);
                         let b_l = $map.bucket_of(tl, merged, hl);
                         let b_r = $map.bucket_of(merged, tr, hr);
-                        $map.prefetch_bucket(b_l);
-                        $map.prefetch_bucket(b_r);
+                        $map.prefetch_bucket_packed(b_l);
+                        $map.prefetch_bucket_packed(b_r);
                         let bp = $map.bloom.as_ptr();
                         let wl = *bp.add(b_l);
                         let wr = *bp.add(b_r);
@@ -1321,7 +1535,7 @@ macro_rules! merge_bytes_ll_body {
                         let kh_l = MergeMap::pack_key(tl, merged);
                         let hl = MergeMap::hash_packed(kh_l);
                         let b_l = $map.bucket_of(tl, merged, hl);
-                        $map.prefetch_bucket(b_l);
+                        $map.prefetch_bucket_packed(b_l);
                         if $map.bloom_may_contain_b(hl, b_l) {
                             $map.$probe(kh_l, b_l)
                         } else {
@@ -1337,7 +1551,7 @@ macro_rules! merge_bytes_ll_body {
                         let kh_r = MergeMap::pack_key(merged, tr);
                         let hr = MergeMap::hash_packed(kh_r);
                         let b_r = $map.bucket_of(merged, tr, hr);
-                        $map.prefetch_bucket(b_r);
+                        $map.prefetch_bucket_packed(b_r);
                         if $map.bloom_may_contain_b(hr, b_r) {
                             $map.$probe(kh_r, b_r)
                         } else {
@@ -1412,13 +1626,13 @@ macro_rules! merge_bytes_ll_body {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,bmi1")]
+#[target_feature(enable = "avx512f,bmi1,bmi2")]
 unsafe fn merge_bytes_ll_avx512(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
     merge_bytes_ll_body!(chunk, singleton, map, out, probe_bucket_avx512)
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi1")]
+#[target_feature(enable = "avx2,bmi1,bmi2")]
 unsafe fn merge_bytes_ll_avx2(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
     merge_bytes_ll_body!(chunk, singleton, map, out, probe_bucket_avx2)
 }

@@ -1088,7 +1088,10 @@ fn has_avx2_bmi1() -> bool {
     static T: AtomicU8 = AtomicU8::new(0);
     let mut v = T.load(Relaxed);
     if v == 0 {
-        v = if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi1") {
+        v = if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+        {
             2
         } else {
             1
@@ -2364,105 +2367,23 @@ impl Tokenizer {
                     }
                 }
             }
-            let prod_ref = &prod;
-            let verify_merge = |tg: u32| -> bool {
-                let (t1, t2, r) = prod_ref[tg as usize];
-                if r >= AMBIG {
-                    return false;
-                }
-                let (o1, l1) = this.byte_span[t1 as usize];
-                let (o2, l2) = this.byte_span[t2 as usize];
-                let (og, lg) = this.byte_span[tg as usize];
-                if l1 == 0 || l2 == 0 || l1 + l2 != lg || (lg as usize) > chunk_table::MAX_KEY {
-                    return false;
-                }
-                let a = &this.byte_arena;
-                if a[o1 as usize..(o1 + l1) as usize] != a[og as usize..(og + l1) as usize]
-                    || a[o2 as usize..(o2 + l2) as usize]
-                        != a[(og + l1) as usize..(og + lg) as usize]
-                {
-                    return false;
-                }
-                let root_r = this.map.lookup_rank(t1, t2);
-                if root_r != r || this.map.target(root_r) != tg {
-                    return false;
-                }
-                // Collect right spine of t1 and left spine of t2 top-down (depth <= 15).
-                let mut u_tok = [0u32; 16];
-                let mut u_nxt = [0u32; 16];
-                let mut nu = 0usize;
-                let mut cur = t1;
-                let mut nxt_r = r;
-                loop {
-                    if nu >= 16 {
-                        return false;
-                    }
-                    u_tok[nu] = cur;
-                    u_nxt[nu] = nxt_r;
-                    nu += 1;
-                    let (_, rc, cr) = prod_ref[cur as usize];
-                    if cr == LEAF {
-                        break;
-                    }
-                    if cr == AMBIG || cr >= nxt_r {
-                        return false;
-                    }
-                    cur = rc;
-                    nxt_r = cr;
-                }
-                let mut v_tok = [0u32; 16];
-                let mut v_nxt = [0u32; 16];
-                let mut nv = 0usize;
-                let mut cur = t2;
-                let mut nxt_r = r;
-                loop {
-                    if nv >= 16 {
-                        return false;
-                    }
-                    v_tok[nv] = cur;
-                    v_nxt[nv] = nxt_r;
-                    nv += 1;
-                    let (lc, _, cr) = prod_ref[cur as usize];
-                    if cr == LEAF {
-                        break;
-                    }
-                    if cr == AMBIG || cr >= nxt_r {
-                        return false;
-                    }
-                    cur = lc;
-                    nxt_r = cr;
-                }
-                // Walk boundary bottom-up in exact canonical rank order (leftmost wins ties).
-                let mut i = nu - 1;
-                let mut j = nv - 1;
-                while (i | j) != 0 {
-                    let lu = u_nxt[i];
-                    let rv = v_nxt[j];
-                    let mr = this.map.lookup_rank(u_tok[i], v_tok[j]);
-                    if lu <= rv {
-                        if mr < lu {
-                            return false;
-                        }
-                        i -= 1;
-                    } else {
-                        if mr <= rv {
-                            return false;
-                        }
-                        j -= 1;
-                    }
-                }
-                true
-            };
-
-            let local_ok: Vec<bool> = if parallel_ok() {
-                (0..n_vocab as u32)
-                    .into_par_iter()
-                    .with_min_len(1024)
-                    .map(verify_merge)
-                    .collect()
+            let mut local_ok = vec![false; n_vocab];
+            if parallel_ok() {
+                local_ok
+                    .par_chunks_mut(2048)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        this.map.verify_self_enc_range(
+                            &this.byte_arena,
+                            &this.byte_span,
+                            &prod,
+                            ci * 2048,
+                            chunk,
+                        );
+                    });
             } else {
-                (0..n_vocab as u32).map(verify_merge).collect()
-            };
+                this.map.verify_self_enc_range(&this.byte_arena, &this.byte_span, &prod, 0, &mut local_ok);
+            }
 
             // Topological propagation in ascending merge-rank order (valid by `monotonic`).
             let mut self_enc = vec![false; n_vocab];
@@ -2891,46 +2812,17 @@ impl Tokenizer {
         }
     }
 
-    /// Phase 1 records for chunk ends `ends[lo..hi]` (the first chunk starts at
-    /// `a`): key, home-slot address (prefetched) per chunk; returns the last
-    /// end. Straight-line wide loads for `<= 15B` chunks; `16..=31B` chunks
-    /// prefetch their `SharedLongTable` 64B slot out-of-line.
+    /// Cold tail loop of `fill_recs` for the last 16 bytes of a document.
     #[inline(never)]
-    fn fill_recs(
+    fn fill_recs_tail(
         bytes: &[u8],
         ends: &[u32],
-        lo: usize,
-        hi: usize,
         mut a: usize,
-        bufp: *mut std::mem::MaybeUninit<PipeRec>,
+        mut out: *mut std::mem::MaybeUninit<PipeRec>,
         view: chunk_table::View<'_, 3>,
         lview: chunk_table::LongView<'_>,
     ) -> usize {
-        let n = bytes.len();
-        let bp = bytes.as_ptr();
-        let mut j = hi;
-        while j > lo && ends[j - 1] as usize + 16 > n {
-            j -= 1;
-        }
-        let mut out = unsafe { bufp.add(lo) };
-        for &e_u32 in &ends[lo..j] {
-            let e = e_u32 as usize;
-            let len = e - a;
-            if len.wrapping_sub(1) < chunk_table::MAX_KEY {
-                // SAFETY: a < e <= ends[j - 1] and ends[j - 1] + 16 <= n, 1 <= len <= MAX_KEY.
-                let (klo, khi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
-                let p = view.slot_addr(chunk_table::hash(klo, khi));
-                chunk_table::prefetch(p as *const u8);
-                // SAFETY: callers' buffers hold CAP + SCAN_SLACK >= hi records.
-                unsafe { (*out).write(PipeRec { lo: klo, hi: khi, p }) };
-            } else {
-                let v = Self::fill_rec_long(bytes, a, len, lview);
-                unsafe { (*out).write(v) };
-            }
-            out = unsafe { out.add(1) };
-            a = e;
-        }
-        for &e_u32 in &ends[j..hi] {
+        for &e_u32 in ends {
             let e = e_u32 as usize;
             let len = e - a;
             let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY {
@@ -2941,10 +2833,108 @@ impl Tokenizer {
             } else {
                 Self::fill_rec_long(bytes, a, len, lview)
             };
-            // SAFETY: as above.
             unsafe { (*out).write(v) };
             out = unsafe { out.add(1) };
             a = e;
+        }
+        a
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "bmi2")]
+    unsafe fn fill_recs_bmi2(
+        bytes: &[u8],
+        ends: &[u32],
+        mut a: usize,
+        mut out: *mut std::mem::MaybeUninit<PipeRec>,
+        view: chunk_table::View<'_, 3>,
+        lview: chunk_table::LongView<'_>,
+    ) -> usize {
+        let n = bytes.len();
+        let bp = bytes.as_ptr();
+        let mut j = ends.len();
+        while j > 0 && *ends.get_unchecked(j - 1) as usize + 16 > n {
+            j -= 1;
+        }
+        for &e_u32 in ends.get_unchecked(..j) {
+            let e = e_u32 as usize;
+            let len = e - a;
+            if len.wrapping_sub(1) < chunk_table::MAX_KEY {
+                let (klo, khi) = chunk_table::pack_wide(bp.add(a), len);
+                let p = view.slot_addr(chunk_table::hash(klo, khi));
+                chunk_table::prefetch(p as *const u8);
+                (*out).write(PipeRec { lo: klo, hi: khi, p });
+            } else {
+                let v = Self::fill_rec_long(bytes, a, len, lview);
+                (*out).write(v);
+            }
+            out = out.add(1);
+            a = e;
+        }
+        if j < ends.len() {
+            return Self::fill_recs_tail(bytes, ends.get_unchecked(j..), a, out, view, lview);
+        }
+        a
+    }
+
+    /// Phase 1 records for chunk ends `ends[lo..hi]` (the first chunk starts at
+    /// `a`): key, home-slot address (prefetched) per chunk; returns the last
+    /// end. Straight-line wide loads for `<= 15B` chunks; `16..=31B` chunks
+    /// prefetch their `SharedLongTable` 64B slot out-of-line.
+    #[inline(always)]
+    fn fill_recs(
+        bytes: &[u8],
+        ends: &[u32],
+        lo: usize,
+        hi: usize,
+        a: usize,
+        bufp: *mut std::mem::MaybeUninit<PipeRec>,
+        view: chunk_table::View<'_, 3>,
+        lview: chunk_table::LongView<'_>,
+    ) -> usize {
+        let sl = &ends[lo..hi];
+        let out = unsafe { bufp.add(lo) };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if has_avx2_bmi1() {
+                return unsafe { Self::fill_recs_bmi2(bytes, sl, a, out, view, lview) };
+            }
+        }
+        Self::fill_recs_generic(bytes, sl, a, out, view, lview)
+    }
+
+    #[inline(never)]
+    fn fill_recs_generic(
+        bytes: &[u8],
+        ends: &[u32],
+        mut a: usize,
+        mut out: *mut std::mem::MaybeUninit<PipeRec>,
+        view: chunk_table::View<'_, 3>,
+        lview: chunk_table::LongView<'_>,
+    ) -> usize {
+        let n = bytes.len();
+        let bp = bytes.as_ptr();
+        let mut j = ends.len();
+        while j > 0 && ends[j - 1] as usize + 16 > n {
+            j -= 1;
+        }
+        for &e_u32 in &ends[..j] {
+            let e = e_u32 as usize;
+            let len = e - a;
+            if len.wrapping_sub(1) < chunk_table::MAX_KEY {
+                let (klo, khi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
+                let p = view.slot_addr(chunk_table::hash(klo, khi));
+                chunk_table::prefetch(p as *const u8);
+                unsafe { (*out).write(PipeRec { lo: klo, hi: khi, p }) };
+            } else {
+                let v = Self::fill_rec_long(bytes, a, len, lview);
+                unsafe { (*out).write(v) };
+            }
+            out = unsafe { out.add(1) };
+            a = e;
+        }
+        if j < ends.len() {
+            return Self::fill_recs_tail(bytes, &ends[j..], a, out, view, lview);
         }
         a
     }
@@ -3761,9 +3751,12 @@ impl Tokenizer {
         match unsafe { lview.get_into_at(k, addr, &mut s.out) } {
             chunk_table::LongHit::Hit => return,
             chunk_table::LongHit::Empty => {
-                // If `long_table` grew during this batch, re-check current table before merging.
-                if let chunk_table::LongHit::Hit = self.long_table.get_into(k, h, &mut s.out) {
-                    return;
+                // Only re-check current table if `long_table` grew during this 256-chunk batch
+                // (avoids a redundant L3/DRAM probe on 99.99% of cold 16..=31B chunks).
+                if !lview.is_current(&self.long_table) {
+                    if let chunk_table::LongHit::Hit = self.long_table.get_into(k, h, &mut s.out) {
+                        return;
+                    }
                 }
                 let key = &bytes[pos..end];
                 let st = s.out.len();

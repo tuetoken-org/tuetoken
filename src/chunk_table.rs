@@ -1830,6 +1830,14 @@ impl LongView<'_> {
         !self.base.is_null()
     }
 
+    /// True iff `table` has not grown since this `LongView` was captured (1 L1 load +
+    /// pointer compare), letting `emit_long_at` skip a redundant second probe on cold misses.
+    #[inline(always)]
+    pub fn is_current(&self, table: &SharedLongTable) -> bool {
+        let cur = table.cur.load(Ordering::Acquire);
+        !cur.is_null() && std::ptr::eq(self.base, unsafe { (*cur).ptr as *const LSlot })
+    }
+
     /// Address of the home 64-byte `LSlot` for hash `h`.
     #[inline(always)]
     pub fn slot_addr(&self, h: u64) -> u64 {
