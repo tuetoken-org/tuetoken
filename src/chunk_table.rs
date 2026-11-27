@@ -29,6 +29,7 @@ struct Entry {
 }
 
 pub const MAX_KEY: usize = 15;
+pub const PACK20_MAX_TOK: u32 = (1 << 20) - 1;
 
 #[cfg(test)]
 pub static DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -203,6 +204,29 @@ impl ChunkTable {
             i = (i + 1) & self.mask;
         }
     }
+}
+
+/// Hint Linux to back large (>= 2 MiB) random-access tables and output buffers
+/// with 2 MiB Transparent Huge Pages (when THP is `[madvise]`, the Ubuntu/Linux
+/// server default). Eliminates 4-level dTLB page-table walks on 16-128 MiB
+/// `SharedTable` random probes and cuts 50,000 x 4 KiB output page faults down
+/// to ~100 x 2 MiB faults. Safe no-op on non-Linux or unsupported kernels.
+#[inline]
+pub fn advise_hugepage(ptr: *mut u8, bytes: usize) {
+    #[cfg(target_os = "linux")]
+    if bytes >= (2 << 20) && !ptr.is_null() {
+        const MADV_HUGEPAGE: i32 = 14;
+        extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+        }
+        let p = (ptr as usize) & !4095usize;
+        let len = (ptr as usize + bytes) - p;
+        unsafe {
+            let _ = madvise(p as *mut std::ffi::c_void, len, MADV_HUGEPAGE);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (ptr, bytes);
 }
 
 /// Per-thread 2-way set-associative cache for the chunks the static table can't
@@ -429,17 +453,131 @@ mod tests {
     }
 }
 
+/// Zero-malloc open-addressing byte-slice -> u32-slice arena table powering
+/// both `LongCache` and every `SpillMap` shard. Replaces per-entry
+/// `Box<[u8]>` + `Box<[u32]>` heap allocations with two contiguous arenas.
+#[derive(Clone, Copy, Default)]
+struct ArenaSlot {
+    hash: u64, // 0 = empty; real hashes OR'd with 1
+    k_off: u32,
+    t_off: u32,
+    k_len: u16,
+    t_len: u16,
+}
+
+#[derive(Default)]
+struct ArenaMap {
+    slots: Vec<ArenaSlot>,
+    mask: usize,
+    len: usize,
+    keys: Vec<u8>,
+    toks: Vec<u32>,
+}
+
+#[inline(always)]
+pub fn hash_bytes(key: &[u8]) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = rustc_hash::FxBuildHasher.build_hasher();
+    key.hash(&mut h);
+    h.finish() | 1
+}
+
+impl ArenaMap {
+    fn clear(&mut self) {
+        for s in &mut self.slots {
+            s.hash = 0;
+        }
+        self.len = 0;
+        self.keys.clear();
+        self.toks.clear();
+    }
+
+    #[inline]
+    fn get_h(&self, key: &[u8], h: u64) -> Option<&[u32]> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s.hash == 0 {
+                return None;
+            }
+            if s.hash == h && s.k_len as usize == key.len() {
+                let ko = s.k_off as usize;
+                if unsafe { self.keys.get_unchecked(ko..ko + s.k_len as usize) } == key {
+                    let to = s.t_off as usize;
+                    return Some(unsafe { self.toks.get_unchecked(to..to + s.t_len as usize) });
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let new_cap = (self.slots.len() * 2).max(64);
+        let new_mask = new_cap - 1;
+        let mut ns = vec![ArenaSlot::default(); new_cap];
+        for &s in &self.slots {
+            if s.hash != 0 {
+                let mut i = (s.hash as usize) & new_mask;
+                while ns[i].hash != 0 {
+                    i = (i + 1) & new_mask;
+                }
+                ns[i] = s;
+            }
+        }
+        self.slots = ns;
+        self.mask = new_mask;
+    }
+
+    /// Insert if absent; returns true if newly inserted.
+    #[inline]
+    fn insert_h(&mut self, key: &[u8], h: u64, toks: &[u32]) -> bool {
+        if key.len() > u16::MAX as usize || toks.len() > u16::MAX as usize {
+            return false;
+        }
+        if self.keys.len() + key.len() > u32::MAX as usize || self.toks.len() + toks.len() > u32::MAX as usize {
+            return false;
+        }
+        if self.slots.is_empty() || (self.len + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let s = self.slots[i];
+            if s.hash == 0 {
+                let k_off = self.keys.len() as u32;
+                let t_off = self.toks.len() as u32;
+                self.keys.extend_from_slice(key);
+                self.toks.extend_from_slice(toks);
+                self.slots[i] = ArenaSlot {
+                    hash: h,
+                    k_off,
+                    t_off,
+                    k_len: key.len() as u16,
+                    t_len: toks.len() as u16,
+                };
+                self.len += 1;
+                return true;
+            }
+            if s.hash == h && s.k_len as usize == key.len() {
+                let ko = s.k_off as usize;
+                if &self.keys[ko..ko + s.k_len as usize] == key {
+                    return false;
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 /// Per-thread exact cache for chunks LONGER than `MAX_KEY` bytes (long words,
-/// identifiers, punctuation runs): ~0.1% of chunks, but each costs a full merge
-/// of hundreds of ns. Keyed by the chunk bytes (exact compare); results live in
-/// an arena. One small map per tokenizer (the 4 most recently used), so a thread
-/// alternating between models keeps them all warm. Bounded per map; a full map
-/// is cleared.
+/// identifiers, punctuation runs). Zero per-entry mallocs (arena-backed).
 #[derive(Default)]
 struct LongMap {
     owner: u64,
-    map: rustc_hash::FxHashMap<Box<[u8]>, (u32, u32)>, // bytes -> (offset, len)
-    arena: Vec<u32>,
+    map: ArenaMap,
 }
 
 #[derive(Default)]
@@ -448,8 +586,8 @@ pub struct LongCache {
 }
 
 const LONG_MAPS: usize = 4;
-const LONG_MAX_ENTRIES: usize = 1 << 14;
-const LONG_MAX_ARENA: usize = 1 << 20; // u32s (4 MiB)
+const LONG_MAX_ENTRIES: usize = 1 << 17;
+const LONG_MAX_ARENA: usize = 1 << 22; // u32s (16 MiB max; lazy-allocated only when long chunks exist)
 const LONG_MAX_BYTES: usize = 1024; // longer chunks are not worth caching
 
 impl LongCache {
@@ -470,25 +608,21 @@ impl LongCache {
     }
 
     #[inline]
-    pub fn get(&self, owner: u64, key: &[u8]) -> Option<&[u32]> {
+    pub fn get_h(&self, owner: u64, key: &[u8], h: u64) -> Option<&[u32]> {
         let m = self.maps.first().filter(|m| m.owner == owner)?;
-        let &(off, len) = m.map.get(key)?;
-        Some(&m.arena[off as usize..(off + len) as usize])
+        m.map.get_h(key, h)
     }
 
     #[inline]
-    pub fn put(&mut self, owner: u64, key: &[u8], toks: &[u32]) {
+    pub fn put_h(&mut self, owner: u64, key: &[u8], h: u64, toks: &[u32]) {
         let Some(m) = self.maps.first_mut().filter(|m| m.owner == owner) else { return };
         if key.len() > LONG_MAX_BYTES {
             return;
         }
-        if m.map.len() >= LONG_MAX_ENTRIES || m.arena.len() + toks.len() > LONG_MAX_ARENA {
+        if m.map.len >= LONG_MAX_ENTRIES || m.map.toks.len() + toks.len() > LONG_MAX_ARENA {
             m.map.clear();
-            m.arena.clear();
         }
-        let off = m.arena.len() as u32;
-        m.arena.extend_from_slice(toks);
-        m.map.insert(key.into(), (off, toks.len() as u32));
+        let _ = m.map.insert_h(key, h, toks);
     }
 }
 
@@ -508,8 +642,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize
 struct SSlot<const W: usize> {
     lo: AtomicU64,
     hi: AtomicU64,
-    meta: AtomicU32,
     toks: [AtomicU32; W],
+    meta: AtomicU32,
 }
 
 /// Its own 128-byte line (Apple M-series lines are 128 B): the insert counter
@@ -532,8 +666,9 @@ struct STable<const W: usize> {
 impl<const W: usize> STable<W> {
     fn layout(n: usize) -> std::alloc::Layout {
         let sz = std::mem::size_of::<SSlot<W>>();
-        // cache-line aligned so a slot never straddles two lines
-        std::alloc::Layout::from_size_align(sz * n, sz.next_power_of_two().clamp(8, 64)).expect("table layout")
+        // 64-byte aligned so every (2b, 2b+1) pair of 32B SSlot<3> shares one
+        // 64B cache line and `addr ^ 32` is always the in-line sibling slot.
+        std::alloc::Layout::from_size_align(sz * n, sz.next_power_of_two().max(64)).expect("table layout")
     }
 
     fn new(bits: u32) -> Box<STable<W>> {
@@ -545,6 +680,7 @@ impl<const W: usize> STable<W> {
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+        advise_hugepage(ptr as *mut u8, layout.size());
         Box::new(STable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
     }
 
@@ -569,6 +705,8 @@ impl<const W: usize> Drop for STable<W> {
 const PROBE_MAX: usize = 32;
 /// Token count `SharedTable::get` reports for an entry stored in the SpillMap.
 pub const SPILLED: usize = 63;
+/// Return code of `View::emit_inline_at` when key is spilled/in-flight (vs 0 = empty slot).
+pub const INLINE_SPILLED: usize = 7;
 const SHARED_MIN_BITS: u32 = 14;
 
 /// Inserts a thread batches before publishing them to a table's count.
@@ -581,68 +719,160 @@ thread_local! {
 #[derive(Clone, Copy)]
 pub struct View<'a, const W: usize> {
     base: *const SSlot<W>,
-    mask: usize,
+    end: *const SSlot<W>,
     shift: u32,
     _t: std::marker::PhantomData<&'a ()>,
 }
 
+/// Unpack a 20-bit packed 4..=6 token `SSlot<3>` (state `m & 3 == 3`) directly
+/// into `dst` and return token count (`4..=6`).
+/// SAFETY: `p` points at a published `SSlot<3>` (`m & 3 == 3`, write-once immutable),
+/// and `dst` has capacity for at least 6 `u32`s.
+#[inline(always)]
+unsafe fn unpack_packed6(p: *const SSlot<3>, m: u32, dst: *mut u32) -> usize {
+    let raw = ((p as *const u8).add(16) as *const [u32; 4]).read();
+    let a = (raw[0] as u64) | ((raw[1] as u64) << 32);
+    let b = raw[2];
+    let t0 = (a & 0xF_FFFF) as u32;
+    let t1 = ((a >> 20) & 0xF_FFFF) as u32;
+    let t2 = ((a >> 40) & 0xF_FFFF) as u32;
+    let t3 = b & 0xF_FFFF;
+    let t4 = (b >> 20) | (((m >> 4) & 0xFF) << 12);
+    let t5 = ((m >> 12) & 0xFFFF) | (((a >> 60) as u32) << 16);
+    *dst = t0;
+    *dst.add(1) = t1;
+    *dst.add(2) = t2;
+    *dst.add(3) = t3;
+    *dst.add(4) = t4;
+    *dst.add(5) = t5;
+    4 + (((m >> 2) & 3) as usize)
+}
+
+#[inline(always)]
+fn pack_6_words(toks: &[u32]) -> Option<([u32; 3], u32)> {
+    let n = toks.len();
+    if n < 4 || n > 6 {
+        return None;
+    }
+    let t0 = toks[0];
+    let t1 = toks[1];
+    let t2 = toks[2];
+    let t3 = toks[3];
+    let t4 = if n > 4 { toks[4] } else { 0 };
+    let t5 = if n > 5 { toks[5] } else { 0 };
+    if (t0 | t1 | t2 | t3 | t4 | t5) > PACK20_MAX_TOK {
+        return None;
+    }
+    let a = (t0 as u64)
+        | ((t1 as u64) << 20)
+        | ((t2 as u64) << 40)
+        | ((((t5 >> 16) & 0xF) as u64) << 60);
+    let b = t3 | ((t4 & 0xFFF) << 20);
+    let meta = 3u32
+        | (((n - 4) as u32) << 2)
+        | (((t4 >> 12) & 0xFF) << 4)
+        | ((t5 & 0xFFFF) << 12);
+    Some(([a as u32, (a >> 32) as u32, b], meta))
+}
+
 impl View<'_, 3> {
-    /// Address of the home slot for hash `h` (as an integer; never 0).
+    /// Address of the home slot for hash `h` (never 0).
     #[inline(always)]
     pub fn slot_addr(&self, h: u64) -> u64 {
         // SAFETY: (h >> shift) < 2^bits == table length.
         unsafe { self.base.add((h >> self.shift) as usize) as u64 }
     }
 
-    /// [`Self::get_inline`] starting from a home-slot address computed by
-    /// [`Self::slot_addr`] of THIS view (phase 1 computes it anyway for the
-    /// prefetch, so phase 2 skips the shift/add). Published inline entries
-    /// have meta in {6, 10, 14} (2 | n << 2, n = 1..=3; n = 4 is never stored
-    /// and the spill marker is 2 | 63 << 2), i.e. (meta - 6) & !0b1100 == 0.
     #[inline(always)]
-    pub fn get_inline_at(&self, lo: u64, hi: u64, addr: u64) -> Option<([u32; 3], usize)> {
-        let mut p = addr as *const SSlot<3>;
-        for _ in 0..PROBE_MAX {
-            // SAFETY: p points at a slot of this view's table (home slot, or
-            // advanced with wrap-around below); the table outlives the view.
-            let s = unsafe { &*p };
-            let m = s.meta.load(Ordering::Acquire);
-            let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
-            let t = [s.toks[0].load(Ordering::Relaxed), s.toks[1].load(Ordering::Relaxed), s.toks[2].load(Ordering::Relaxed)];
-            if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
-                return Some((t, (m >> 2) as usize));
+    fn load_meta(s: &SSlot<3>) -> u32 {
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let val: u32;
+            unsafe {
+                std::arch::asm!(
+                    "ldapr {val:w}, [{ptr}]",
+                    val = out(reg) val,
+                    ptr = in(reg) &s.meta,
+                    options(nostack, readonly, preserves_flags),
+                );
             }
-            if m == 0 || (l == lo && g == hi) {
-                return None;
-            }
-            // SAFETY: p is within the table; next index wraps by the mask.
-            let i = (unsafe { p.offset_from(self.base) } as usize + 1) & self.mask;
-            p = unsafe { self.base.add(i) };
+            val
         }
-        None
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            s.meta.load(Ordering::Acquire)
+        }
+    }
+
+    /// Probe starting from a home-slot address computed by [`Self::slot_addr`]
+    /// and emit directly to `dst` on inline hit:
+    /// - Probe 0 unrolled straight-line (hits ~80-90% of Zipf-hot lookups with
+    ///   minimal L1d load port pressure and zero loop overhead).
+    /// - 1..=3 tokens (`m & 3 == 2`): ONE 128-bit load + ONE 128-bit store.
+    /// - 4..=6 tokens (`m & 3 == 3`): 20-bit bit-packed unpack from same 32B slot.
+    /// Returns token count `1..=6` on hit, `0` on empty slot, or `INLINE_SPILLED`.
+    ///
+    /// SAFETY: `dst` must have capacity for at least 6 `u32`s.
+    #[inline(always)]
+    pub unsafe fn emit_inline_at(&self, lo: u64, hi: u64, addr: u64, dst: *mut u32) -> usize {
+        const {
+            assert!(std::mem::offset_of!(SSlot<3>, toks) == 16);
+            assert!(std::mem::size_of::<SSlot<3>>() == 32);
+        }
+        let mut p = addr as *const SSlot<3>;
+        // Probe 0: unrolled fast path for the prefetched home slot.
+        {
+            let s = &*p;
+            let m = Self::load_meta(s);
+            let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+            if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
+                let t = ((p as *const u8).add(16) as *const [u32; 4]).read();
+                (dst as *mut [u32; 4]).write_unaligned(t);
+                return (m >> 2) as usize;
+            }
+            if m == 0 {
+                return 0;
+            }
+            if l == lo && g == hi {
+                if (m & 3) == 3 {
+                    return unpack_packed6(p, m, dst);
+                }
+                return INLINE_SPILLED;
+            }
+        }
+        // Probe 1..PROBE_MAX: linear probing (for even home slots, Probe 1 shares
+        // the same 64-byte cache line already prefetched by Probe 0).
+        for _ in 1..PROBE_MAX {
+            p = p.add(1);
+            if p == self.end {
+                p = self.base;
+            }
+            let s = &*p;
+            let m = Self::load_meta(s);
+            let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+            if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
+                let t = ((p as *const u8).add(16) as *const [u32; 4]).read();
+                (dst as *mut [u32; 4]).write_unaligned(t);
+                return (m >> 2) as usize;
+            }
+            if m == 0 {
+                return 0;
+            }
+            if l == lo && g == hi {
+                if (m & 3) == 3 {
+                    return unpack_packed6(p, m, dst);
+                }
+                return INLINE_SPILLED;
+            }
+        }
+        INLINE_SPILLED
     }
 }
 
 /// Grow-only, lock-free table of LEARNED chunk encodings (multi-token results
 /// the load-time table can't hold), shared by every thread using a tokenizer.
-/// `W` = tokens stored inline per entry.
-///
-/// Natural text has a very long tail of distinct multi-token pre-tokens (names,
-/// numbers, URL pieces, typos). Bounded per-thread caches keep evicting them —
-/// and each thread re-learns what the others already merged. This table keeps
-/// everything any thread has learned, growing on demand up to a memory cap.
-///
-/// * Reads take no lock: one Acquire load of the table pointer, then linear
-///   probing over published slots.
-/// * Inserts claim an empty slot with one CAS; entries are never overwritten.
-///   Two threads racing on the same key may both insert it (harmless).
-/// * Growth: when half full, one thread builds a 2x table, copies the entries
-///   and swaps the pointer; inserts arriving meanwhile are skipped. A missing
-///   entry only means that chunk gets merged again — every entry is just
-///   `f(bytes)` for the exact merge function.
-/// * Old tables stay allocated until the tokenizer is dropped (so a concurrent
-///   reader can never see freed memory); geometric growth bounds that overhead
-///   to the size of the final table.
+/// `W` = uncompressed tokens stored inline per entry (`W = 3` also adaptively
+/// bit-packs 4..=6 tokens of <=20 bits into the same 32-byte slot using state 3!).
 pub struct SharedTable<const W: usize = 3> {
     cur: AtomicPtr<STable<W>>,
     retired: std::sync::Mutex<Vec<*mut STable<W>>>,
@@ -650,8 +880,6 @@ pub struct SharedTable<const W: usize = 3> {
     max_bits: AtomicU32,
 }
 
-// SAFETY: all shared state is atomic or behind the Mutex; the raw table
-// pointers are owned by this struct and freed only in Drop (exclusive access).
 unsafe impl<const W: usize> Send for SharedTable<W> {}
 unsafe impl<const W: usize> Sync for SharedTable<W> {}
 
@@ -682,27 +910,25 @@ impl<const W: usize> SharedTable<W> {
 
     #[inline(always)]
     fn table(&self) -> &STable<W> {
-        // SAFETY: `cur` always points to a live table; tables are freed only in Drop.
         unsafe { &*self.cur.load(Ordering::Acquire) }
     }
 
-    /// Learned entries currently stored (approximate under concurrency).
     pub fn len(&self) -> usize {
         self.table().count.0.load(Ordering::Relaxed)
     }
 
-    /// A view of the current table for a batch of lookups: ONE acquire load of
-    /// the table pointer instead of one per lookup, and base/mask/shift held in
-    /// registers. Using a view that a concurrent growth has since replaced is
-    /// safe and exact: old tables stay allocated until the tokenizer drops,
-    /// slots are write-once, so a stale view can only MISS an entry (and the
-    /// caller then takes the exact path).
     #[inline(always)]
     pub fn view(&self) -> View<'_, W> {
         let t = self.table();
-        View { base: t.ptr as *const SSlot<W>, mask: t.mask, shift: t.shift, _t: std::marker::PhantomData }
+        View {
+            base: t.ptr as *const SSlot<W>,
+            end: unsafe { (t.ptr as *const SSlot<W>).add(t.len) },
+            shift: t.shift,
+            _t: std::marker::PhantomData,
+        }
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn get(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; W], usize)> {
         let t = self.table();
@@ -725,38 +951,32 @@ impl<const W: usize> SharedTable<W> {
         None
     }
 
-    /// Insert a learned encoding of 1..=W tokens (longer ones are ignored).
+    /// Insert a learned encoding of 1..=W uncompressed tokens.
     pub fn put(&self, lo: u64, hi: u64, h: u64, toks: &[u32]) {
         if toks.is_empty() || toks.len() > W {
             return;
         }
-        self.put_n(lo, hi, h, toks, toks.len());
+        self.put_n(lo, hi, h, toks, 2 | ((toks.len() as u32) << 2));
     }
 
-    /// Record that `key`'s encoding lives in the [`SpillMap`]: `get` then
-    /// returns a count of [`SPILLED`] (and no tokens).
+    /// Record that `key`'s encoding lives in the [`SpillMap`].
     pub fn put_spilled(&self, lo: u64, hi: u64, h: u64) {
-        self.put_n(lo, hi, h, &[], SPILLED);
+        self.put_n(lo, hi, h, &[], 2 | ((SPILLED as u32) << 2));
     }
 
-    fn put_n(&self, lo: u64, hi: u64, h: u64, toks: &[u32], n: usize) {
+    fn put_n(&self, lo: u64, hi: u64, h: u64, toks: &[u32], pub_meta: u32) {
         if self.max_bits.load(Ordering::Relaxed) == 0 {
             return;
         }
         let t = self.table();
         let count = t.count.0.load(Ordering::Relaxed);
-        if count * 2 >= t.len {
+        if count * 8 >= t.len * 5 {
             if t.bits() < self.max_bits.load(Ordering::Relaxed) {
                 self.grow(t);
-            } else if count * 8 >= t.len * 5 {
-                // At the memory cap: stop at 5/8 load. Filling further makes
-                // every probe (hits AND misses) walk long clusters.
+            } else {
                 return;
             }
         }
-        // A growth in progress is copying the old table; an insert landing there
-        // now could be missed by the copy. Don't wait for it (threads would pile
-        // up): skip — the chunk is simply merged again if it recurs.
         if self.growing.load(Ordering::Acquire) {
             return;
         }
@@ -773,13 +993,7 @@ impl<const W: usize> SharedTable<W> {
                         for (k, d) in s.toks.iter().enumerate() {
                             d.store(toks.get(k).copied().unwrap_or(0), Ordering::Relaxed);
                         }
-                        s.meta.store(2 | (n as u32) << 2, Ordering::Release);
-                        // Sloppy counter: each thread publishes its inserts in
-                        // batches of COUNT_BATCH — one shared fetch_add per insert
-                        // from every thread made the count's cache line ping-pong
-                        // (cold multi-thread calls insert millions of entries).
-                        // The count only drives growth / the load cap, so being
-                        // off by < COUNT_BATCH per thread is harmless.
+                        s.meta.store(pub_meta, Ordering::Release);
                         PENDING.with(|c| {
                             let v = c.get() + 1;
                             if v >= COUNT_BATCH {
@@ -794,88 +1008,217 @@ impl<const W: usize> SharedTable<W> {
                     Err(cur) => m = cur,
                 }
             }
-            if m & 3 == 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
-                return; // already learned
+            if m >= 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
+                return;
             }
             i = (i + 1) & t.mask;
         }
     }
 
-    /// Test-only: replace the (empty) table with an empty one of 2^bits slots.
     #[cfg(test)]
     pub fn presize(&self, bits: u32) {
         let old = self.cur.swap(Box::into_raw(STable::<W>::new(bits)), Ordering::AcqRel);
         self.retired.lock().unwrap().push(old);
     }
 
-    /// Make room for about `entries` learned entries up front (one growth to the
-    /// final size instead of a chain of doublings, each a serial copy during
-    /// which other threads cannot learn). Bounded by the memory cap.
-    pub fn reserve(&self, entries: usize) {
-        let max = self.max_bits.load(Ordering::Relaxed);
-        if max == 0 {
-            return;
-        }
-        let want = (usize::BITS - (entries.max(1) * 2 - 1).leading_zeros()).min(max);
-        let t = self.table();
-        if t.bits() < want {
-            self.grow_to(t, want);
-        }
-    }
-
-    /// Double the table (one thread at a time; others keep using the old one).
     #[cold]
     fn grow(&self, old: &STable<W>) {
         self.grow_to(old, old.bits() + 1);
     }
 
+    /// Disjoint-stripe sequential-order doubling: every home slot `h_old` maps
+    /// to `[h_old * scale .. (h_old + 1) * scale)`, so parallel threads own
+    /// strictly disjoint destination stripes with zero CAS and sequential streaming.
     #[cold]
+    #[inline(never)]
     fn grow_to(&self, old: &STable<W>, bits: u32) {
-        if self.growing.swap(true, Ordering::Acquire) {
+        if self.growing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             return;
         }
         let cur = self.cur.load(Ordering::Acquire);
-        if !std::ptr::eq(cur, old) {
+        if !std::ptr::eq(cur, old) || unsafe { &*cur }.bits() >= bits {
             self.growing.store(false, Ordering::Release);
             return;
         }
         #[cfg(test)]
         let t0 = std::time::Instant::now();
         let new = STable::<W>::new(bits);
-        let mut copied = 0usize;
-        for i in 0..old.len {
-            let s = old.slot(i);
-            let m = s.meta.load(Ordering::Acquire);
-            if m & 3 != 2 {
-                continue;
-            }
-            let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
-            let mut j = (hash(lo, hi) >> new.shift) as usize;
-            loop {
-                let d = new.slot(j);
-                if d.meta.load(Ordering::Relaxed) == 0 {
-                    d.lo.store(lo, Ordering::Relaxed);
-                    d.hi.store(hi, Ordering::Relaxed);
-                    for (x, y) in d.toks.iter().zip(s.toks.iter()) {
-                        x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
-                    }
-                    d.meta.store(m, Ordering::Relaxed);
-                    copied += 1;
-                    break;
+        let diff = bits - old.bits();
+        let copied = if old.len >= 32768 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+            struct RawTable<const W: usize>(*const STable<W>);
+            unsafe impl<const W: usize> Sync for RawTable<W> {}
+            impl<const W: usize> RawTable<W> {
+                #[inline(always)]
+                fn get(&self) -> &STable<W> {
+                    unsafe { &*self.0 }
                 }
-                j = (j + 1) & new.mask;
             }
-        }
+            let old_r = RawTable(old as *const STable<W>);
+            let new_r = RawTable(&*new as *const STable<W>);
+            let n_stripes = rayon::current_num_threads().min(old.len / 16384).max(1);
+            let stripe = (old.len / n_stripes).max(1);
+            let parts: Vec<(usize, Vec<(u64, u64, [u32; W], u32, u64)>)> = (0..n_stripes)
+                .into_par_iter()
+                .map(|si| {
+                    let old_t = old_r.get();
+                    let new_t = new_r.get();
+                    let s_lo = si * stripe;
+                    let s_hi = if si + 1 == n_stripes { old_t.len } else { s_lo + stripe };
+                    let d_lo = s_lo << diff;
+                    let d_hi = s_hi << diff;
+                    let mut n = 0usize;
+                    let mut ov = Vec::new();
+                    for i in s_lo..s_hi {
+                        let s = old_t.slot(i);
+                        let m = s.meta.load(Ordering::Acquire);
+                        if m < 2 {
+                            continue;
+                        }
+                        let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+                        let h = hash(lo, hi);
+                        let mut j = (h >> new_t.shift) as usize;
+                        if j >= d_lo && j < d_hi {
+                            while j < d_hi {
+                                let d = new_t.slot(j);
+                                if d.meta.load(Ordering::Relaxed) == 0 {
+                                    d.lo.store(lo, Ordering::Relaxed);
+                                    d.hi.store(hi, Ordering::Relaxed);
+                                    for (x, y) in d.toks.iter().zip(s.toks.iter()) {
+                                        x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
+                                    }
+                                    d.meta.store(m, Ordering::Relaxed);
+                                    n += 1;
+                                    break;
+                                }
+                                j += 1;
+                            }
+                            if j == d_hi {
+                                let mut tv = [0u32; W];
+                                for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                                    *dst = src.load(Ordering::Relaxed);
+                                }
+                                ov.push((lo, hi, tv, m, h));
+                            }
+                        } else {
+                            let mut tv = [0u32; W];
+                            for (dst, src) in tv.iter_mut().zip(s.toks.iter()) {
+                                *dst = src.load(Ordering::Relaxed);
+                            }
+                            ov.push((lo, hi, tv, m, h));
+                        }
+                    }
+                    (n, ov)
+                })
+                .collect();
+            let mut total = 0usize;
+            for (n, ov) in parts {
+                total += n;
+                for (lo, hi, tv, m, h) in ov {
+                    let mut j = (h >> new.shift) as usize;
+                    loop {
+                        let d = new.slot(j);
+                        if d.meta.load(Ordering::Relaxed) == 0 {
+                            d.lo.store(lo, Ordering::Relaxed);
+                            d.hi.store(hi, Ordering::Relaxed);
+                            for (x, &y) in d.toks.iter().zip(tv.iter()) {
+                                x.store(y, Ordering::Relaxed);
+                            }
+                            d.meta.store(m, Ordering::Relaxed);
+                            total += 1;
+                            break;
+                        }
+                        j = (j + 1) & new.mask;
+                    }
+                }
+            }
+            total
+        } else {
+            let mut copied = 0usize;
+            for i in 0..old.len {
+                let s = old.slot(i);
+                let m = s.meta.load(Ordering::Acquire);
+                if m < 2 {
+                    continue;
+                }
+                let (lo, hi) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+                let mut j = (hash(lo, hi) >> new.shift) as usize;
+                loop {
+                    let d = new.slot(j);
+                    if d.meta.load(Ordering::Relaxed) == 0 {
+                        d.lo.store(lo, Ordering::Relaxed);
+                        d.hi.store(hi, Ordering::Relaxed);
+                        for (x, y) in d.toks.iter().zip(s.toks.iter()) {
+                            x.store(y.load(Ordering::Relaxed), Ordering::Relaxed);
+                        }
+                        d.meta.store(m, Ordering::Relaxed);
+                        copied += 1;
+                        break;
+                    }
+                    j = (j + 1) & new.mask;
+                }
+            }
+            copied
+        };
         new.count.0.store(copied, Ordering::Relaxed);
         #[cfg(test)]
         if std::env::var("TT_DIAG").is_ok() {
             eprintln!("grow -> 2^{} ({copied} entries) {:?}", new.bits(), t0.elapsed());
         }
         let newp = Box::into_raw(new);
-        // Release: the copied slots are visible to any thread that loads `cur`.
         self.cur.store(newp, Ordering::Release);
         self.retired.lock().unwrap_or_else(|e| e.into_inner()).push(cur);
         self.growing.store(false, Ordering::Release);
+    }
+}
+
+impl SharedTable<3> {
+    /// Lookup returning up to 6 inline tokens (uncompressed 1..=3 OR 20-bit packed
+    /// 4..=6), or count == `SPILLED` when stored in `SpillMap`.
+    #[inline(always)]
+    pub fn get_6(&self, lo: u64, hi: u64, h: u64) -> Option<([u32; 6], usize)> {
+        let t = self.table();
+        let mut i = (h >> t.shift) as usize;
+        for _ in 0..PROBE_MAX {
+            let s = t.slot(i);
+            let m = View::load_meta(s);
+            if m == 0 {
+                return None;
+            }
+            if m >= 2 && s.lo.load(Ordering::Relaxed) == lo && s.hi.load(Ordering::Relaxed) == hi {
+                let mut v = [0u32; 6];
+                if (m & 3) == 2 {
+                    v[0] = s.toks[0].load(Ordering::Relaxed);
+                    v[1] = s.toks[1].load(Ordering::Relaxed);
+                    v[2] = s.toks[2].load(Ordering::Relaxed);
+                    return Some((v, (m >> 2) as usize));
+                }
+                if (m & 3) == 3 {
+                    let c = unsafe { unpack_packed6(s as *const SSlot<3>, m, v.as_mut_ptr()) };
+                    return Some((v, c));
+                }
+            }
+            i = (i + 1) & t.mask;
+        }
+        None
+    }
+
+    /// Insert 1..=3 tokens uncompressed or 4..=6 tokens (<= 20 bits) bit-packed
+    /// in the same 32-byte slot. Returns `true` if stored inline, `false` if
+    /// marked spilled (caller should store in `dyn_cache`/`spill`).
+    #[inline]
+    pub fn put_6(&self, lo: u64, hi: u64, h: u64, toks: &[u32]) -> bool {
+        let n = toks.len();
+        if n >= 1 && n <= 3 {
+            self.put_n(lo, hi, h, toks, 2 | ((n as u32) << 2));
+            return true;
+        }
+        if let Some((words, pub_meta)) = pack_6_words(toks) {
+            self.put_n(lo, hi, h, &words, pub_meta);
+            return true;
+        }
+        self.put_spilled(lo, hi, h);
+        false
     }
 }
 
@@ -963,6 +1306,40 @@ mod shared_tests {
         let found = keys.iter().filter(|&&(lo, hi)| t.get(lo, hi, hash(lo, hi)).is_some()).count();
         assert!(found * 100 >= keys.len() * 99, "found {found} of {}", keys.len());
     }
+
+    #[test]
+    fn shared_table_adaptive_packed6() {
+        let t: SharedTable<3> = SharedTable::new(32);
+        for cnt in 1..=6usize {
+            let key = format!("chunk_{cnt:02}_abc");
+            let (lo, hi) = pack(key.as_bytes());
+            let h = hash(lo, hi);
+            let want: Vec<u32> = (0..cnt as u32).map(|i| (i * 199_991 + 17) & PACK20_MAX_TOK).collect();
+            assert!(t.put_6(lo, hi, h, &want));
+            let (got, gn) = t.get_6(lo, hi, h).unwrap();
+            assert_eq!((gn, &got[..gn]), (cnt, want.as_slice()));
+            let view = t.view();
+            let mut out = [0u32; 8];
+            let vc = unsafe { view.emit_inline_at(lo, hi, view.slot_addr(h), out.as_mut_ptr()) };
+            assert_eq!((vc, &out[..vc]), (cnt, want.as_slice()));
+        }
+        // 7 tokens -> spilled
+        let (lo, hi) = pack(b"seven_tokens_xx");
+        let h = hash(lo, hi);
+        assert!(!t.put_6(lo, hi, h, &[1, 2, 3, 4, 5, 6, 7]));
+        assert_eq!(t.get_6(lo, hi, h).unwrap().1, SPILLED);
+        // 4 tokens with >20-bit token -> spilled safely
+        let (lo2, hi2) = pack(b"big_tok_id_test");
+        let h2 = hash(lo2, hi2);
+        assert!(!t.put_6(lo2, hi2, h2, &[1, 2, 3, PACK20_MAX_TOK + 1]));
+        assert_eq!(t.get_6(lo2, hi2, h2).unwrap().1, SPILLED);
+        // 3 tokens with >20-bit token -> still stored inline uncompressed!
+        let (lo3, hi3) = pack(b"big_3_tok_test!");
+        let h3 = hash(lo3, hi3);
+        assert!(t.put_6(lo3, hi3, h3, &[1, 2, PACK20_MAX_TOK + 99]));
+        let (got3, gn3) = t.get_6(lo3, hi3, h3).unwrap();
+        assert_eq!((gn3, &got3[..gn3]), (3, &[1, 2, PACK20_MAX_TOK + 99][..]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +1359,7 @@ mod shared_tests {
 /// shard is a miss / a skipped insert), so the map can't stall a worker or
 /// deadlock a forked child.
 pub struct SpillMap {
-    shards: Box<[std::sync::RwLock<rustc_hash::FxHashMap<Box<[u8]>, Box<[u32]>>>]>,
+    shards: Box<[std::sync::RwLock<ArenaMap>]>,
     bytes: PaddedCount,
     limit: AtomicUsize,
 }
@@ -996,7 +1373,7 @@ pub static SPILL_PUTS: AtomicU64 = AtomicU64::new(0);
 impl SpillMap {
     pub fn new(limit_bytes: usize) -> Self {
         SpillMap {
-            shards: (0..SPILL_SHARDS).map(|_| std::sync::RwLock::new(Default::default())).collect(),
+            shards: (0..SPILL_SHARDS).map(|_| std::sync::RwLock::new(ArenaMap::default())).collect(),
             bytes: PaddedCount(AtomicUsize::new(0)),
             limit: AtomicUsize::new(limit_bytes),
         }
@@ -1007,26 +1384,16 @@ impl SpillMap {
     }
 
     #[inline]
-    fn shard(&self, key: &[u8]) -> &std::sync::RwLock<rustc_hash::FxHashMap<Box<[u8]>, Box<[u32]>>> {
-        use std::hash::{BuildHasher, Hash, Hasher};
-        let mut h = rustc_hash::FxBuildHasher.build_hasher();
-        key.hash(&mut h);
-        &self.shards[(h.finish() >> 58) as usize]
-    }
-
-    /// Append the stored encoding of `key` to `out`; false if not stored.
-    #[inline]
-    pub fn get_into(&self, key: &[u8], out: &mut Vec<u32>) -> bool {
+    pub fn get_into_h(&self, key: &[u8], h: u64, out: &mut Vec<u32>) -> bool {
         #[cfg(test)]
         SPILL_GETS.fetch_add(1, Ordering::Relaxed);
-        // Never block: a shard being written (or a lock orphaned by fork()) is
-        // simply a miss — the caller merges, which is always correct.
-        let g = match self.shard(key).try_read() {
+        let sh = &self.shards[(h >> 58) as usize];
+        let g = match sh.try_read() {
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
-        match g.get(key) {
+        match g.get_h(key, h) {
             Some(t) => {
                 out.extend_from_slice(t);
                 true
@@ -1035,25 +1402,698 @@ impl SpillMap {
         }
     }
 
-    /// Store `key`'s encoding; false if it isn't stored (over the cap / too long).
-    pub fn put(&self, key: &[u8], toks: &[u32]) -> bool {
+    /// Append the stored encoding of `key` to `out`; false if not stored.
+    #[inline]
+    pub fn get_into(&self, key: &[u8], out: &mut Vec<u32>) -> bool {
+        self.get_into_h(key, hash_bytes(key), out)
+    }
+
+    pub fn put_h(&self, key: &[u8], h: u64, toks: &[u32]) -> bool {
         if key.len() > LONG_MAX_BYTES {
             return false;
         }
-        let cost = key.len() + 4 * toks.len() + 64;
+        let cost = key.len() + 4 * toks.len() + 24;
         if self.bytes.0.load(Ordering::Relaxed) + cost > self.limit.load(Ordering::Relaxed) {
             return false;
         }
         #[cfg(test)]
         SPILL_PUTS.fetch_add(1, Ordering::Relaxed);
-        let mut g = match self.shard(key).try_write() {
+        let sh = &self.shards[(h >> 58) as usize];
+        let mut g = match sh.try_write() {
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
-        if g.insert(key.into(), toks.into()).is_none() {
+        if g.insert_h(key, h, toks) {
             self.bytes.0.fetch_add(cost, Ordering::Relaxed);
         }
         true
+    }
+
+    /// Store `key`'s encoding; false if it isn't stored (over the cap / too long).
+    pub fn put(&self, key: &[u8], toks: &[u32]) -> bool {
+        self.put_h(key, hash_bytes(key), toks)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lock-free lazy SharedLongTable for 16..=31 byte chunks (99.8% of >15B words)
+// ---------------------------------------------------------------------------
+
+pub const MAX_LONG_KEY: usize = 31;
+const LONG_MIN_BITS: u32 = 11; // 2048 slots * 64B = 128 KiB initial (lazy)
+thread_local! {
+    static PENDING_LONG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Pack a 16..=31 byte slice into a lossless 32-byte key (`buf[31] = len`).
+#[inline(always)]
+pub fn pack32_at(b: &[u8], pos: usize, len: usize) -> [u64; 4] {
+    debug_assert!(len >= 16 && len <= MAX_LONG_KEY);
+    if pos + 32 <= b.len() {
+        // SAFETY: 32 bytes readable at pos; `len - 16` is in 0..=15.
+        unsafe {
+            let p = b.as_ptr().add(pos);
+            let lo = u128::from_le((p as *const u128).read_unaligned());
+            let hi = u128::from_le((p.add(16) as *const u128).read_unaligned())
+                & *KEY_MASK.get_unchecked(len - 16);
+            [
+                lo as u64,
+                (lo >> 64) as u64,
+                hi as u64,
+                ((hi >> 64) as u64) | ((len as u64) << 56),
+            ]
+        }
+    } else {
+        pack32_tail(&b[pos..pos + len])
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn pack32_tail(c: &[u8]) -> [u64; 4] {
+    let mut buf = [0u8; 32];
+    buf[..c.len()].copy_from_slice(c);
+    buf[31] = c.len() as u8;
+    [
+        u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+    ]
+}
+
+#[inline(always)]
+pub fn hash32(k: [u64; 4]) -> u64 {
+    let a = (k[0] ^ k[2].rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let b = (k[1] ^ k[3].rotate_left(31)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    (a ^ b.rotate_left(29)).wrapping_mul(0x94D0_49BB_1331_11EB)
+}
+
+/// One 64-byte cache-line slot for a 16..=31 byte chunk:
+/// - `k`: 32-byte lossless key (`len` in byte 31, always 16..=31)
+/// - `toks`: 1..=7 uncompressed tokens (`meta & 3 == 2`), OR 8..=11 20-bit
+///   packed tokens (`meta & 3 == 3`)
+/// - `meta`: 0 = empty, 1 = being written, else published.
+#[repr(C, align(64))]
+struct LSlot {
+    k: [AtomicU64; 4],
+    toks: [AtomicU32; 7],
+    meta: AtomicU32,
+}
+const _: () = assert!(std::mem::size_of::<LSlot>() == 64);
+
+#[repr(C, align(128))]
+struct LTable {
+    ptr: *mut LSlot,
+    len: usize,
+    mask: usize,
+    shift: u32,
+    count: PaddedCount,
+}
+
+impl LTable {
+    fn layout(n: usize) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(64 * n, 64).expect("ltable layout")
+    }
+
+    fn new(bits: u32) -> Box<LTable> {
+        let n = 1usize << bits;
+        let layout = Self::layout(n);
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut LSlot;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        advise_hugepage(ptr as *mut u8, layout.size());
+        Box::new(LTable { ptr, len: n, mask: n - 1, shift: 64 - bits, count: PaddedCount(AtomicUsize::new(0)) })
+    }
+
+    #[inline(always)]
+    fn slot(&self, i: usize) -> &LSlot {
+        unsafe { &*self.ptr.add(i) }
+    }
+
+    fn bits(&self) -> u32 {
+        64 - self.shift
+    }
+}
+
+impl Drop for LTable {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len)) };
+    }
+}
+
+#[inline(always)]
+fn pack_11_words(toks: &[u32]) -> Option<([u32; 7], u32)> {
+    let n = toks.len();
+    if n < 8 || n > 11 {
+        return None;
+    }
+    let mut or_all = 0u32;
+    let mut t = [0u32; 11];
+    for (i, &v) in toks.iter().enumerate() {
+        t[i] = v;
+        or_all |= v;
+    }
+    if or_all > PACK20_MAX_TOK {
+        return None;
+    }
+    let w0 = (t[0] as u64) | ((t[1] as u64) << 20) | ((t[2] as u64) << 40) | (((t[9] & 0xF) as u64) << 60);
+    let w1 = (t[3] as u64) | ((t[4] as u64) << 20) | ((t[5] as u64) << 40) | ((((t[9] >> 4) & 0xF) as u64) << 60);
+    let w2 = (t[6] as u64) | ((t[7] as u64) << 20) | ((t[8] as u64) << 40) | ((((t[9] >> 8) & 0xF) as u64) << 60);
+    let w3 = t[10] | (((t[9] >> 12) & 0xFF) << 20);
+    let words = [
+        w0 as u32,
+        (w0 >> 32) as u32,
+        w1 as u32,
+        (w1 >> 32) as u32,
+        w2 as u32,
+        (w2 >> 32) as u32,
+        w3,
+    ];
+    let meta = 3u32 | (((n - 8) as u32) << 2);
+    Some((words, meta))
+}
+
+#[inline(always)]
+unsafe fn unpack_11_into(s: &LSlot, m: u32, out: &mut Vec<u32>) {
+    let n = 8 + (((m >> 2) & 3) as usize);
+    let raw = [
+        s.toks[0].load(Ordering::Relaxed),
+        s.toks[1].load(Ordering::Relaxed),
+        s.toks[2].load(Ordering::Relaxed),
+        s.toks[3].load(Ordering::Relaxed),
+        s.toks[4].load(Ordering::Relaxed),
+        s.toks[5].load(Ordering::Relaxed),
+        s.toks[6].load(Ordering::Relaxed),
+    ];
+    let w0 = (raw[0] as u64) | ((raw[1] as u64) << 32);
+    let w1 = (raw[2] as u64) | ((raw[3] as u64) << 32);
+    let w2 = (raw[4] as u64) | ((raw[5] as u64) << 32);
+    let w3 = raw[6];
+    let t9 = ((w0 >> 60) as u32)
+        | (((w1 >> 60) as u32) << 4)
+        | (((w2 >> 60) as u32) << 8)
+        | (((w3 >> 20) & 0xFF) << 12);
+    let t = [
+        (w0 & 0xF_FFFF) as u32,
+        ((w0 >> 20) & 0xF_FFFF) as u32,
+        ((w0 >> 40) & 0xF_FFFF) as u32,
+        (w1 & 0xF_FFFF) as u32,
+        ((w1 >> 20) & 0xF_FFFF) as u32,
+        ((w1 >> 40) & 0xF_FFFF) as u32,
+        (w2 & 0xF_FFFF) as u32,
+        ((w2 >> 20) & 0xF_FFFF) as u32,
+        ((w2 >> 40) & 0xF_FFFF) as u32,
+        t9,
+        w3 & 0xF_FFFF,
+    ];
+    out.extend_from_slice(&t[..n]);
+}
+
+/// Lookup result for `SharedLongTable::get_into`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LongHit {
+    Hit,
+    Empty,
+    Spilled,
+}
+
+/// Read-only snapshot view of [`SharedLongTable`] for 256-deep pipelined prefetching.
+#[derive(Clone, Copy)]
+pub struct LongView<'a> {
+    base: *const LSlot,
+    end: *const LSlot,
+    shift: u32,
+    _t: std::marker::PhantomData<&'a ()>,
+}
+
+impl LongView<'_> {
+    #[inline(always)]
+    pub fn is_valid(&self) -> bool {
+        !self.base.is_null()
+    }
+
+    /// Address of the home 64-byte `LSlot` for hash `h`.
+    #[inline(always)]
+    pub fn slot_addr(&self, h: u64) -> u64 {
+        debug_assert!(!self.base.is_null());
+        unsafe { self.base.add((h >> self.shift) as usize) as u64 }
+    }
+
+    /// Probe starting from a prefetched `LSlot` address `addr` with unrolled
+    /// Probe-0 and two-128-bit-store token copy for 1..=7 uncompressed tokens.
+    #[inline(always)]
+    pub unsafe fn get_into_at(&self, k: [u64; 4], addr: u64, out: &mut Vec<u32>) -> LongHit {
+        const {
+            assert!(std::mem::offset_of!(LSlot, toks) == 32);
+            assert!(std::mem::size_of::<LSlot>() == 64);
+        }
+        // Probe 0: prefetched home 64B cache line.
+        let mut p = addr as *const LSlot;
+        let s0 = &*p;
+        let m0 = SharedLongTable::load_meta(s0);
+        if m0 == 0 {
+            return LongHit::Empty;
+        }
+        if ((s0.k[0].load(Ordering::Relaxed) ^ k[0])
+            | (s0.k[1].load(Ordering::Relaxed) ^ k[1])
+            | (s0.k[2].load(Ordering::Relaxed) ^ k[2])
+            | (s0.k[3].load(Ordering::Relaxed) ^ k[3]))
+            == 0
+        {
+            if (m0 & 3) == 2 {
+                let n = (m0 >> 2) as usize;
+                if n <= 7 {
+                    let base = out.len();
+                    out.reserve(8);
+                    let raw = ((p as *const u8).add(32) as *const [u32; 8]).read();
+                    (out.as_mut_ptr().add(base) as *mut [u32; 8]).write_unaligned(raw);
+                    out.set_len(base + n);
+                    return LongHit::Hit;
+                }
+                return LongHit::Spilled;
+            }
+            if (m0 & 3) == 3 {
+                unpack_11_into(s0, m0, out);
+                return LongHit::Hit;
+            }
+        }
+        // Probe 1..PROBE_MAX: linear scan.
+        for _ in 1..PROBE_MAX {
+            p = p.add(1);
+            if p == self.end {
+                p = self.base;
+            }
+            let s = &*p;
+            let m = SharedLongTable::load_meta(s);
+            if m == 0 {
+                return LongHit::Empty;
+            }
+            if m >= 2
+                && ((s.k[0].load(Ordering::Relaxed) ^ k[0])
+                    | (s.k[1].load(Ordering::Relaxed) ^ k[1])
+                    | (s.k[2].load(Ordering::Relaxed) ^ k[2])
+                    | (s.k[3].load(Ordering::Relaxed) ^ k[3]))
+                    == 0
+            {
+                if (m & 3) == 2 {
+                    let n = (m >> 2) as usize;
+                    if n <= 7 {
+                        let base = out.len();
+                        out.reserve(8);
+                        let raw = ((p as *const u8).add(32) as *const [u32; 8]).read();
+                        (out.as_mut_ptr().add(base) as *mut [u32; 8]).write_unaligned(raw);
+                        out.set_len(base + n);
+                        return LongHit::Hit;
+                    }
+                    return LongHit::Spilled;
+                }
+                if (m & 3) == 3 {
+                    unpack_11_into(s, m, out);
+                    return LongHit::Hit;
+                }
+            }
+        }
+        LongHit::Spilled
+    }
+}
+
+/// Lock-free, lazy-allocated shared table for 16..=31 byte chunks.
+/// Allocates 0 bytes until the first 16..=31 byte chunk is stored, then starts
+/// at 128 KiB and doubles with zero-CAS disjoint stripes up to `max_mib`.
+/// Eliminates per-thread `LongCache` wipes and `SpillMap` RwLock contention
+/// on German/compound-word corpora while staying tiny on English.
+pub struct SharedLongTable {
+    cur: AtomicPtr<LTable>,
+    retired: std::sync::Mutex<Vec<*mut LTable>>,
+    growing: AtomicBool,
+    max_bits: AtomicU32,
+}
+
+unsafe impl Send for SharedLongTable {}
+unsafe impl Sync for SharedLongTable {}
+
+impl SharedLongTable {
+    pub fn new(max_mib: usize) -> Self {
+        let t = SharedLongTable {
+            cur: AtomicPtr::new(std::ptr::null_mut()),
+            retired: std::sync::Mutex::new(Vec::new()),
+            growing: AtomicBool::new(false),
+            max_bits: AtomicU32::new(LONG_MIN_BITS),
+        };
+        t.set_limit_mib(max_mib);
+        t
+    }
+
+    pub fn set_limit_mib(&self, max_mib: usize) {
+        let slots = (max_mib << 20) / 64;
+        let bits = if slots < (1 << LONG_MIN_BITS) {
+            0
+        } else {
+            usize::BITS - 1 - slots.leading_zeros()
+        };
+        self.max_bits.store(bits, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    fn load_meta(s: &LSlot) -> u32 {
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let val: u32;
+            unsafe {
+                std::arch::asm!(
+                    "ldapr {val:w}, [{ptr}]",
+                    val = out(reg) val,
+                    ptr = in(reg) &s.meta,
+                    options(nostack, readonly, preserves_flags),
+                );
+            }
+            val
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            s.meta.load(Ordering::Acquire)
+        }
+    }
+
+    #[inline(always)]
+    pub fn view(&self) -> LongView<'_> {
+        let tp = self.cur.load(Ordering::Acquire);
+        if tp.is_null() {
+            return LongView {
+                base: std::ptr::null(),
+                end: std::ptr::null(),
+                shift: 0,
+                _t: std::marker::PhantomData,
+            };
+        }
+        let t = unsafe { &*tp };
+        LongView {
+            base: t.ptr as *const LSlot,
+            end: unsafe { (t.ptr as *const LSlot).add(t.len) },
+            shift: t.shift,
+            _t: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn get_into(&self, k: [u64; 4], h: u64, out: &mut Vec<u32>) -> LongHit {
+        let v = self.view();
+        if !v.is_valid() {
+            return LongHit::Empty;
+        }
+        unsafe { v.get_into_at(k, v.slot_addr(h), out) }
+    }
+
+    /// Store 1..=11 tokens inline (1..=7 uncompressed, 8..=11 20-bit packed),
+    /// or record a `SPILLED` marker and return `false` so caller uses SpillMap.
+    pub fn put(&self, k: [u64; 4], h: u64, toks: &[u32]) -> bool {
+        let max_b = self.max_bits.load(Ordering::Relaxed);
+        if max_b == 0 {
+            return false;
+        }
+        let mut tp = self.cur.load(Ordering::Acquire);
+        if tp.is_null() {
+            tp = self.init_table();
+            if tp.is_null() {
+                return false;
+            }
+        }
+        let t = unsafe { &*tp };
+        if t.count.0.load(Ordering::Relaxed) * 8 >= t.len * 5 {
+            if t.bits() < max_b {
+                self.grow_to(t, t.bits() + 1);
+            } else {
+                return false;
+            }
+        }
+        if self.growing.load(Ordering::Acquire) {
+            return false;
+        }
+        let t = unsafe { &*self.cur.load(Ordering::Acquire) };
+        let (words, pub_meta, inline) = if !toks.is_empty() && toks.len() <= 7 {
+            let mut w = [0u32; 7];
+            w[..toks.len()].copy_from_slice(toks);
+            (w, 2 | ((toks.len() as u32) << 2), true)
+        } else if let Some((w, m)) = pack_11_words(toks) {
+            (w, m, true)
+        } else {
+            ([0u32; 7], 2 | ((SPILLED as u32) << 2), false)
+        };
+        let mut i = (h >> t.shift) as usize;
+        for _ in 0..PROBE_MAX {
+            let s = t.slot(i);
+            let mut m = s.meta.load(Ordering::Relaxed);
+            if m == 0 {
+                match s.meta.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+                    Ok(_) => {
+                        for j in 0..4 {
+                            s.k[j].store(k[j], Ordering::Relaxed);
+                        }
+                        for j in 0..7 {
+                            s.toks[j].store(words[j], Ordering::Relaxed);
+                        }
+                        s.meta.store(pub_meta, Ordering::Release);
+                        PENDING_LONG.with(|c| {
+                            let v = c.get() + 1;
+                            if v >= 32 {
+                                t.count.0.fetch_add(v, Ordering::Relaxed);
+                                c.set(0);
+                            } else {
+                                c.set(v);
+                            }
+                        });
+                        return inline;
+                    }
+                    Err(cur) => m = cur,
+                }
+            }
+            if m >= 2
+                && s.k[0].load(Ordering::Relaxed) == k[0]
+                && s.k[1].load(Ordering::Relaxed) == k[1]
+                && s.k[2].load(Ordering::Relaxed) == k[2]
+                && s.k[3].load(Ordering::Relaxed) == k[3]
+            {
+                return inline;
+            }
+            i = (i + 1) & t.mask;
+        }
+        false
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn init_table(&self) -> *mut LTable {
+        if self.growing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return self.cur.load(Ordering::Acquire);
+        }
+        let cur = self.cur.load(Ordering::Acquire);
+        let out = if cur.is_null() {
+            let p = Box::into_raw(LTable::new(LONG_MIN_BITS));
+            self.cur.store(p, Ordering::Release);
+            p
+        } else {
+            cur
+        };
+        self.growing.store(false, Ordering::Release);
+        out
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_to(&self, old: &LTable, bits: u32) {
+        if self.growing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let cur = self.cur.load(Ordering::Acquire);
+        if !std::ptr::eq(cur, old) || unsafe { &*cur }.bits() >= bits {
+            self.growing.store(false, Ordering::Release);
+            return;
+        }
+        let new = LTable::new(bits);
+        let diff = bits - old.bits();
+        let copied = if old.len >= 16384 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+            struct RawLTable(*const LTable);
+            unsafe impl Sync for RawLTable {}
+            impl RawLTable {
+                #[inline(always)]
+                fn get(&self) -> &LTable {
+                    unsafe { &*self.0 }
+                }
+            }
+            let old_r = RawLTable(old as *const LTable);
+            let new_r = RawLTable(&*new as *const LTable);
+            let n_stripes = rayon::current_num_threads().min(old.len / 8192).max(1);
+            let stripe = old.len / n_stripes;
+            let parts: Vec<(usize, Vec<([u64; 4], [u32; 7], u32, u64)>)> = (0..n_stripes)
+                .into_par_iter()
+                .map(|si| {
+                    let old_t = old_r.get();
+                    let new_t = new_r.get();
+                    let s_lo = si * stripe;
+                    let s_hi = if si + 1 == n_stripes { old_t.len } else { s_lo + stripe };
+                    let d_lo = s_lo << diff;
+                    let d_hi = s_hi << diff;
+                    let mut n = 0usize;
+                    let mut ov = Vec::new();
+                    for i in s_lo..s_hi {
+                        let s = old_t.slot(i);
+                        let m = s.meta.load(Ordering::Acquire);
+                        if m < 2 {
+                            continue;
+                        }
+                        let k = [
+                            s.k[0].load(Ordering::Relaxed),
+                            s.k[1].load(Ordering::Relaxed),
+                            s.k[2].load(Ordering::Relaxed),
+                            s.k[3].load(Ordering::Relaxed),
+                        ];
+                        let h = hash32(k);
+                        let mut j = (h >> new_t.shift) as usize;
+                        if j >= d_lo && j < d_hi {
+                            while j < d_hi {
+                                let d = new_t.slot(j);
+                                if d.meta.load(Ordering::Relaxed) == 0 {
+                                    for x in 0..4 {
+                                        d.k[x].store(k[x], Ordering::Relaxed);
+                                    }
+                                    for x in 0..7 {
+                                        d.toks[x].store(s.toks[x].load(Ordering::Relaxed), Ordering::Relaxed);
+                                    }
+                                    d.meta.store(m, Ordering::Relaxed);
+                                    n += 1;
+                                    break;
+                                }
+                                j += 1;
+                            }
+                            if j == d_hi {
+                                let mut tv = [0u32; 7];
+                                for x in 0..7 {
+                                    tv[x] = s.toks[x].load(Ordering::Relaxed);
+                                }
+                                ov.push((k, tv, m, h));
+                            }
+                        } else {
+                            let mut tv = [0u32; 7];
+                            for x in 0..7 {
+                                tv[x] = s.toks[x].load(Ordering::Relaxed);
+                            }
+                            ov.push((k, tv, m, h));
+                        }
+                    }
+                    (n, ov)
+                })
+                .collect();
+            let mut total = 0usize;
+            for (n, ov) in parts {
+                total += n;
+                for (k, tv, m, h) in ov {
+                    let mut j = (h >> new.shift) as usize;
+                    loop {
+                        let d = new.slot(j);
+                        if d.meta.load(Ordering::Relaxed) == 0 {
+                            for x in 0..4 {
+                                d.k[x].store(k[x], Ordering::Relaxed);
+                            }
+                            for x in 0..7 {
+                                d.toks[x].store(tv[x], Ordering::Relaxed);
+                            }
+                            d.meta.store(m, Ordering::Relaxed);
+                            total += 1;
+                            break;
+                        }
+                        j = (j + 1) & new.mask;
+                    }
+                }
+            }
+            total
+        } else {
+            let mut copied = 0usize;
+            for i in 0..old.len {
+                let s = old.slot(i);
+                let m = s.meta.load(Ordering::Acquire);
+                if m < 2 {
+                    continue;
+                }
+                let k = [
+                    s.k[0].load(Ordering::Relaxed),
+                    s.k[1].load(Ordering::Relaxed),
+                    s.k[2].load(Ordering::Relaxed),
+                    s.k[3].load(Ordering::Relaxed),
+                ];
+                let mut j = (hash32(k) >> new.shift) as usize;
+                loop {
+                    let d = new.slot(j);
+                    if d.meta.load(Ordering::Relaxed) == 0 {
+                        for x in 0..4 {
+                            d.k[x].store(k[x], Ordering::Relaxed);
+                        }
+                        for x in 0..7 {
+                            d.toks[x].store(s.toks[x].load(Ordering::Relaxed), Ordering::Relaxed);
+                        }
+                        d.meta.store(m, Ordering::Relaxed);
+                        copied += 1;
+                        break;
+                    }
+                    j = (j + 1) & new.mask;
+                }
+            }
+            copied
+        };
+        new.count.0.store(copied, Ordering::Relaxed);
+        let newp = Box::into_raw(new);
+        self.cur.store(newp, Ordering::Release);
+        self.retired.lock().unwrap_or_else(|e| e.into_inner()).push(cur);
+        self.growing.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for SharedLongTable {
+    fn drop(&mut self) {
+        unsafe {
+            let cur = *self.cur.get_mut();
+            if !cur.is_null() {
+                drop(Box::from_raw(cur));
+            }
+            for p in self.retired.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                drop(Box::from_raw(p));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod long_table_tests {
+    use super::*;
+
+    #[test]
+    fn shared_long_table_roundtrip_and_pack11() {
+        let t = SharedLongTable::new(16);
+        let mut out = Vec::new();
+        for len in 16..=31usize {
+            let key: Vec<u8> = (0..len).map(|i| b'a' + ((i + len) % 26) as u8).collect();
+            let k = pack32_at(&key, 0, len);
+            // Also verify wide load path when padded with >=32 bytes
+            let mut padded = key.clone();
+            padded.extend_from_slice(&[0xFF; 32]);
+            assert_eq!(k, pack32_at(&padded, 0, len));
+            let h = hash32(k);
+            let ntok = 1 + (len % 11); // tests 1..=11 tokens!
+            let want: Vec<u32> = (0..ntok as u32).map(|i| (i * 173_111 + len as u32) & PACK20_MAX_TOK).collect();
+            assert_eq!(t.get_into(k, h, &mut out), LongHit::Empty);
+            assert!(t.put(k, h, &want));
+            out.clear();
+            assert_eq!(t.get_into(k, h, &mut out), LongHit::Hit);
+            assert_eq!(out, want);
+        }
+        // 12 tokens -> spilled
+        let key12 = b"twelve_tokens_long_word!";
+        let k12 = pack32_at(key12, 0, key12.len());
+        let h12 = hash32(k12);
+        assert!(!t.put(k12, h12, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]));
+        assert_eq!(t.get_into(k12, h12, &mut out), LongHit::Spilled);
     }
 }
