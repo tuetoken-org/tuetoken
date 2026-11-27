@@ -9,17 +9,28 @@ struct Entry {
 }
 
 const PACK_RANK_BITS: u32 = 22;
+const PACK_RANK_MASK: u32 = (1u32 << PACK_RANK_BITS) - 1;
+const PACK_KEY_MASK: u64 = !(PACK_RANK_MASK as u64);
 const PACK_MAX_TOK: usize = 1 << 21;
 const PACK_MAX_RANK: usize = (1 << PACK_RANK_BITS) - 2; // +1 stored in 1..=PACK_RANK_MASK
 const DENSE_NONE: u16 = u16::MAX;
 const DENSE_OVERFLOW: u16 = u16::MAX - 1;
 
+/// One 64-byte cache-line bucket holding 8 packed `(t1 << 43) | (t2 << 22) | (rank + 1)`
+/// entries filled left-to-right in ascending rank order. Probed 8-wide in parallel
+/// via AVX-512F / AVX2 / NEON with a single branch for all 8 slots and exact
+/// overflow termination via `slot[7] == 0`.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct MergeBucket([u64; 8]);
+const _: () = assert!(std::mem::size_of::<MergeBucket>() == 64);
+
 pub struct MergeMap {
-    /// Packed 8-byte open-addressing table: `(t1 << 43) | (t2 << 22) | (rank + 1)`.
-    /// 4x smaller than baseline 16B/3x table (2 MiB for o200k, 512 KiB for gpt2),
-    /// backed by 2 MiB-aligned Linux THP via `HugeVec<u64>`.
-    /// Empty sentinel is 0 (rank + 1 >= 1, so every live entry is non-zero).
-    packed: crate::chunk_table::HugeVec<u64>,
+    /// 64B cache-line SIMD-bucketed table (exact same footprint as flat u64:
+    /// 2 MiB o200k, 1 MiB cl100k, 512 KiB gpt2), backed by 2 MiB-aligned Linux THP.
+    buckets: crate::chunk_table::HugeVec<MergeBucket>,
+    bmask: usize,
+    bshift: u32,
     /// Fallback 16-byte table (empty for all normal vocabularies < 2M tokens).
     entries: Vec<Entry>,
     mask: usize,
@@ -108,8 +119,11 @@ impl MergeMap {
         let mut can_lr = vec![0u8; (vocab_n + 3) >> 2];
         let mut dense = vec![DENSE_NONE; 1 << 16];
         let mut has_dense_overflow = false;
-        let mut packed = if use_packed {
-            crate::chunk_table::HugeVec::<u64>::zeroed(cap)
+        let nbuckets = (cap >> 3).max(2);
+        let bmask = nbuckets - 1;
+        let bshift = 64 - nbuckets.trailing_zeros();
+        let mut buckets = if use_packed {
+            crate::chunk_table::HugeVec::<MergeBucket>::zeroed(nbuckets)
         } else {
             crate::chunk_table::HugeVec::empty()
         };
@@ -152,16 +166,21 @@ impl MergeMap {
                 let kh = Self::pack_key(t1, t2);
                 let h = Self::hash_packed(kh);
                 bloom[(h >> bloom_shift) as usize] |= Self::bloom_mask(h);
-                let mut idx = (h >> shift) as usize;
-                while packed[idx] != 0 {
-                    // Keep first (lowest-rank) duplicate pair if any.
-                    if (packed[idx] ^ kh) < (1u64 << PACK_RANK_BITS) {
-                        break;
+                let mut b = (h >> bshift) as usize;
+                'ins: loop {
+                    let buck = &mut buckets[b].0;
+                    for slot in buck.iter_mut() {
+                        let e = *slot;
+                        if e == 0 {
+                            *slot = kh | (r as u64 + 1);
+                            break 'ins;
+                        }
+                        if (e & PACK_KEY_MASK) == kh {
+                            // Keep first (lowest-rank) duplicate pair if any.
+                            break 'ins;
+                        }
                     }
-                    idx = (idx + 1) & mask;
-                }
-                if packed[idx] == 0 {
-                    packed[idx] = kh | (r as u64 + 1);
+                    b = (b + 1) & bmask;
                 }
             } else {
                 let key = Self::key(t1, t2);
@@ -180,7 +199,9 @@ impl MergeMap {
             }
         }
         MergeMap {
-            packed,
+            buckets,
+            bmask,
+            bshift,
             entries,
             mask,
             shift,
@@ -202,7 +223,7 @@ impl MergeMap {
     /// Precompute direct raw-byte pair ranks (`dense_byte`) and per-byte `can_lr`
     /// flags for ByteLevel models so cold BPE reads straight from `&[u8]`.
     pub fn init_byte_tables(&mut self, singleton: &[i32; 256]) -> bool {
-        if self.packed.is_empty() || singleton.iter().any(|&t| t < 0 || (t as usize) >= self.vocab_n) {
+        if self.buckets.is_empty() || singleton.iter().any(|&t| t < 0 || (t as usize) >= self.vocab_n) {
             return false;
         }
         let mut db = vec![DENSE_NONE; 1 << 16];
@@ -310,36 +331,141 @@ impl MergeMap {
         }
     }
 
+    /// Portable scalar 64B-bucket probe (fallback for non-SIMD / SSE2 x86_64).
+    #[cfg(not(target_arch = "aarch64"))]
     #[inline(always)]
-    fn probe_packed_kh(&self, kh: u64, mut idx: usize) -> u32 {
-        // Probe 0 unrolled: merges are inserted in rank order so >95% of hot
-        // hits resolve at the home slot with zero loop/mask overhead.
-        let e0 = unsafe { *self.packed.get_unchecked(idx) };
-        let d0 = e0 ^ kh;
-        if d0.wrapping_sub(1) < (1u64 << PACK_RANK_BITS) - 1 {
-            return (d0 as u32) - 1;
-        }
-        if e0 == 0 {
-            return u32::MAX;
-        }
+    fn probe_bucket_scalar(&self, kh: u64, mut b: usize) -> u32 {
         loop {
-            idx = (idx + 1) & self.mask;
-            // SAFETY: idx is masked to < packed.len().
-            let e = unsafe { *self.packed.get_unchecked(idx) };
-            let diff = e ^ kh;
-            if diff.wrapping_sub(1) < (1u64 << PACK_RANK_BITS) - 1 {
-                return (diff as u32) - 1;
+            // SAFETY: b is masked to < buckets.len().
+            let buck = unsafe { &self.buckets.get_unchecked(b).0 };
+            for &e in buck {
+                let diff = e ^ kh;
+                if diff.wrapping_sub(1) < (1u64 << PACK_RANK_BITS) - 1 {
+                    return (diff as u32) - 1;
+                }
+                if e == 0 {
+                    return u32::MAX;
+                }
             }
-            if e == 0 {
+            b = (b + 1) & self.bmask;
+        }
+    }
+
+    /// ARM64 NEON 8-wide branchless 64B-bucket probe: loads one cache line
+    /// (`2 x ldp q`), compares all 8 keys in parallel, and OR-reduces the
+    /// matching slot's value directly in registers (zero second memory load,
+    /// zero `tzcnt`, single branch for all 8 slots).
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn probe_bucket_neon(&self, kh: u64, mut b: usize) -> u32 {
+        use std::arch::aarch64::*;
+        let buckets = self.buckets.as_ptr();
+        let km = vdupq_n_u64(PACK_KEY_MASK);
+        let tgt = vdupq_n_u64(kh);
+        loop {
+            let bp = buckets.add(b);
+            let p = (*bp).0.as_ptr();
+            let v0 = vld1q_u64(p);
+            let v1 = vld1q_u64(p.add(2));
+            let v2 = vld1q_u64(p.add(4));
+            let v3 = vld1q_u64(p.add(6));
+            let c0 = vceqq_u64(vandq_u64(v0, km), tgt);
+            let c1 = vceqq_u64(vandq_u64(v1, km), tgt);
+            let c2 = vceqq_u64(vandq_u64(v2, km), tgt);
+            let c3 = vceqq_u64(vandq_u64(v3, km), tgt);
+            let h01 = vorrq_u64(vandq_u64(c0, v0), vandq_u64(c1, v1));
+            let h23 = vorrq_u64(vandq_u64(c2, v2), vandq_u64(c3, v3));
+            let hit = vorrq_u64(h01, h23);
+            let val = vgetq_lane_u64::<0>(hit) | vgetq_lane_u64::<1>(hit);
+            if val != 0 {
+                return ((val as u32) & PACK_RANK_MASK) - 1;
+            }
+            if (*bp).0[7] == 0 {
                 return u32::MAX;
             }
+            b = (b + 1) & self.bmask;
+        }
+    }
+
+    /// x86_64 AVX-512F 8-wide branchless 64B-bucket probe: 1 aligned 64B load
+    /// + `vpandq` + `vpcmpeqq` + `vpcompressq` extracts the matching rank in
+    /// registers with 1 branch across all 8 slots.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,bmi1")]
+    #[inline]
+    unsafe fn probe_bucket_avx512(&self, kh: u64, mut b: usize) -> u32 {
+        use std::arch::x86_64::*;
+        let buckets = self.buckets.as_ptr();
+        let km = _mm512_set1_epi64(PACK_KEY_MASK as i64);
+        let tgt = _mm512_set1_epi64(kh as i64);
+        loop {
+            let bp = buckets.add(b);
+            let v = _mm512_load_si512(bp as *const _);
+            let m = _mm512_cmpeq_epi64_mask(_mm512_and_si512(v, km), tgt);
+            if m != 0 {
+                let hit = _mm512_maskz_compress_epi64(m, v);
+                let lo = _mm512_cvtsi512_si32(hit) as u32;
+                return (lo & PACK_RANK_MASK) - 1;
+            }
+            if (*bp).0[7] == 0 {
+                return u32::MAX;
+            }
+            b = (b + 1) & self.bmask;
+        }
+    }
+
+    /// x86_64 AVX2 8-wide branchless 64B-bucket probe: 2 aligned 32B loads +
+    /// register OR-reduce with 1 branch across all 8 slots.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1")]
+    #[inline]
+    unsafe fn probe_bucket_avx2(&self, kh: u64, mut b: usize) -> u32 {
+        use std::arch::x86_64::*;
+        let buckets = self.buckets.as_ptr();
+        let km = _mm256_set1_epi64x(PACK_KEY_MASK as i64);
+        let tgt = _mm256_set1_epi64x(kh as i64);
+        loop {
+            let bp = buckets.add(b);
+            let p = bp as *const __m256i;
+            let v0 = _mm256_load_si256(p);
+            let v1 = _mm256_load_si256(p.add(1));
+            let c0 = _mm256_cmpeq_epi64(_mm256_and_si256(v0, km), tgt);
+            let c1 = _mm256_cmpeq_epi64(_mm256_and_si256(v1, km), tgt);
+            let hit = _mm256_or_si256(_mm256_and_si256(c0, v0), _mm256_and_si256(c1, v1));
+            let lo128 = _mm256_castsi256_si128(hit);
+            let hi128 = _mm256_extracti128_si256::<1>(hit);
+            let r128 = _mm_or_si128(lo128, hi128);
+            let val = (_mm_cvtsi128_si64(r128) | _mm_extract_epi64::<1>(r128)) as u64;
+            if val != 0 {
+                return ((val as u32) & PACK_RANK_MASK) - 1;
+            }
+            if (*bp).0[7] == 0 {
+                return u32::MAX;
+            }
+            b = (b + 1) & self.bmask;
         }
     }
 
     #[inline(always)]
+    fn probe_bucket_best(&self, kh: u64, b: usize) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        return unsafe { self.probe_bucket_neon(kh, b) };
+        #[cfg(target_arch = "x86_64")]
+        {
+            match bpe_x86_tier() {
+                3 => return unsafe { self.probe_bucket_avx512(kh, b) },
+                2 => return unsafe { self.probe_bucket_avx2(kh, b) },
+                _ => return self.probe_bucket_scalar(kh, b),
+            }
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        self.probe_bucket_scalar(kh, b)
+    }
+
+    #[inline(always)]
     fn probe_table(&self, t1: u32, t2: u32, idx: usize) -> u32 {
-        if !self.packed.is_empty() {
-            return self.probe_packed_kh(Self::pack_key(t1, t2), idx);
+        if !self.buckets.is_empty() {
+            return self.probe_bucket_best(Self::pack_key(t1, t2), idx);
         }
         let mut idx = idx;
         let key = Self::key(t1, t2);
@@ -356,10 +482,10 @@ impl MergeMap {
     }
 
     #[inline(always)]
-    fn prefetch_idx(&self, idx: usize) {
-        if !self.packed.is_empty() {
-            // SAFETY: idx < packed.len() (computed via hash_packed >> shift).
-            let p = unsafe { self.packed.as_ptr().add(idx) as *const u8 };
+    fn prefetch_bucket(&self, b: usize) {
+        if !self.buckets.is_empty() {
+            // SAFETY: b < buckets.len() (computed via hash_packed >> bshift).
+            let p = unsafe { self.buckets.as_ptr().add(b) as *const u8 };
             crate::chunk_table::prefetch(p);
         }
     }
@@ -367,10 +493,10 @@ impl MergeMap {
     #[cold]
     #[inline(never)]
     fn probe_dense_overflow(&self, t1: u32, t2: u32) -> u32 {
-        if !self.packed.is_empty() {
+        if !self.buckets.is_empty() {
             let kh = Self::pack_key(t1, t2);
             let h = Self::hash_packed(kh);
-            return self.probe_packed_kh(kh, (h >> self.shift) as usize);
+            return self.probe_bucket_best(kh, (h >> self.bshift) as usize);
         }
         let key = Self::key(t1, t2);
         let h = Self::hash_key(key);
@@ -392,13 +518,13 @@ impl MergeMap {
         } else if !self.can_merge(t1, t2) {
             return u32::MAX;
         }
-        if !self.packed.is_empty() {
+        if !self.buckets.is_empty() {
             let kh = Self::pack_key(t1, t2);
             let h = Self::hash_packed(kh);
             if !self.bloom_may_contain(h) {
                 return u32::MAX;
             }
-            return self.probe_packed_kh(kh, (h >> self.shift) as usize);
+            return self.probe_bucket_best(kh, (h >> self.bshift) as usize);
         }
         let h = Self::hash_key(Self::key(t1, t2));
         if !self.bloom_may_contain(h) {
@@ -582,29 +708,32 @@ const INIT_NEXT: [u8; MAX_SMALL] = {
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn has_bmi1() -> bool {
+fn bpe_x86_tier() -> u8 {
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    let s = STATE.load(Ordering::Relaxed);
-    if s != 0 {
-        return s == 2;
+    static TIER: AtomicU8 = AtomicU8::new(0);
+    let t = TIER.load(Ordering::Relaxed);
+    if t != 0 {
+        return t;
     }
-    let ok = std::is_x86_feature_detected!("bmi1");
-    STATE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
-    ok
+    let detected = if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("bmi1") {
+        3
+    } else if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi1") {
+        2
+    } else if std::is_x86_feature_detected!("bmi1") {
+        1
+    } else {
+        4
+    };
+    TIER.store(detected, Ordering::Relaxed);
+    detected
 }
 
 /// Stack doubly-linked-list canonical BPE merge with zero-STLF `active: u64`
-/// bitmask min-reduction:
-/// - Tracks only currently mergeable pair indices in a 64-bit `active` mask.
-/// - Reads `rnk[i]` with matching 4-byte scalar loads (eliminates the 12-18
-///   cycle Store-To-Load Forwarding stall from wide SIMD loads overlapping
-///   narrow 4-byte scalar writes on both Zen 4 and Apple Silicon).
-/// - Instant zero-load exit on `active == 0` and 1-load exit when 1 pair left.
+/// bitmask min-reduction and 64B cache-line SIMD bucket probing.
 macro_rules! merge_small_ll_body {
-    ($tokens:expr, $map:expr) => {{
+    ($tokens:expr, $map:expr, $probe:ident) => {{
         let n = $tokens.len();
-        debug_assert!(n >= 2 && n <= MAX_SMALL && !$map.packed.is_empty());
+        debug_assert!(n >= 2 && n <= MAX_SMALL && !$map.buckets.is_empty());
         if n == 2 {
             let r = $map.lookup_rank(*$tokens.get_unchecked(0), *$tokens.get_unchecked(1));
             if r != u32::MAX {
@@ -708,24 +837,24 @@ macro_rules! merge_small_ll_body {
                         kh_l = MergeMap::pack_key(*tok.add(l), merged);
                         let hl = MergeMap::hash_packed(kh_l);
                         if $map.bloom_may_contain(hl) {
-                            idx_l = (hl >> $map.shift) as usize;
+                            idx_l = (hl >> $map.bshift) as usize;
                         }
                     }
                     if do_r {
                         kh_r = MergeMap::pack_key(merged, *tok.add(rr));
                         let hr = MergeMap::hash_packed(kh_r);
                         if $map.bloom_may_contain(hr) {
-                            idx_r = (hr >> $map.shift) as usize;
+                            idx_r = (hr >> $map.bshift) as usize;
                         }
                     }
                     if idx_l != usize::MAX && idx_r != usize::MAX {
-                        $map.prefetch_idx(idx_l);
-                        $map.prefetch_idx(idx_r);
-                        ($map.probe_packed_kh(kh_l, idx_l), $map.probe_packed_kh(kh_r, idx_r))
+                        $map.prefetch_bucket(idx_l);
+                        $map.prefetch_bucket(idx_r);
+                        ($map.$probe(kh_l, idx_l), $map.$probe(kh_r, idx_r))
                     } else {
                         (
-                            if idx_l != usize::MAX { $map.probe_packed_kh(kh_l, idx_l) } else { u32::MAX },
-                            if idx_r != usize::MAX { $map.probe_packed_kh(kh_r, idx_r) } else { u32::MAX },
+                            if idx_l != usize::MAX { $map.$probe(kh_l, idx_l) } else { u32::MAX },
+                            if idx_r != usize::MAX { $map.$probe(kh_r, idx_r) } else { u32::MAX },
                         )
                     }
                 } else {
@@ -766,39 +895,68 @@ macro_rules! merge_small_ll_body {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi1")]
-unsafe fn merge_small_ll_bmi1(tokens: &mut Vec<u32>, map: &MergeMap) {
-    merge_small_ll_body!(tokens, map)
+#[target_feature(enable = "avx512f,bmi1")]
+unsafe fn merge_small_ll_avx512(tokens: &mut Vec<u32>, map: &MergeMap) {
+    merge_small_ll_body!(tokens, map, probe_bucket_avx512)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1")]
+unsafe fn merge_small_ll_avx2(tokens: &mut Vec<u32>, map: &MergeMap) {
+    merge_small_ll_body!(tokens, map, probe_bucket_avx2)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi1")]
+unsafe fn merge_small_ll_bmi1(tokens: &mut Vec<u32>, map: &MergeMap) {
+    merge_small_ll_body!(tokens, map, probe_bucket_scalar)
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn merge_small_ll_default(tokens: &mut Vec<u32>, map: &MergeMap) {
-    merge_small_ll_body!(tokens, map)
+    merge_small_ll_body!(tokens, map, probe_bucket_neon)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+unsafe fn merge_small_ll_default(tokens: &mut Vec<u32>, map: &MergeMap) {
+    merge_small_ll_body!(tokens, map, probe_bucket_scalar)
 }
 
 #[inline]
 fn merge_small_canonical(tokens: &mut Vec<u32>, map: &MergeMap) {
     #[cfg(target_arch = "x86_64")]
     {
-        if has_bmi1() {
-            // SAFETY: BMI1 runtime-checked above.
-            unsafe { merge_small_ll_bmi1(tokens, map) };
-            return;
+        match bpe_x86_tier() {
+            3 => {
+                unsafe { merge_small_ll_avx512(tokens, map) };
+                return;
+            }
+            2 => {
+                unsafe { merge_small_ll_avx2(tokens, map) };
+                return;
+            }
+            1 => {
+                unsafe { merge_small_ll_bmi1(tokens, map) };
+                return;
+            }
+            _ => {}
         }
     }
-    // SAFETY: invariants enforced by caller (`2 <= tokens.len() <= 64 && !map.packed.is_empty()`).
+    // SAFETY: invariants enforced by caller (`2 <= tokens.len() <= 64 && !map.buckets.is_empty()`).
     unsafe { merge_small_ll_default(tokens, map) };
 }
 
 /// Zero-copy direct byte-slice -> `out: &mut Vec<u32>` canonical BPE merge:
 /// - Eliminates the 4 redundant `s.chunk` copies on every cold merge.
 /// - Uses `dense_byte[(b0 << 8) | b1]` to break the `singleton -> dense` chain.
-/// - Maintains a 64B stack `lr[64]` array (cuts `can_lr` loads 3x).
-/// - Zero-STLF `active: u64` bitmask min-reduction (eliminates wide-load STLF
-///   stalls and scans only live mergeable pairs with 2-way ILP unrolling).
+/// - Maintains a 64B stack `lr[65]` array with sentinel 0s at `n` and `MAX_SMALL`.
+/// - Zero-STLF `active: u64` bitmask min-reduction with 2-way ILP unrolling.
+/// - 64B cache-line 8-wide SIMD bucket probing (AVX-512F / AVX2 / NEON).
 /// - Specializes `n == 1, 2, 3` with zero stack arrays or linked-list setup.
 macro_rules! merge_bytes_ll_body {
-    ($chunk:expr, $singleton:expr, $map:expr, $out:expr) => {{
+    ($chunk:expr, $singleton:expr, $map:expr, $out:expr, $probe:ident) => {{
         let n = $chunk.len();
         debug_assert!(n >= 1 && n <= MAX_SMALL && !$map.dense_byte.is_empty());
         let cp = $chunk.as_ptr();
@@ -992,16 +1150,16 @@ macro_rules! merge_bytes_ll_body {
                         // Issue both L2 Bloom loads concurrently with zero intervening branch!
                         let ok_l = $map.bloom_may_contain(hl);
                         let ok_r = $map.bloom_may_contain(hr);
-                        let idx_l = (hl >> $map.shift) as usize;
-                        let idx_r = (hr >> $map.shift) as usize;
+                        let b_l = (hl >> $map.bshift) as usize;
+                        let b_r = (hr >> $map.bshift) as usize;
                         if ok_l && ok_r {
-                            $map.prefetch_idx(idx_l);
-                            $map.prefetch_idx(idx_r);
-                            ($map.probe_packed_kh(kh_l, idx_l), $map.probe_packed_kh(kh_r, idx_r))
+                            $map.prefetch_bucket(b_l);
+                            $map.prefetch_bucket(b_r);
+                            ($map.$probe(kh_l, b_l), $map.$probe(kh_r, b_r))
                         } else {
                             (
-                                if ok_l { $map.probe_packed_kh(kh_l, idx_l) } else { u32::MAX },
-                                if ok_r { $map.probe_packed_kh(kh_r, idx_r) } else { u32::MAX },
+                                if ok_l { $map.$probe(kh_l, b_l) } else { u32::MAX },
+                                if ok_r { $map.$probe(kh_r, b_r) } else { u32::MAX },
                             )
                         }
                     } else if do_l {
@@ -1009,7 +1167,7 @@ macro_rules! merge_bytes_ll_body {
                         let hl = MergeMap::hash_packed(kh_l);
                         (
                             if $map.bloom_may_contain(hl) {
-                                $map.probe_packed_kh(kh_l, (hl >> $map.shift) as usize)
+                                $map.$probe(kh_l, (hl >> $map.bshift) as usize)
                             } else {
                                 u32::MAX
                             },
@@ -1021,7 +1179,7 @@ macro_rules! merge_bytes_ll_body {
                         (
                             u32::MAX,
                             if $map.bloom_may_contain(hr) {
-                                $map.probe_packed_kh(kh_r, (hr >> $map.shift) as usize)
+                                $map.$probe(kh_r, (hr >> $map.bshift) as usize)
                             } else {
                                 u32::MAX
                             },
@@ -1085,14 +1243,33 @@ macro_rules! merge_bytes_ll_body {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi1")]
-unsafe fn merge_bytes_ll_bmi1(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
-    merge_bytes_ll_body!(chunk, singleton, map, out)
+#[target_feature(enable = "avx512f,bmi1")]
+unsafe fn merge_bytes_ll_avx512(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
+    merge_bytes_ll_body!(chunk, singleton, map, out, probe_bucket_avx512)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1")]
+unsafe fn merge_bytes_ll_avx2(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
+    merge_bytes_ll_body!(chunk, singleton, map, out, probe_bucket_avx2)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi1")]
+unsafe fn merge_bytes_ll_bmi1(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
+    merge_bytes_ll_body!(chunk, singleton, map, out, probe_bucket_scalar)
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn merge_bytes_ll_default(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
-    merge_bytes_ll_body!(chunk, singleton, map, out)
+    merge_bytes_ll_body!(chunk, singleton, map, out, probe_bucket_neon)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+unsafe fn merge_bytes_ll_default(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
+    merge_bytes_ll_body!(chunk, singleton, map, out, probe_bucket_scalar)
 }
 
 /// Fast zero-copy canonical BPE for `1 <= chunk.len() <= 64` when
@@ -1101,9 +1278,20 @@ unsafe fn merge_bytes_ll_default(chunk: &[u8], singleton: &[u32; 256], map: &Mer
 pub fn merge_bytes_into(chunk: &[u8], singleton: &[u32; 256], map: &MergeMap, out: &mut Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
     {
-        if has_bmi1() {
-            unsafe { merge_bytes_ll_bmi1(chunk, singleton, map, out) };
-            return;
+        match bpe_x86_tier() {
+            3 => {
+                unsafe { merge_bytes_ll_avx512(chunk, singleton, map, out) };
+                return;
+            }
+            2 => {
+                unsafe { merge_bytes_ll_avx2(chunk, singleton, map, out) };
+                return;
+            }
+            1 => {
+                unsafe { merge_bytes_ll_bmi1(chunk, singleton, map, out) };
+                return;
+            }
+            _ => {}
         }
     }
     unsafe { merge_bytes_ll_default(chunk, singleton, map, out) };
@@ -1123,7 +1311,7 @@ pub fn merge(
     if n <= 1 {
         return true;
     }
-    if n <= MAX_SMALL && !map.packed.is_empty() {
+    if n <= MAX_SMALL && !map.buckets.is_empty() {
         // Exact canonical stack linked-list + SIMD min merge — faster AND
         // canonical even on rank-inverted vocabularies (never needs to bail!).
         merge_small_canonical(tokens, map);
@@ -1217,7 +1405,7 @@ pub fn merge_canonical(tokens: &mut Vec<u32>, map: &MergeMap, s: &mut CanonScrat
     if n <= 1 {
         return;
     }
-    if n <= MAX_SMALL && !map.packed.is_empty() {
+    if n <= MAX_SMALL && !map.buckets.is_empty() {
         merge_small_canonical(tokens, map);
         return;
     }
