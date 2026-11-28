@@ -3442,15 +3442,12 @@ impl Tokenizer {
         time_precision: f64,
         segment_size: usize,
     ) -> (Vec<u8>, bool) {
-        if decode_with_timestamps && self.whisper_ts_begin != u32::MAX {
-            let mut buf = self.gather_bytes_opts(ids, skip_special, true, time_precision, segment_size);
-            if self.decode_strip_space && buf.first() == Some(&b' ') {
-                buf.remove(0);
-            }
-            return (buf, false);
-        }
         let mut buf = Vec::new();
-        let is_ascii = self.gather_bytes_single_pass_into(ids, skip_special, &mut buf);
+        let is_ascii = if decode_with_timestamps && self.whisper_ts_begin != u32::MAX {
+            self.gather_bytes_into_opts(ids, skip_special, true, time_precision, segment_size, &mut buf)
+        } else {
+            self.gather_bytes_single_pass_into(ids, skip_special, &mut buf)
+        };
         if self.decode_strip_space && buf.first() == Some(&b' ') {
             buf.remove(0);
         }
@@ -3471,11 +3468,11 @@ impl Tokenizer {
         segment_size: usize,
         scratch_buf: &mut Vec<u8>,
     ) -> Bound<'py, PyString> {
-        if decode_with_timestamps && self.whisper_ts_begin != u32::MAX {
-            self.gather_bytes_into_opts(ids, skip_special, true, time_precision, segment_size, scratch_buf);
-            return bytes_to_pystr(py, self.strip_decoded(scratch_buf));
-        }
-        let is_ascii = self.gather_bytes_single_pass_into(ids, skip_special, scratch_buf);
+        let is_ascii = if decode_with_timestamps && self.whisper_ts_begin != u32::MAX {
+            self.gather_bytes_into_opts(ids, skip_special, true, time_precision, segment_size, scratch_buf)
+        } else {
+            self.gather_bytes_single_pass_into(ids, skip_special, scratch_buf)
+        };
         let slice = self.strip_decoded(scratch_buf);
         if is_ascii {
             ascii_bytes_to_pystr(py, slice)
@@ -3484,32 +3481,10 @@ impl Tokenizer {
         }
     }
 
-    /// Gather the raw bytes for `ids` from the contiguous token-byte arena into `buf`.
-    /// Two passes: sum lengths for one exact reservation, then memcpy each span.
-    fn gather_bytes_into(&self, ids: &[u32], buf: &mut Vec<u8>) {
-        buf.clear();
-        let nspans = self.byte_span.len();
-        let mut total = 0usize;
-        for &t in ids {
-            if (t as usize) < nspans {
-                total += unsafe { self.byte_span.get_unchecked(t as usize).1 } as usize;
-            }
-        }
-        buf.reserve(total);
-        for &t in ids {
-            let ti = t as usize;
-            if ti < nspans {
-                // SAFETY: ti < nspans; span (off,len) points inside byte_arena.
-                let (off, len) = unsafe { *self.byte_span.get_unchecked(ti) };
-                let (off, len) = (off as usize, len as usize);
-                buf.extend_from_slice(unsafe { self.byte_arena.get_unchecked(off..off + len) });
-            }
-        }
-    }
-
-    /// Gather the raw bytes for `ids` from the contiguous token-byte arena into `out` (cleared first), supporting
+    /// Gather the raw bytes for `ids` into `out` (cleared first), supporting
     /// `skip_special` and Whisper prompt stripping / timestamp stripping /
     /// multi-segment timestamp accumulation (`decode_with_timestamps=true`).
+    /// Returns `true` iff every emitted byte is guaranteed ASCII (`< 0x80`).
     fn gather_bytes_into_opts(
         &self,
         ids: &[u32],
@@ -3518,12 +3493,11 @@ impl Tokenizer {
         time_precision: f64,
         segment_size: usize,
         out: &mut Vec<u8>,
-    ) {
+    ) -> bool {
         out.clear();
         let ts_begin = self.whisper_ts_begin;
         if !skip_special && ts_begin == u32::MAX {
-            self.gather_bytes_into(ids, out);
-            return;
+            return self.gather_bytes_single_pass_into(ids, false, out);
         }
         // Whisper `_strip_prompt`: when `skip_special=true` and the sequence begins
         // with `<|startofprev|>`, drop everything before `<|startoftranscript|>`
@@ -3534,157 +3508,192 @@ impl Tokenizer {
         {
             match ids.iter().position(|&t| t == self.whisper_sot_id) {
                 Some(pos) => &ids[pos..],
-                None => return,
+                None => return true,
             }
         } else {
             ids
         };
 
-        let nspans = self.byte_span.len();
-        let skip_mask = &self.special_skip_mask;
-        let is_special = |t: u32| -> bool {
-            let ti = t as usize;
-            ti < skip_mask.len() && unsafe { *skip_mask.get_unchecked(ti) }
-        };
-
         if decode_with_timestamps && ts_begin != u32::MAX {
             // Exact single-pass port of HF `WhisperTokenizerFast._decode_with_timestamps`:
             // accumulate segment rollovers (>30s audio) and rewind consecutive
-            // boundary timestamps without per-segment Python decode re-entry.
+            // boundary timestamps using 16B inline `DecodeEntry` stores, 16-ahead
+            // prefetching, zero-alloc stack `marks`, and pure-ASCII tracking.
             use std::io::Write;
-            out.reserve(ids.len() * 4);
-            let mut marks: Vec<usize> = Vec::with_capacity(16);
-            marks.push(0);
+            let n = ids.len();
+            if n == 0 {
+                return true;
+            }
+            let dt = self.decode_table();
+            let ndt = dt.len();
+            let dtp = dt.as_ptr();
+            let arena = self.byte_arena.as_ptr();
+
+            out.reserve(n.saturating_mul(5).saturating_add(32));
+            let mut base = out.as_mut_ptr();
+            let mut dst = base;
+            let mut cap_end = unsafe { base.add(out.capacity()) };
+            let mut non_ascii = 0u8;
+
+            #[inline(always)]
+            unsafe fn ensure_cap(
+                out: &mut Vec<u8>,
+                base: &mut *mut u8,
+                dst: &mut *mut u8,
+                cap_end: &mut *mut u8,
+                need: usize,
+                rem_toks: usize,
+            ) {
+                let cur = (*dst).offset_from(*base) as usize;
+                out.set_len(cur);
+                out.reserve(need.saturating_add(rem_toks.saturating_mul(4)).saturating_add(32));
+                *base = out.as_mut_ptr();
+                *dst = (*base).add(cur);
+                *cap_end = (*base).add(out.capacity());
+            }
+
+            // Stack-backed mark buffer (zero heap alloc for <= 31 timestamps/transcript).
+            let mut marks_arr = [0usize; 64];
+            let mut marks_len = 1usize;
+            let mut marks_vec: Vec<usize> = Vec::new();
+            let push_mark = |val: usize, arr: &mut [usize; 64], mlen: &mut usize, mv: &mut Vec<usize>| {
+                if mv.is_empty() {
+                    if *mlen < 64 {
+                        arr[*mlen] = val;
+                        *mlen += 1;
+                    } else {
+                        mv.reserve(128);
+                        mv.extend_from_slice(&arr[..*mlen]);
+                        mv.push(val);
+                    }
+                } else {
+                    mv.push(val);
+                }
+            };
+
             let mut cur_max_ts = 0.0f64;
             let mut prev_seg_len = 0.0f64;
             let mut penult_ts = 0.0f64;
 
-            for (i, &t) in ids.iter().enumerate() {
-                if t >= ts_begin {
-                    let ts = (t - ts_begin) as f64 * time_precision;
-                    if ts < cur_max_ts {
-                        let last_was_single_ending =
-                            i >= 2 && !(ids[i - 1] >= ts_begin && ids[i - 2] >= ts_begin);
-                        if last_was_single_ending {
-                            prev_seg_len += time_precision * (segment_size as f64);
-                        } else {
-                            cur_max_ts = penult_ts;
-                            prev_seg_len += penult_ts;
-                            if marks.len() >= 2 {
-                                let new_len = marks.len() - 2;
-                                let cut = marks[new_len];
-                                marks.truncate(new_len);
-                                out.truncate(cut);
+            unsafe {
+                for i in 0..n {
+                    if i + 16 < n {
+                        let pt = *ids.get_unchecked(i + 16) as usize;
+                        if pt < ndt {
+                            chunk_table::prefetch(dtp.add(pt) as *const u8);
+                        }
+                    }
+                    let t = *ids.get_unchecked(i);
+                    if t >= ts_begin {
+                        let ts = (t - ts_begin) as f64 * time_precision;
+                        if ts < cur_max_ts {
+                            let last_was_single_ending =
+                                i >= 2 && !(*ids.get_unchecked(i - 1) >= ts_begin && *ids.get_unchecked(i - 2) >= ts_begin);
+                            if last_was_single_ending {
+                                prev_seg_len += time_precision * (segment_size as f64);
                             } else {
-                                marks.clear();
-                                out.clear();
+                                cur_max_ts = penult_ts;
+                                prev_seg_len += penult_ts;
+                                if marks_vec.is_empty() {
+                                    if marks_len >= 2 {
+                                        marks_len -= 2;
+                                        dst = base.add(marks_arr[marks_len]);
+                                    } else {
+                                        marks_len = 0;
+                                        dst = base;
+                                    }
+                                } else if marks_vec.len() >= 2 {
+                                    let new_len = marks_vec.len() - 2;
+                                    let cut = marks_vec[new_len];
+                                    marks_vec.truncate(new_len);
+                                    dst = base.add(cut);
+                                } else {
+                                    marks_vec.clear();
+                                    dst = base;
+                                }
                             }
                         }
-                    }
-                    penult_ts = cur_max_ts;
-                    cur_max_ts = ts;
-                    marks.push(out.len());
-                    // Fast fixed-point `<|S.CC|>` formatting for standard 0.02s Whisper
-                    // precision (exact match to `format!("<|{:.2}|>", val)` without std::fmt
-                    // float Dragonbox overhead); falls back to `write!` for non-standard precisions.
-                    let val = ts + prev_seg_len;
-                    if time_precision == 0.02 && (0.0..1e9).contains(&val) {
-                        let cents = (val * 100.0 + 0.5) as u64;
-                        let secs = cents / 100;
-                        let frac = (cents % 100) as u8;
-                        let mut tmp = [0u8; 24];
-                        let mut p = 0usize;
-                        tmp[p] = b'<'; p += 1;
-                        tmp[p] = b'|'; p += 1;
-                        if secs == 0 {
-                            tmp[p] = b'0'; p += 1;
+                        penult_ts = cur_max_ts;
+                        cur_max_ts = ts;
+                        let cur_len = dst.offset_from(base) as usize;
+                        push_mark(cur_len, &mut marks_arr, &mut marks_len, &mut marks_vec);
+                        // Fast fixed-point `<|S.CC|>` formatting for standard 0.02s Whisper
+                        // precision (exact match to `format!("<|{:.2}|>", val)` without std::fmt
+                        // float Dragonbox overhead); falls back to `write!` for non-standard precisions.
+                        let val = ts + prev_seg_len;
+                        if time_precision == 0.02 && (0.0..1e9).contains(&val) {
+                            if dst.add(24) > cap_end {
+                                ensure_cap(out, &mut base, &mut dst, &mut cap_end, 24, n - i);
+                            }
+                            let cents = (val * 100.0 + 0.5) as u64;
+                            let secs = cents / 100;
+                            let frac = (cents % 100) as u8;
+                            *dst = b'<';
+                            *dst.add(1) = b'|';
+                            dst = dst.add(2);
+                            if secs == 0 {
+                                *dst = b'0';
+                                dst = dst.add(1);
+                            } else {
+                                let mut d = [0u8; 12];
+                                let mut dn = 0usize;
+                                let mut s = secs;
+                                while s > 0 {
+                                    *d.get_unchecked_mut(dn) = b'0' + (s % 10) as u8;
+                                    s /= 10;
+                                    dn += 1;
+                                }
+                                while dn > 0 {
+                                    dn -= 1;
+                                    *dst = *d.get_unchecked(dn);
+                                    dst = dst.add(1);
+                                }
+                            }
+                            *dst = b'.';
+                            *dst.add(1) = b'0' + (frac / 10);
+                            *dst.add(2) = b'0' + (frac % 10);
+                            *dst.add(3) = b'|';
+                            *dst.add(4) = b'>';
+                            dst = dst.add(5);
                         } else {
-                            let mut d = [0u8; 12];
-                            let mut dn = 0usize;
-                            let mut s = secs;
-                            while s > 0 {
-                                d[dn] = b'0' + (s % 10) as u8;
-                                s /= 10;
-                                dn += 1;
+                            out.set_len(cur_len);
+                            let _ = write!(out, "<|{val:.2}|>");
+                            base = out.as_mut_ptr();
+                            dst = base.add(out.len());
+                            cap_end = base.add(out.capacity());
+                        }
+                        push_mark(dst.offset_from(base) as usize, &mut marks_arr, &mut marks_len, &mut marks_vec);
+                    } else {
+                        let ti = t as usize;
+                        if ti < ndt {
+                            let e = *dtp.add(ti);
+                            if skip_special && (e.flags & DEC_FLAG_SPECIAL) != 0 {
+                                continue;
                             }
-                            while dn > 0 {
-                                dn -= 1;
-                                tmp[p] = d[dn];
-                                p += 1;
+                            non_ascii |= e.flags;
+                            if e.len != DEC_OUTLINE_LEN {
+                                if dst.add(16) > cap_end {
+                                    ensure_cap(out, &mut base, &mut dst, &mut cap_end, 16, n - i);
+                                }
+                                std::ptr::copy_nonoverlapping(&e as *const DecodeEntry as *const u8, dst, 16);
+                                dst = dst.add(e.len as usize);
+                            } else {
+                                let (off, len) = e.outline_span();
+                                if dst.add(len + 16) > cap_end {
+                                    ensure_cap(out, &mut base, &mut dst, &mut cap_end, len + 16, n - i);
+                                }
+                                std::ptr::copy_nonoverlapping(arena.add(off), dst, len);
+                                dst = dst.add(len);
                             }
                         }
-                        tmp[p] = b'.'; p += 1;
-                        tmp[p] = b'0' + (frac / 10); p += 1;
-                        tmp[p] = b'0' + (frac % 10); p += 1;
-                        tmp[p] = b'|'; p += 1;
-                        tmp[p] = b'>'; p += 1;
-                        out.extend_from_slice(&tmp[..p]);
-                    } else {
-                        let _ = write!(out, "<|{val:.2}|>");
-                    }
-                    marks.push(out.len());
-                } else {
-                    if skip_special && is_special(t) {
-                        continue;
-                    }
-                    let ti = t as usize;
-                    if ti < nspans {
-                        // SAFETY: ti < nspans; span points inside byte_arena.
-                        let (off, len) = unsafe { *self.byte_span.get_unchecked(ti) };
-                        let (off, len) = (off as usize, len as usize);
-                        out.extend_from_slice(unsafe {
-                            self.byte_arena.get_unchecked(off..off + len)
-                        });
                     }
                 }
+                out.set_len(dst.offset_from(base) as usize);
             }
-            return;
+            return (non_ascii & DEC_FLAG_NON_ASCII) == 0;
         }
 
-        // Standard (or Whisper non-timestamped) decode: two-pass exact reserve.
-        let mut total = 0usize;
-        for &t in ids {
-            if t >= ts_begin || (skip_special && is_special(t)) {
-                continue;
-            }
-            let ti = t as usize;
-            if ti < nspans {
-                total += unsafe { self.byte_span.get_unchecked(ti).1 } as usize;
-            }
-        }
-        out.reserve(total);
-        for &t in ids {
-            if t >= ts_begin || (skip_special && is_special(t)) {
-                continue;
-            }
-            let ti = t as usize;
-            if ti < nspans {
-                // SAFETY: ti < nspans; span points inside byte_arena.
-                let (off, len) = unsafe { *self.byte_span.get_unchecked(ti) };
-                let (off, len) = (off as usize, len as usize);
-                out.extend_from_slice(unsafe { self.byte_arena.get_unchecked(off..off + len) });
-            }
-        }
-    }
-
-    fn gather_bytes_opts(
-        &self,
-        ids: &[u32],
-        skip_special: bool,
-        decode_with_timestamps: bool,
-        time_precision: f64,
-        segment_size: usize,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        self.gather_bytes_into_opts(
-            ids,
-            skip_special,
-            decode_with_timestamps,
-            time_precision,
-            segment_size,
-            &mut buf,
-        );
-        buf
+        self.gather_bytes_single_pass_into(ids, skip_special, out)
     }
 
     /// SentencePiece decode post-step: strip one leading space (the metaspace
@@ -11324,21 +11333,26 @@ mod perf {
             256,                           // <|endoftext|>
         ];
         // 1. skip_special=true, decode_with_timestamps=false: strips prompt, specials, AND timestamps
-        let s1 = String::from_utf8(tk.gather_bytes_opts(&ids_prompt_and_segs, true, false, 0.02, 1500)).unwrap();
-        assert_eq!(s1, "AB");
+        let (b1, a1) = tk.gather_bytes_fast_opts(&ids_prompt_and_segs, true, false, 0.02, 1500);
+        assert!(a1);
+        assert_eq!(String::from_utf8(b1).unwrap(), "AB");
         // 2. skip_special=false, decode_with_timestamps=false: keeps prompt & specials, strips timestamps
-        let s2 = String::from_utf8(tk.gather_bytes_opts(&ids_prompt_and_segs, false, false, 0.02, 1500)).unwrap();
-        assert_eq!(s2, "<|startofprev|>pr<|startoftranscript|>AB<|endoftext|>");
+        let (b2, a2) = tk.gather_bytes_fast_opts(&ids_prompt_and_segs, false, false, 0.02, 1500);
+        assert!(a2);
+        assert_eq!(String::from_utf8(b2).unwrap(), "<|startofprev|>pr<|startoftranscript|>AB<|endoftext|>");
         // 3. skip_special=true, decode_with_timestamps=true: strips prompt & specials, accumulates rollover!
-        let s3 = String::from_utf8(tk.gather_bytes_opts(&ids_prompt_and_segs, true, true, 0.02, 1500)).unwrap();
-        assert_eq!(s3, "<|0.00|>A<|20.00|><|25.00|>B<|30.00|>");
+        let (b3, a3) = tk.gather_bytes_fast_opts(&ids_prompt_and_segs, true, true, 0.02, 1500);
+        assert!(a3);
+        assert_eq!(String::from_utf8(b3).unwrap(), "<|0.00|>A<|20.00|><|25.00|>B<|30.00|>");
         // 4. Single-ending segment rollover (+30.00s): <|0.00|>X<|29.00|><|1.00|>Y<|5.00|>
         let ids_single_end = vec![257, ts(0), b'X' as u32, ts(1450), ts(50), b'Y' as u32, ts(250), 256];
-        let s4 = String::from_utf8(tk.gather_bytes_opts(&ids_single_end, true, true, 0.02, 1500)).unwrap();
-        assert_eq!(s4, "<|0.00|>X<|29.00|><|31.00|>Y<|35.00|>");
+        let (b4, a4) = tk.gather_bytes_fast_opts(&ids_single_end, true, true, 0.02, 1500);
+        assert!(a4);
+        assert_eq!(String::from_utf8(b4).unwrap(), "<|0.00|>X<|29.00|><|31.00|>Y<|35.00|>");
         // 5. Prompt with NO <|startoftranscript|> -> empty when skip_special=true
         let ids_no_sot = vec![258, b'x' as u32, b'y' as u32];
-        let s5 = String::from_utf8(tk.gather_bytes_opts(&ids_no_sot, true, false, 0.02, 1500)).unwrap();
-        assert_eq!(s5, "");
+        let (b5, a5) = tk.gather_bytes_fast_opts(&ids_no_sot, true, false, 0.02, 1500);
+        assert!(a5);
+        assert_eq!(String::from_utf8(b5).unwrap(), "");
     }
 }
