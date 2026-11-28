@@ -1,4 +1,4 @@
-"""Render publication-grade bench_tokenizers.png from tools/bench/results_vs_all.json.
+"""Render minimalist 16:9 benchmark figure (SVG + 2x PNG) from tools/bench/results_vs_all.json.
 
     python tools/bench/plot_vs_all.py
 """
@@ -8,10 +8,11 @@ import os
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.font_manager as fm
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
+from matplotlib.path import Path
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -20,527 +21,387 @@ R = json.load(open(os.path.join(HERE, "results_vs_all.json")))
 META = R["meta"]
 CORES = META["cores"]
 
-# ── Editorial Color System ────────────────────────────────────────────────
-# One signature cobalt for tuetoken, one warm vermilion for gigatoken,
-# and three calm graduated cool-slate tones for older baselines.
-BG = "#FFFFFF"
-STRIP_BG = "#F8FAFC"
-INK = "#0F172A"
-SUB = "#475569"
-MUTED = "#64748B"
-RULE = "#E2E8F0"
-GRID = "#F1F5F9"
 
-C = {
-    "tuetoken": "#1D4ED8",   # signature royal cobalt
-    "gigatoken": "#E05A2B",  # refined warm vermilion
-    "fastokens": "#475569",  # deep slate
-    "tiktoken": "#94A3B8",   # medium slate
-    "hf": "#CBD5E1",         # light stone
-}
-EDGE = {
-    "tuetoken": "#1D4ED8",
-    "gigatoken": "#E05A2B",
-    "fastokens": "#475569",
-    "tiktoken": "#64748B",
-    "hf": "#94A3B8",
-}
-LABEL = {
-    "tuetoken": f"tuetoken {META['versions']['tuetoken']}",
-    "gigatoken": f"gigatoken {META['versions']['gigatoken']}",
-    "fastokens": f"fastokens {META['versions']['fastokens']}",
-    "tiktoken": f"tiktoken {META['versions']['tiktoken']}",
-    "hf": f"HF tokenizers {META['versions']['tokenizers']}",
-}
+def setup_fonts():
+    """Register true Regular / Medium / Bold Helvetica Neue faces on macOS if available."""
+    ttc = "/System/Library/Fonts/HelveticaNeue.ttc"
+    if os.path.exists(ttc):
+        try:
+            from fontTools.ttLib import TTCollection
+            cache_dir = os.path.expanduser("~/.cache/tuetoken/fonts")
+            os.makedirs(cache_dir, exist_ok=True)
+            faces = [
+                (0, "HelveticaNeue-Regular.ttf"),
+                (10, "HelveticaNeue-Medium.ttf"),
+                (1, "HelveticaNeue-Bold.ttf"),
+            ]
+            extracted = []
+            ttc_obj = None
+            for idx, fname in faces:
+                out_p = os.path.join(cache_dir, fname)
+                if not os.path.exists(out_p):
+                    if ttc_obj is None:
+                        ttc_obj = TTCollection(ttc)
+                    ttc_obj.fonts[idx].save(out_p)
+                extracted.append(out_p)
+            for p in extracted:
+                fm.fontManager.addfont(p)
+            return ["Inter", "Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
+        except Exception:
+            pass
+    return ["Inter", "Helvetica", "Arial", "Liberation Sans", "DejaVu Sans"]
+
+
+FONT_STACK = setup_fonts()
+
+# ── Palette ───────────────────────────────────────────────────────────────
+BG = "#FFFFFF"
+INK = "#0F172A"
+BLUE = "#1D4ED8"
+ORANGE = "#E4572E"
+GRAY_BAR = "#CBD5E1"
+TICK = "#64748B"
+BASELINE = "#E2E8F0"
+GRID = "#EEF2F7"
 
 plt.rcParams.update({
     "font.family": "sans-serif",
-    "font.sans-serif": ["Inter", "SF Pro Text", "Arial", "Liberation Sans", "DejaVu Sans"],
+    "font.sans-serif": FONT_STACK,
+    "svg.fonttype": "none",
     "font.size": 9.5,
     "text.color": INK,
     "axes.facecolor": BG,
     "figure.facecolor": BG,
-    "axes.edgecolor": RULE,
-    "axes.labelcolor": SUB,
-    "xtick.color": SUB,
-    "ytick.color": SUB,
+    "axes.edgecolor": BASELINE,
+    "axes.labelcolor": TICK,
+    "xtick.color": TICK,
+    "ytick.color": TICK,
     "axes.linewidth": 0.8,
 })
 
-
-def fmt_x(v):
-    if v >= 1000:
-        return f"{v:,.0f}×"
-    if v >= 10:
-        return f"{v:.1f}×" if v < 12 else f"{v:.0f}×"
-    return f"{v:.1f}×"
+W_REG = "normal"
+W_SEMI = "medium"
+W_BOLD = "bold"
 
 
-def style_ax(ax, tag, title, subtitle, grid_axis="y"):
+def draw_rounded_barh(ax, y_center, width, height, color, radius_pt=3.0, zorder=3):
+    """Horizontal bar flush on x=0 with rounded right corners (exact radius in points)."""
+    if width <= 0:
+        return
+    fig = ax.figure
+    bbox = ax.get_position()
+    ax_w_pt = bbox.width * fig.get_figwidth() * 72.0
+    ax_h_pt = bbox.height * fig.get_figheight() * 72.0
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    dx_per_pt = abs(x1 - x0) / ax_w_pt
+    dy_per_pt = abs(y1 - y0) / ax_h_pt
+
+    half_h = height / 2.0
+    ry = min(radius_pt * dy_per_pt, half_h)
+    rx = min(radius_pt * dx_per_pt, width * 0.48)
+    k = 0.55228475
+    yb, yt = y_center - half_h, y_center + half_h
+
+    verts = [
+        (0.0, yb),
+        (width - rx, yb),
+        (width - rx * (1 - k), yb),
+        (width, yb + ry * (1 - k)),
+        (width, yb + ry),
+        (width, yt - ry),
+        (width, yt - ry * (1 - k)),
+        (width - rx * (1 - k), yt),
+        (width - rx, yt),
+        (0.0, yt),
+        (0.0, yb),
+    ]
+    codes = [
+        Path.MOVETO,
+        Path.LINETO,
+        Path.CURVE4, Path.CURVE4, Path.CURVE4,
+        Path.LINETO,
+        Path.CURVE4, Path.CURVE4, Path.CURVE4,
+        Path.LINETO,
+        Path.CLOSEPOLY,
+    ]
+    ax.add_patch(mpatches.PathPatch(Path(verts, codes), facecolor=color, edgecolor="none", zorder=zorder))
+
+
+def draw_rounded_barv(ax, x_center, height, width, color, radius_pt=2.8, zorder=3):
+    """Vertical bar flush on y=0 with rounded top corners (exact radius in points)."""
+    if height <= 0:
+        return
+    fig = ax.figure
+    bbox = ax.get_position()
+    ax_w_pt = bbox.width * fig.get_figwidth() * 72.0
+    ax_h_pt = bbox.height * fig.get_figheight() * 72.0
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    dx_per_pt = abs(x1 - x0) / ax_w_pt
+    dy_per_pt = abs(y1 - y0) / ax_h_pt
+
+    half_w = width / 2.0
+    rx = min(radius_pt * dx_per_pt, half_w)
+    ry = min(radius_pt * dy_per_pt, height * 0.48)
+    k = 0.55228475
+    xl, xr = x_center - half_w, x_center + half_w
+
+    verts = [
+        (xl, 0.0),
+        (xl, height - ry),
+        (xl, height - ry * (1 - k)),
+        (xl + rx * (1 - k), height),
+        (xl + rx, height),
+        (xr - rx, height),
+        (xr - rx * (1 - k), height),
+        (xr, height - ry * (1 - k)),
+        (xr, height - ry),
+        (xr, 0.0),
+        (xl, 0.0),
+    ]
+    codes = [
+        Path.MOVETO,
+        Path.LINETO,
+        Path.CURVE4, Path.CURVE4, Path.CURVE4,
+        Path.LINETO,
+        Path.CURVE4, Path.CURVE4, Path.CURVE4,
+        Path.LINETO,
+        Path.CLOSEPOLY,
+    ]
+    ax.add_patch(mpatches.PathPatch(Path(verts, codes), facecolor=color, edgecolor="none", zorder=zorder))
+
+
+def clean_spines(ax, baseline="bottom", hgrid=False):
+    for s in ("top", "right", "left", "bottom"):
+        ax.spines[s].set_visible(s == baseline)
+    ax.spines[baseline].set_color(BASELINE)
+    ax.spines[baseline].set_linewidth(0.9)
     ax.set_axisbelow(True)
-    if grid_axis == "y":
-        ax.yaxis.grid(True, color=GRID, lw=0.95)
-        ax.xaxis.grid(False)
+    ax.xaxis.grid(False)
+    if hgrid:
+        ax.yaxis.grid(True, color=GRID, linewidth=0.9)
     else:
-        ax.xaxis.grid(True, color=GRID, lw=0.95)
         ax.yaxis.grid(False)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
-    if grid_axis == "x":
-        ax.spines["left"].set_color("#CBD5E1")
-        ax.spines["bottom"].set_color(RULE)
-    else:
-        ax.spines["left"].set_visible(False)
-        ax.spines["bottom"].set_color("#CBD5E1")
-    ax.tick_params(length=0, pad=6, labelsize=9.2)
-    ax.text(
-        0.0, 1.12, f"{tag}  {title}",
-        transform=ax.transAxes, fontsize=12.4, fontweight="bold", color=INK,
-        va="bottom", ha="left",
-    )
-    ax.text(
-        0.0, 1.048, subtitle,
-        transform=ax.transAxes, fontsize=9.0, color=MUTED,
-        va="bottom", ha="left",
-    )
+    ax.tick_params(length=0, pad=7, labelsize=9.0, colors=TICK)
 
 
-fig = plt.figure(figsize=(16.5, 11.4), facecolor=BG)
+# ── Canvas (16:9, pure white, generous margins) ───────────────────────────
+fig = plt.figure(figsize=(16.0, 9.0), facecolor=BG)
 
-MARGIN_L = 0.040
-MARGIN_R = 0.960
-SPAN_W = MARGIN_R - MARGIN_L
+ML, MR = 0.048, 0.955
 
-# Subtle top editorial rule
-fig.patches.append(mpatches.Rectangle(
-    (MARGIN_L, 0.985), SPAN_W, 0.0036,
-    transform=fig.transFigure, facecolor=C["tuetoken"], edgecolor="none",
-))
+# Header: Title (24pt bold) + one subtitle line only
+fig.text(ML, 0.922, "tuetoken: BPE tokenizer benchmark",
+         fontsize=24, fontweight=W_BOLD, color=INK, va="center")
+fig.text(ML, 0.873, "Identical token IDs across all five libraries",
+         fontsize=11.5, fontweight=W_REG, color=TICK, va="center")
 
-# ── Header ────────────────────────────────────────────────────────────────
-t0 = fig.text(MARGIN_L, 0.946, "tuetoken", fontsize=22, fontweight="bold", color=C["tuetoken"], va="center")
-fig.canvas.draw()
-bb0 = t0.get_window_extent().transformed(fig.transFigure.inverted())
-fig.text(bb0.x1 + 0.007, 0.946, "—  Head-to-Head BPE Tokenizer Benchmark",
-         fontsize=21.5, fontweight="bold", color=INK, va="center")
+# ── Layout Coordinates ────────────────────────────────────────────────────
+CHART_TOP = 0.778
+CHART_BOT = 0.258
 
-fig.text(
-    MARGIN_L, 0.912,
-    "Bit-for-bit identical token IDs verified across all five libraries  ·  Cold 1 GB runs use a fresh OS process per data point",
-    fontsize=10.2, color=SUB, va="center",
-)
-
-fig.text(
-    MARGIN_R, 0.952,
-    f"{META['cpu']} ({CORES} cores)  ·  Python {META['python']}",
-    fontsize=10.2, fontweight="bold", color=INK, ha="right", va="center",
-)
-fig.text(
-    MARGIN_R, 0.927,
-    "All axes linear  ·  Also verified on Linux AMD EPYC Zen 4 (AVX-512)",
-    fontsize=8.8, color=MUTED, ha="right", va="center",
-)
-
-# Horizontal legend bar
-lx = MARGIN_L
-ly = 0.875
-for k in ("tuetoken", "gigatoken", "fastokens", "tiktoken", "hf"):
-    fig.patches.append(mpatches.FancyBboxPatch(
-        (lx, ly - 0.0055), 0.011, 0.011,
-        boxstyle="round,pad=0.0012", transform=fig.transFigure,
-        facecolor=C[k], edgecolor=EDGE[k], linewidth=0.8,
-    ))
-    t = fig.text(
-        lx + 0.0155, ly, LABEL[k],
-        fontsize=9.6, color=INK if k in ("tuetoken", "gigatoken") else SUB,
-        fontweight="bold" if k == "tuetoken" else "normal",
-        ha="left", va="center",
-    )
-    fig.canvas.draw()
-    bb = t.get_window_extent().transformed(fig.transFigure.inverted())
-    lx = bb.x1 + 0.025
-
-fig.add_artist(mlines.Line2D(
-    [MARGIN_L, MARGIN_R], [0.852, 0.852],
-    transform=fig.transFigure, color=RULE, linewidth=0.9,
-))
-
-# ── Main 2×2 Grid (aligned Swiss margins so y-labels never clip!) ─────────
-gs = fig.add_gridspec(
-    2, 2,
-    left=0.105, right=MARGIN_R, top=0.790, bottom=0.258,
-    hspace=0.47, wspace=0.26,
-)
-
-# ── (A) Cold 1 GB Corpus Scaling (Linear GB/s) ────────────────────────────
-ax = fig.add_subplot(gs[0, 0])
+# 1) HERO PANEL: Cold 1 GB corpus scaling (~45% of width including direct labels)
+# Axes stop cleanly at 14 threads so gridlines & baseline don't run under labels.
+ax_hero = fig.add_axes([0.088, CHART_BOT, 0.285, CHART_TOP - CHART_BOT])
 cold = R["corpus"]["cold"]
-gb = R["corpus"]["bytes"] / (1 << 30)
-
 th_t = np.array([p["threads"] for p in cold["tuetoken"]])
 gb_t = np.array([p["mbps"] / 1000.0 for p in cold["tuetoken"]])
 th_g = np.array([p["threads"] for p in cold["gigatoken"]])
 gb_g = np.array([p["mbps"] / 1000.0 for p in cold["gigatoken"]])
 
-ax.fill_between(th_t, gb_g, gb_t, color=C["tuetoken"], alpha=0.075, zorder=2)
-ax.plot(th_t, gb_t, "-", color=C["tuetoken"], lw=2.8, marker="o", ms=7.0,
-        mfc=BG, mec=C["tuetoken"], mew=2.3, zorder=5)
-ax.plot(th_g, gb_g, "-", color=C["gigatoken"], lw=2.2, marker="o", ms=6.0,
-        mfc=C["gigatoken"], mec=BG, mew=1.2, zorder=4)
+ax_hero.set_xlim(0.5, 14.35)
+ax_hero.set_ylim(0.0, 4.88)
+ax_hero.set_xticks(th_t)
+ax_hero.set_yticks([0, 1, 2, 3, 4])
+ax_hero.set_yticklabels(["0", "1 GB/s", "2 GB/s", "3 GB/s", "4 GB/s"])
+ax_hero.set_xlabel("Threads", fontsize=9.5, fontweight=W_REG, color=TICK, labelpad=8)
+clean_spines(ax_hero, baseline="bottom", hgrid=True)
 
-# Direct endpoint labels
-ax.annotate(
-    f"{gb_t[-1]:.2f} GB/s", (th_t[-1], gb_t[-1]),
-    xytext=(10, 0), textcoords="offset points",
-    fontsize=10.2, fontweight="bold", color=C["tuetoken"], va="center",
-)
-ax.annotate(
-    f"{gb_g[-1]:.2f} GB/s", (th_g[-1], gb_g[-1]),
-    xytext=(10, 0), textcoords="offset points",
-    fontsize=9.6, fontweight="bold", color=C["gigatoken"], va="center",
-)
+ax_hero.fill_between(th_t, gb_g, gb_t, color=BLUE, alpha=0.085, zorder=2)
+ax_hero.plot(th_t, gb_t, color=BLUE, lw=3.0, solid_capstyle="round", zorder=4)
+ax_hero.plot(th_g, gb_g, color=ORANGE, lw=1.75, solid_capstyle="round", zorder=3.5)
+ax_hero.scatter([th_t[-1]], [gb_t[-1]], s=38, color=BLUE, zorder=5, clip_on=False)
+ax_hero.scatter([th_g[-1]], [gb_g[-1]], s=26, color=ORANGE, zorder=4.5, clip_on=False)
 
-# Clean dimension bracket near 14T with text seated comfortably in open shaded wedge
-x_br = 13.35
-y_hi = float(np.interp(x_br, th_t, gb_t)) - 0.10
-y_lo = float(np.interp(x_br, th_g, gb_g)) + 0.10
-ax.annotate(
-    "", xy=(x_br, y_hi), xytext=(x_br, y_lo),
-    arrowprops=dict(arrowstyle="<->", color=C["tuetoken"], lw=1.15, alpha=0.8),
-    zorder=4,
-)
-ax.text(
-    x_br - 0.35, 0.5 * (y_hi + y_lo),
-    f"{gb_t[-1] / gb_g[-1]:.1f}× faster\nat {CORES}T cold",
-    fontsize=9.2, fontweight="bold", color=C["tuetoken"], va="center", ha="right",
-)
+# Direct end labels floating cleanly in whitespace right of x=14
+lx_end = 14.75
+ax_hero.text(lx_end, gb_t[-1] + 0.04, "4.50 GB/s", fontsize=11, fontweight=W_BOLD,
+             color=BLUE, va="bottom", clip_on=False)
+ax_hero.text(lx_end, gb_t[-1] - 0.05, "tuetoken", fontsize=9.5, fontweight=W_SEMI,
+             color=BLUE, va="top", clip_on=False)
 
-# fastokens, tiktoken, HF at 14T
-if cold.get("fastokens"):
-    fp = cold["fastokens"][-1]
-    ax.scatter([fp["threads"]], [fp["mbps"] / 1000.0], marker="D", s=46,
-               color=C["fastokens"], edgecolor=BG, linewidth=0.9, zorder=4)
-    ax.annotate(
-        f"fastokens  {fp['mbps']:.0f} MB/s", (fp["threads"], fp["mbps"] / 1000.0),
-        xytext=(10, 0), textcoords="offset points",
-        fontsize=8.7, color=C["fastokens"], va="center",
-    )
+ax_hero.text(lx_end, gb_g[-1] + 0.04, "1.79 GB/s", fontsize=11, fontweight=W_SEMI,
+             color=ORANGE, va="bottom", clip_on=False)
+ax_hero.text(lx_end, gb_g[-1] - 0.05, "gigatoken", fontsize=9.5, fontweight=W_REG,
+             color=ORANGE, va="top", clip_on=False)
 
-tk_14 = cold["tiktoken"][-1]["mbps"]
-hf_14 = cold["hf"][-1]["mbps"]
-ax.plot([p["threads"] for p in cold["tiktoken"]], [p["mbps"] / 1000.0 for p in cold["tiktoken"]],
-        "--", color=C["tiktoken"], lw=1.25, zorder=3)
-ax.scatter([CORES], [tk_14 / 1000.0], marker="s", s=34, color=C["tiktoken"],
-           edgecolor=EDGE["tiktoken"], linewidth=0.8, zorder=4)
-ax.scatter([CORES], [hf_14 / 1000.0], marker="^", s=36, color=C["hf"],
-           edgecolor=EDGE["hf"], linewidth=0.8, zorder=4)
-ax.annotate(
-    f"tiktoken {tk_14:.0f}  ·  HF {hf_14:.0f} MB/s",
-    (CORES, tk_14 / 1000.0), xytext=(10, 4), textcoords="offset points",
-    fontsize=8.4, color=MUTED, va="center",
+# One gap annotation only, beside the gap, no arrow
+ax_hero.text(
+    lx_end, 0.5 * (gb_t[-1] + gb_g[-1]),
+    "2.5× faster\nat 14 threads",
+    fontsize=10.5, fontweight=W_SEMI, color=BLUE, va="center", ha="left",
+    linespacing=1.25, clip_on=False,
 )
 
-ax.set_xticks(th_t)
-ax.set_xlim(0.2, CORES * 1.48)
-ax.set_ylim(-0.08, 5.15)
-ax.yaxis.set_major_locator(mticker.MultipleLocator(1.0))
-ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f} GB/s" if v > 0 else "0"))
-ax.set_xlabel("Threads", fontsize=9.2, labelpad=6)
-style_ax(ax, "A", f"Cold {gb:.0f} GB corpus scaling", "o200k_base · fresh OS process per point · higher is better", grid_axis="y")
+# Single gray label near the baseline, no separate markers
+ax_hero.hlines(0.58, 1.0, 14.0, color=GRAY_BAR, lw=1.15, linestyles="--", zorder=2.5)
+ax_hero.text(14.0, 0.28, "others < 0.6 GB/s", fontsize=9.2, fontweight=W_REG,
+             color=TICK, ha="right", va="center")
 
-# ── (B) Frontier LLM Throughput (Linear GB/s, aligned vs gt column) ───────
-ax = fig.add_subplot(gs[0, 1])
+fig.text(0.088, CHART_TOP + 0.024, "Cold 1 GB corpus scaling",
+         fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
+
+# 2) THROUGHPUT PANEL: LLM tokenizer throughput (top-right, wide)
+RIGHT_AX_L = 0.578
+ax_thr = fig.add_axes([RIGHT_AX_L, 0.542, MR - RIGHT_AX_L, CHART_TOP - 0.542])
 fr = sorted(R["frontier"], key=lambda r: r["tuetoken"], reverse=True)
-y = np.arange(len(fr))
-bh = 0.34
+n_fr = len(fr)
 
-t_gb = [r["tuetoken"] / 1000.0 for r in fr]
-g_gb = [(r["gigatoken"] or 0.0) / 1000.0 for r in fr]
+ax_thr.set_xlim(0.0, 10.65)
+ax_thr.set_ylim(n_fr - 0.45, -0.55)
+ax_thr.set_yticks(np.arange(n_fr))
+ax_thr.set_yticklabels([r["model"] for r in fr], fontsize=9.2, color=INK)
+ax_thr.set_xticks([0, 3, 6, 9])
+ax_thr.set_xticklabels(["0", "3 GB/s", "6 GB/s", "9 GB/s"])
+clean_spines(ax_thr, baseline="left", hgrid=False)
+ax_thr.tick_params(axis="y", pad=8)
 
-ax.barh(y - bh / 2 - 0.015, t_gb, bh, color=C["tuetoken"], zorder=3)
-ax.barh(y + bh / 2 + 0.015, g_gb, bh, color=C["gigatoken"], zorder=3)
-
-# Clean right-aligned "vs gt" speedup column matching Panel C!
-COL_X = 11.45
-ax.text(COL_X, -0.78, "vs gt", fontsize=8.5, fontweight="bold", color=MUTED, ha="right", va="bottom")
+# Consistent ~8.8pt visual blue bar thickness across Throughput and Decode
+blue_h = 0.39
+orange_h = 0.16
+gap_bar = 0.05
 
 for i, r in enumerate(fr):
     tv = r["tuetoken"] / 1000.0
     gv = r["gigatoken"]
-    ax.text(
-        tv + 0.14, i - bh / 2 - 0.015, f"{tv:.2f} GB/s",
-        va="center", ha="left", fontsize=9.1, fontweight="bold", color=INK,
-    )
     if gv is not None:
-        gv_gb = gv / 1000.0
-        sp = r["tuetoken"] / gv
-        ax.text(
-            gv_gb + 0.14, i + bh / 2 + 0.015, f"{gv_gb:.2f}",
-            va="center", ha="left", fontsize=8.4, color=C["gigatoken"],
-        )
-        ax.text(
-            COL_X, i, fmt_x(sp),
-            va="center", ha="right", fontsize=9.4, fontweight="bold", color=C["tuetoken"],
-        )
+        y_blue = i - (orange_h + gap_bar) / 2.0
+        y_org = i + (blue_h + gap_bar) / 2.0
+        draw_rounded_barh(ax_thr, y_blue, tv, blue_h, BLUE, radius_pt=3.0)
+        draw_rounded_barh(ax_thr, y_org, gv / 1000.0, orange_h, ORANGE, radius_pt=1.8)
     else:
-        ax.text(
-            0.14, i + bh / 2 + 0.015, "unsupported in gigatoken",
-            va="center", ha="left", fontsize=8.2, style="italic", color=MUTED,
-        )
-        ax.text(
-            COL_X, i, "—",
-            va="center", ha="right", fontsize=9.2, color="#94A3B8",
-        )
+        y_blue = float(i)
+        draw_rounded_barh(ax_thr, y_blue, tv, blue_h, BLUE, radius_pt=3.0)
+    lbl = f"{tv:.2f} GB/s" if i == 0 else f"{tv:.2f}"
+    ax_thr.text(tv + 0.17, y_blue, lbl, fontsize=11, fontweight=W_SEMI, color=INK, va="center")
 
-ax.set_yticks(y, [r["model"] for r in fr], fontsize=9.4, color=INK)
-ax.invert_yaxis()
-ax.set_ylim(len(fr) - 0.45, -0.92)
-ax.set_xlim(0, 11.75)
-ax.xaxis.set_major_locator(mticker.MultipleLocator(2.0))
-ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f} GB/s" if 0 < v <= 10 else ("0" if v == 0 else "")))
-ax.set_xlabel("Throughput (GB/s)", fontsize=9.2, labelpad=6)
-hf_min = min(r["hf"] for r in fr)
-hf_max = max(r["hf"] for r in fr)
-style_ax(
-    ax, "B", "Frontier LLM throughput",
-    f"25 MB OpenWebText · {CORES} cores · HF baseline: {hf_min:.0f}–{hf_max:.0f} MB/s (59–927× slower)",
-    grid_axis="x",
-)
+fig.text(RIGHT_AX_L, CHART_TOP + 0.024, "LLM tokenizer throughput",
+         fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
 
-# ── (C) Startup Latency — Horizontal Dumbbell Chart (Linear ms) ───────────
-ax = fig.add_subplot(gs[1, 0])
+# 3) STARTUP PANEL: Dumbbell chart (bottom-right-left)
+# Axes stop cleanly at 305 ms; right-side speedup labels float outside baseline.
+ax_st = fig.add_axes([RIGHT_AX_L, CHART_BOT, 0.145, 0.445 - CHART_BOT])
 st = sorted(R["startup"], key=lambda r: r["tuetoken"])
-yc = np.arange(len(st))
+n_st = len(st)
+
+ax_st.set_xlim(-6.0, 306.0)
+ax_st.set_ylim(n_st - 0.45, -0.55)
+ax_st.set_yticks(np.arange(n_st))
+ax_st.set_yticklabels([r["model"] for r in st], fontsize=9.2, color=INK)
+ax_st.set_xticks([0, 100, 200, 300])
+ax_st.set_xticklabels(["0", "100 ms", "200 ms", "300 ms"])
+clean_spines(ax_st, baseline="bottom", hgrid=False)
+ax_st.tick_params(axis="y", pad=8)
 
 for i, r in enumerate(st):
-    tv, gv, hv = r["tuetoken"], r["gigatoken"], r["hf"]
-    hi = max(gv, hv)
-    ax.hlines(i, tv, hi, color="#E2E8F0", lw=2.8, zorder=2)
-    ax.hlines(i, tv, gv, color="#CBD5E1", lw=2.8, zorder=2.5)
+    ax_st.hlines(i, r["tuetoken"], r["gigatoken"], color=GRAY_BAR, lw=2.0, zorder=2)
 
-ax.scatter([r["hf"] for r in st], yc, s=62, color=C["hf"],
-           edgecolor=EDGE["hf"], linewidth=1.1, zorder=3.5)
-ax.scatter([r["gigatoken"] for r in st], yc, s=78, color=C["gigatoken"],
-           edgecolor=BG, linewidth=1.3, zorder=4.5)
-ax.scatter([r["tuetoken"] for r in st], yc, s=90, color=C["tuetoken"],
-           edgecolor=BG, linewidth=1.4, zorder=5.5)
+ax_st.scatter([r["gigatoken"] for r in st], np.arange(n_st), s=44, color=ORANGE, zorder=4)
+ax_st.scatter([r["tuetoken"] for r in st], np.arange(n_st), s=52, color=BLUE, zorder=5)
 
-COL_C = 392
-ax.text(COL_C, -0.78, "vs gt", fontsize=8.5, fontweight="bold", color=MUTED, ha="right", va="bottom")
 for i, r in enumerate(st):
     tv, gv = r["tuetoken"], r["gigatoken"]
-    # Crisp white halo breaks the gray connector line cleanly around the label
-    ax.text(
-        tv + 10, i, f"{tv:.1f} ms",
-        va="center", ha="left", fontsize=8.8, fontweight="bold", color=C["tuetoken"],
-        bbox=dict(facecolor=BG, edgecolor="none", pad=1.4), zorder=5,
+    sp = round(gv / tv)
+    blue_lbl = f"{tv:.1f} ms" if i == 0 else f"{tv:.1f}"
+    ax_st.text(
+        tv + 15, i, blue_lbl,
+        fontsize=10.2, fontweight=W_SEMI, color=BLUE, va="center", ha="left",
+        bbox=dict(facecolor=BG, edgecolor="none", pad=1.2), zorder=6,
     )
-    # Uniformly place gigatoken load time cleanly above every orange dot
-    ax.text(
-        gv, i - 0.30, f"{gv:.0f} ms",
-        va="bottom", ha="center", fontsize=8.0, color=C["gigatoken"],
-    )
-    ax.text(
-        COL_C, i, fmt_x(gv / tv),
-        va="center", ha="right", fontsize=9.4, fontweight="bold", color=C["tuetoken"],
+    ax_st.text(
+        gv + 15, i, f"{sp}×",
+        fontsize=11, fontweight=W_SEMI, color=INK, va="center", ha="left", clip_on=False,
     )
 
-ax.set_yticks(yc, [r["model"] for r in st], fontsize=9.4, color=INK)
-ax.invert_yaxis()
-ax.set_ylim(len(st) - 0.45, -0.92)
-ax.set_xlim(0, 404)
-ax.xaxis.set_major_locator(mticker.MultipleLocator(100))
-ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f} ms" if 0 < v <= 300 else ("0" if v == 0 else "")))
-ax.set_xlabel("Cold load time (ms)", fontsize=9.2, labelpad=6)
-style_ax(
-    ax, "C", "Startup latency (tokenizer.json load)",
-    "Median load time · ms · lower is better  (tuetoken loads in 7–20 ms)",
-    grid_axis="x",
-)
+ax_st.text(0.0, 1.09, "Startup latency",
+           transform=ax_st.transAxes, fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
 
-# ── (D) Decode Throughput (Linear M tokens/sec) ───────────────────────────
-ax = fig.add_subplot(gs[1, 1])
+# 4) DECODE PANEL: Grouped bars (bottom-right-right)
+DEC_L = 0.788
+ax_dec = fig.add_axes([DEC_L, CHART_BOT, MR - DEC_L, 0.445 - CHART_BOT])
 dc = R["decode"]
 xd = np.arange(len(dc))
 keys_d = ("tuetoken", "gigatoken", "tiktoken", "fastokens", "hf")
-w = 0.155
+cols_d = (BLUE, ORANGE, GRAY_BAR, GRAY_BAR, GRAY_BAR)
 
-for j, k in enumerate(keys_d):
-    vals = [r["tokens"] / r[k] for r in dc]  # tokens / us == M tokens/sec
-    ax.bar(
-        xd + (j - 2) * w, vals, w * 0.88,
-        color=C[k], edgecolor=EDGE[k] if k == "hf" else "none", linewidth=0.6, zorder=3,
-    )
+ax_dec.set_xlim(-0.55, 2.65)
+ax_dec.set_ylim(0.0, 305.0)
+ax_dec.set_xticks(xd)
+ax_dec.set_xticklabels(["50", "1,000", "12,000 tok"])
+ax_dec.set_yticks([0, 100, 200, 300])
+ax_dec.set_yticklabels(["0", "100M", "200M", "300M"])
+clean_spines(ax_dec, baseline="bottom", hgrid=True)
 
+# Match visual blue bar thickness (~8.8pt)
+bar_w = 0.160
+for j, (k, col) in enumerate(zip(keys_d, cols_d)):
+    for i, r in enumerate(dc):
+        rate = r["tokens"] / r[k]
+        draw_rounded_barv(ax_dec, xd[i] + (j - 2) * bar_w, rate, bar_w * 0.85, col, radius_pt=2.8)
+
+# Label ONLY the blue bars ("109M", "231M", "248M tokens/s") — zero overflow
 for i, r in enumerate(dc):
-    t_rate = r["tokens"] / r["tuetoken"]
-    g_rate = r["tokens"] / r["gigatoken"]
-    sp_gt = r["gigatoken"] / r["tuetoken"]
-    lat_str = f"{r['tuetoken']:.2f} µs" if r["tuetoken"] < 1 else f"{r['tuetoken']:.1f} µs"
-    ax.text(
-        xd[i] - 2 * w, t_rate + 7,
-        f"{t_rate:.0f}M\n({lat_str})",
-        ha="center", va="bottom", fontsize=8.4, fontweight="bold", color=C["tuetoken"],
-        linespacing=1.18,
-    )
-    # Consistent cobalt color grammar for tuetoken speedup callouts
-    ax.text(
-        xd[i] + 0.08, g_rate + 14,
-        f"{fmt_x(sp_gt)} vs gt",
-        ha="center", va="bottom", fontsize=8.7, fontweight="bold", color=C["tuetoken"],
-    )
+    rate = r["tokens"] / r["tuetoken"]
+    bx = xd[i] - 2 * bar_w
+    if i == len(dc) - 1:
+        ax_dec.text(xd[i] + 2.65 * bar_w, rate + 10, f"{rate:.0f}M tokens/s",
+                    fontsize=10.8, fontweight=W_SEMI, color=BLUE, ha="right", va="bottom", clip_on=False)
+    else:
+        ax_dec.text(bx, rate + 10, f"{rate:.0f}M",
+                    fontsize=11, fontweight=W_SEMI, color=BLUE, ha="center", va="bottom")
 
-ax.set_xticks(xd, [f"{r['tokens']:,} tokens" for r in dc], fontsize=9.5, color=INK)
-ax.set_ylim(0, 305)
-ax.yaxis.set_major_locator(mticker.MultipleLocator(50))
-ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f}M" if v > 0 else "0"))
-ax.set_xlabel("Sequence length  (Python list[int]  ·  also 2.7–2.8× faster than gt on np.uint32)",
-              fontsize=8.6, labelpad=6)
-style_ax(
-    ax, "D", "Decode throughput (o200k_base)",
-    "Derived from p50 latency · M tokens/sec · higher is better",
-    grid_axis="y",
-)
+# Clean non-overlapping gray direct label over the 3 gray bars in group 1
+ax_dec.text(xd[0] + 0.02, 33, "others",
+            fontsize=8.2, fontweight=W_REG, color=TICK, ha="left", va="bottom")
 
-# ── (E) Bottom Production Workloads Strip (4 Symmetric Visual Columns) ────
-strip_y0, strip_h = 0.056, 0.138
-fig.patches.append(mpatches.FancyBboxPatch(
-    (MARGIN_L, strip_y0), SPAN_W, strip_h,
-    boxstyle="round,pad=0.004,rounding_size=0.008",
-    transform=fig.transFigure, facecolor=STRIP_BG, edgecolor=RULE, linewidth=0.9,
-))
+ax_dec.text(0.0, 1.09, "Decode throughput",
+            transform=ax_dec.transAxes, fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
 
-fig.text(
-    MARGIN_L, strip_y0 + strip_h + 0.012,
-    "E  Production & serving workloads",
-    fontsize=11.6, fontweight="bold", color=INK, va="bottom",
-)
-fig.text(
-    MARGIN_R, strip_y0 + strip_h + 0.012,
-    f"Same verified {META['cpu']} ({CORES} cores) setup  ·  AutoTokenizer & batch APIs",
-    fontsize=8.7, color=MUTED, ha="right", va="bottom",
-)
+# ── Bottom Stat Strip (4 tiles, thin dividers, no boxes) ──────────────────
+fig.add_artist(mlines.Line2D([ML, MR], [0.180, 0.180], transform=fig.transFigure, color=BASELINE, lw=0.9))
 
+warm = R["corpus"]["warm_100mb"]
 bt = R["batch_trunc"]
 ex = R["extras"]
-warm = R["corpus"]["warm_100mb"]
 
-cards = [
-    {
-        "title": "Warm steady-state · 100 MB (higher better)",
-        "big": f"{warm['tuetoken'] / 1000:.2f} GB/s",
-        "badge": f"{warm['tuetoken'] / warm['gigatoken']:.1f}× vs gt",
-        "bars": [
-            ("tuetoken", warm["tuetoken"], C["tuetoken"], f"{warm['tuetoken']/1000:.2f} GB/s"),
-            ("gigatoken", warm["gigatoken"], C["gigatoken"], f"{warm['gigatoken']/1000:.2f} GB/s"),
-            ("fastokens", warm["fastokens"], C["fastokens"], f"{warm['fastokens']/1000:.2f} GB/s"),
-        ],
-    },
-    {
-        "title": "10K docs padded · max=512 (higher better)",
-        "big": f"{bt['padded_10k_mbps']['tuetoken'] / 1000:.2f} GB/s",
-        "badge": f"{bt['padded_10k_mbps']['tuetoken'] / bt['padded_10k_mbps']['gigatoken']:.1f}× vs gt",
-        "bars": [
-            ("tuetoken", bt["padded_10k_mbps"]["tuetoken"], C["tuetoken"], f"{bt['padded_10k_mbps']['tuetoken']/1000:.2f} GB/s"),
-            ("gigatoken", bt["padded_10k_mbps"]["gigatoken"], C["gigatoken"], f"{bt['padded_10k_mbps']['gigatoken']/1000:.2f} GB/s"),
-        ],
-        "note": "o200k_base · pad_id=0 · 2D NumPy array output",
-    },
-    {
-        "title": "50 MB truncation · max=512 (lower better)",
-        "big": f"{bt['trunc_50mb_ms']['tuetoken_right']:.2f} ms",
-        "badge": f"{bt['trunc_50mb_ms']['gigatoken'] / bt['trunc_50mb_ms']['tuetoken_right']:.1f}× vs gt · {fmt_x(bt['trunc_50mb_ms']['hf'] / bt['trunc_50mb_ms']['tuetoken_right'])} vs HF",
-        "bars": [
-            ("tuetoken R/L", bt["trunc_50mb_ms"]["tuetoken_right"], C["tuetoken"],
-             f"{bt['trunc_50mb_ms']['tuetoken_right']:.2f} / {bt['trunc_50mb_ms']['tuetoken_left']:.2f} ms"),
-            ("gigatoken R", bt["trunc_50mb_ms"]["gigatoken"], C["gigatoken"],
-             f"{bt['trunc_50mb_ms']['gigatoken']:.1f} ms (R only)"),
-        ],
-        "note": f"HF transformers: {bt['trunc_50mb_ms']['hf']:,.0f} ms (Qwen2.5, 1,000 × 50 KB)",
-    },
-    {
-        "title": "Whisper timestamps & 1 MB byte offsets",
-        "big": f"{ex['whisper_batch_500_ms']['hf'] / ex['whisper_batch_500_ms']['tuetoken']:.0f}× / {ex['offsets_1mb_ms']['hf'] / ex['offsets_1mb_ms']['tuetoken_buf']:.0f}×",
-        "badge": "vs HF",
-        "rows": [
-            ("Whisper batch 500", f"{ex['whisper_batch_500_ms']['tuetoken']:.3f} ms",
-             f"vs {ex['whisper_batch_500_ms']['hf']:.1f} ms HF",
-             f"{ex['whisper_batch_500_ms']['hf'] / ex['whisper_batch_500_ms']['tuetoken']:.0f}×"),
-            ("1 MB byte offsets", f"{ex['offsets_1mb_ms']['tuetoken_buf']:.2f} ms",
-             f"vs {ex['offsets_1mb_ms']['hf']:.0f} ms HF",
-             f"{ex['offsets_1mb_ms']['hf'] / ex['offsets_1mb_ms']['tuetoken_buf']:.0f}×"),
-        ],
-        "note": "Zero-copy Arrow/NumPy offsets & native timestamp decode",
-    },
+tiles = [
+    (f"{warm['tuetoken'] / 1000:.2f} GB/s", "warm steady-state"),
+    (f"{bt['padded_10k_mbps']['tuetoken'] / 1000:.2f} GB/s", "10K docs padded"),
+    (f"{bt['trunc_50mb_ms']['tuetoken_right']:.2f} ms", "50 MB truncation"),
+    (f"{ex['whisper_batch_500_ms']['hf'] / ex['whisper_batch_500_ms']['tuetoken']:.0f}×", "Whisper timestamps vs HF"),
 ]
 
-col_w = SPAN_W / 4.0
-for idx, card in enumerate(cards):
-    x0 = MARGIN_L + idx * col_w
-    pad_x = 0.014
+span_w = MR - ML
+tile_w = span_w / 4.0
+for idx, (val, desc) in enumerate(tiles):
+    tx = ML + idx * tile_w + (0.014 if idx > 0 else 0.0)
     if idx > 0:
-        fig.add_artist(mlines.Line2D(
-            [x0, x0], [strip_y0 + 0.015, strip_y0 + strip_h - 0.015],
-            transform=fig.transFigure, color=RULE, linewidth=0.85,
-        ))
-    fig.text(x0 + pad_x, strip_y0 + strip_h - 0.014, card["title"],
-             fontsize=8.4, fontweight="bold", color=SUB, va="top")
-    tb = fig.text(x0 + pad_x, strip_y0 + strip_h - 0.036, card["big"],
-                  fontsize=15.0, fontweight="bold", color=C["tuetoken"], va="top")
-    fig.canvas.draw()
-    bb = tb.get_window_extent().transformed(fig.transFigure.inverted())
-    fig.text(bb.x1 + 0.006, strip_y0 + strip_h - 0.042, card["badge"],
-             fontsize=8.2, fontweight="bold", color=INK if "vs gt" in card["badge"] else MUTED, va="top")
+        dx = ML + idx * tile_w
+        fig.add_artist(mlines.Line2D([dx, dx], [0.088, 0.156], transform=fig.transFigure, color=BASELINE, lw=0.85))
+    fig.text(tx, 0.138, val, fontsize=21, fontweight=W_BOLD, color=BLUE, va="center")
+    fig.text(tx, 0.095, desc, fontsize=10.0, fontweight=W_REG, color=TICK, va="center")
 
-    if "bars" in card:
-        max_v = max(v for _, v, _, _ in card["bars"])
-        lbl_w = 0.064
-        bar_max_w = col_w - 2 * pad_x - lbl_w - 0.066
-        y_top = strip_y0 + 0.056
-        step = 0.018 if len(card["bars"]) == 3 else 0.022
-        for bi, (lbl, val, col, vtxt) in enumerate(card["bars"]):
-            by = y_top - bi * step
-            fig.text(x0 + pad_x, by, lbl, fontsize=8.0, color=SUB, va="center")
-            bw = max(0.007, bar_max_w * (val / max_v))
-            fig.patches.append(mpatches.FancyBboxPatch(
-                (x0 + pad_x + lbl_w, by - 0.0040), bw, 0.0080,
-                boxstyle="round,pad=0.0005,rounding_size=0.002",
-                transform=fig.transFigure, facecolor=col, edgecolor="none",
-            ))
-            fig.text(x0 + pad_x + lbl_w + bw + 0.005, by, vtxt,
-                     fontsize=7.9, fontweight="bold" if bi == 0 else "normal",
-                     color=INK if bi == 0 else MUTED, va="center")
-        if "note" in card:
-            fig.text(x0 + pad_x, strip_y0 + 0.014, card["note"],
-                     fontsize=7.6, color=MUTED, va="center")
-    elif "rows" in card:
-        y_top = strip_y0 + 0.056
-        for ri, (name, fast, slow, sp) in enumerate(card["rows"]):
-            ry = y_top - ri * 0.022
-            fig.text(x0 + pad_x, ry, name, fontsize=8.1, color=SUB, va="center")
-            t_fast = fig.text(x0 + pad_x + 0.088, ry, fast, fontsize=8.3,
-                              fontweight="bold", color=C["tuetoken"], va="center")
-            fig.canvas.draw()
-            bbf = t_fast.get_window_extent().transformed(fig.transFigure.inverted())
-            fig.text(bbf.x1 + 0.004, ry, slow, fontsize=7.9, color=MUTED, va="center")
-            fig.text(x0 + col_w - pad_x, ry, sp, fontsize=8.3,
-                     fontweight="bold", color=C["tuetoken"], ha="right", va="center")
-        if "note" in card:
-            fig.text(x0 + pad_x, strip_y0 + 0.014, card["note"],
-                     fontsize=7.6, color=MUTED, va="center")
-
-# ── Footer ────────────────────────────────────────────────────────────────
+# ── Single Footer Line ────────────────────────────────────────────────────
 fig.text(
-    MARGIN_L, 0.019,
-    "Corpus: OpenWebText (1.00 GB)  ·  OpenAI o200k_base & HuggingFace tokenizer.json  ·  Raw data: tools/bench/results_vs_all.json",
-    fontsize=8.3, color=MUTED, va="center",
-)
-fig.text(
-    MARGIN_R, 0.019,
-    "Reproduce: python tools/bench/bench_vs_all.py corpus_1gb.txt && python tools/bench/plot_vs_all.py",
-    fontsize=8.3, color=MUTED, ha="right", va="center",
+    ML, 0.032,
+    f"{META['cpu']}, {CORES} cores · Python {META['python']} · OpenWebText 1 GB · details in README",
+    fontsize=9.0, fontweight=W_REG, color=TICK, va="center",
 )
 
-out = os.path.join(ROOT, "bench_tokenizers.png")
-fig.savefig(out, dpi=200, facecolor=BG)
-print("Saved", out)
+out_png = os.path.join(ROOT, "bench_tokenizers.png")
+out_svg = os.path.join(ROOT, "bench_tokenizers.svg")
+fig.savefig(out_png, dpi=200, facecolor=BG)
+fig.savefig(out_svg, facecolor=BG)
+print("Saved", out_png)
+print("Saved", out_svg)
