@@ -1481,6 +1481,169 @@ def test_count_and_file_apis():
     return ok, tot
 
 
+def test_truncate_chunk_and_v02_regressions():
+    """Verify `truncate`, `chunk_text`, local-dir `AutoTokenizer.from_pretrained`,
+    `chat_template.jinja`, Gemma/SP literal `'▁'` multi-thread parity, `gpt-oss-20b`
+    `ignore_merges`, `Falcon-H1`/`Falcon3` `PretokPipe`, and `attention_mask`."""
+    import tempfile
+    from tuetoken import Tokenizer, AutoTokenizer as TTAuto
+    from transformers import AutoTokenizer as HFAuto
+    from huggingface_hub import hf_hub_download
+
+    ok = tot = 0
+    tok_o200k = Tokenizer.from_tiktoken("o200k_base")
+
+    # 1. Core `truncate` & `chunk_text` (short + long >DETACH_MIN + >SPLIT_MIN + Unicode)
+    short = "The quick brown fox jumps over the lazy dog! Café naïve 日本語 🚀"
+    ids_short = tok_o200k.encode_ordinary(short)
+    for k in (0, 1, 3, 7, len(ids_short), len(ids_short) + 10):
+        for side in ("right", "left"):
+            got = tok_o200k.truncate(short, k, side=side)
+            if k == 0:
+                want = ""
+            elif k >= len(ids_short):
+                want = short
+            else:
+                sub = ids_short[:k] if side == "right" else ids_short[-k:]
+                want = tok_o200k.decode(sub)
+            tot += 1
+            ok += int(got == want)
+
+    # Empty string and error cases
+    tot += 3
+    ok += int(tok_o200k.truncate("", 5) == "")
+    ok += int(tok_o200k.chunk_text("", 5) == [])
+    try:
+        tok_o200k.truncate("abc", 2, side="middle")
+    except ValueError:
+        ok += 1
+
+    for bad_call in (
+        lambda: tok_o200k.chunk_text("hello", 0),
+        lambda: tok_o200k.chunk_text("hello", 4, overlap=4),
+        lambda: tok_o200k.chunk_text("hello", 4, overlap=5),
+    ):
+        tot += 1
+        try:
+            bad_call()
+        except ValueError:
+            ok += 1
+
+    # Long text (>DETACH_MIN and >SPLIT_MIN) for both truncate & chunk_text
+    long_txt = (short + "\n") * 4000
+    ids_long = tok_o200k.encode_ordinary(long_txt)
+    tot += 3
+    ok += int(tok_o200k.truncate(long_txt, 50, side="right") == tok_o200k.decode(ids_long[:50]))
+    ok += int(tok_o200k.truncate(long_txt, 50, side="left") == tok_o200k.decode(ids_long[-50:]))
+    ok += int(tok_o200k.truncate(long_txt, len(ids_long) + 100) == long_txt)
+
+    for max_t, ov in ((5, 0), (5, 2), (7, 6), (len(ids_short), 0), (len(ids_short) + 5, 2)):
+        chunks = tok_o200k.chunk_text(short, max_t, overlap=ov)
+        if len(ids_short) <= max_t:
+            want_chunks = [short]
+        else:
+            step = max_t - ov
+            want_chunks = []
+            pos = 0
+            while pos < len(ids_short):
+                end = min(pos + max_t, len(ids_short))
+                want_chunks.append(tok_o200k.decode(ids_short[pos:end]))
+                if end == len(ids_short):
+                    break
+                pos += step
+        tot += 1
+        ok += int(chunks == want_chunks)
+
+    # Large doc chunk_text (parallel encode + sliding window decode)
+    big_chunks = tok_o200k.chunk_text(long_txt[:20000], 128, overlap=16)
+    ids_20k = tok_o200k.encode_ordinary(long_txt[:20000])
+    step = 112
+    want_big = []
+    pos = 0
+    while pos < len(ids_20k):
+        end = min(pos + 128, len(ids_20k))
+        want_big.append(tok_o200k.decode(ids_20k[pos:end]))
+        if end == len(ids_20k):
+            break
+        pos += step
+    tot += 1
+    ok += int(big_chunks == want_big)
+
+    # 2. AutoTokenizer.truncate & chunk_text (specials + post-processor BOS/EOS budget)
+    qwen = TTAuto.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", local_files_only=True)
+    phi = TTAuto.from_pretrained("microsoft/Phi-3.5-mini-instruct", local_files_only=True)
+    spec_text = "<|im_start|>user\nHello world from tuetoken truncate!<|im_end|>"
+    ids_q = qwen.encode(spec_text, add_special_tokens=False)
+    tot += 3
+    ok += int(qwen.truncate(spec_text, 4, side="right", add_special_tokens=False) == qwen.decode(ids_q[:4], skip_special_tokens=False))
+    ok += int(qwen.truncate(spec_text, 4, side="left", add_special_tokens=False) == qwen.decode(ids_q[-4:], skip_special_tokens=False))
+    # Phi-3.5 adds BOS (1 token) when add_special_tokens=True: truncated text must fit within budget!
+    phi_trunc = phi.truncate("one two three four five six seven eight nine ten", 6, add_special_tokens=True)
+    ok += int(len(phi.encode(phi_trunc, add_special_tokens=True)) <= 6)
+
+    phi_chunks = phi.chunk_text("one two three four five six seven eight nine ten", 6, overlap=1, add_special_tokens=True)
+    tot += 2
+    ok += int(len(phi_chunks) >= 2)
+    ok += int(all(len(phi.encode(c, add_special_tokens=True)) <= 6 for c in phi_chunks))
+
+    # 3. Local-directory AutoTokenizer.from_pretrained + stand-alone chat_template.jinja
+    qwen_tj = hf_hub_download("Qwen/Qwen2.5-0.5B-Instruct", "tokenizer.json", local_files_only=True)
+    qwen_dir = os.path.dirname(qwen_tj)
+    qwen_local = TTAuto.from_pretrained(qwen_dir)
+    tot += 2
+    ok += int(qwen_local.encode(spec_text) == qwen.encode(spec_text))
+    ok += int(qwen_local.eos_token_id == qwen.eos_token_id)
+
+    with tempfile.TemporaryDirectory() as td:
+        import shutil
+        shutil.copy(qwen_tj, os.path.join(td, "tokenizer.json"))
+        with open(os.path.join(td, "tokenizer_config.json"), "w", encoding="utf-8") as f:
+            f.write('{"eos_token": "<|im_end|>"}')
+        with open(os.path.join(td, "chat_template.jinja"), "w", encoding="utf-8") as f:
+            f.write("{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}")
+        ltok = TTAuto.from_pretrained(td)
+        rendered = ltok.apply_chat_template([{"role": "user", "content": "hi"}], tokenize=False)
+        tot += 1
+        ok += int(rendered == "user: hi\n")
+
+    # 4. PySequence_Repeat attention_mask exactness on empty, 1-token, and padded batches
+    out_am = qwen(["", "hello", "the quick brown fox jumps"], padding=True, return_attention_mask=True)
+    tot += 2
+    ok += int(out_am["attention_mask"][0] == [0] * len(out_am["input_ids"][0]))
+    ok += int(all(len(a) == len(b) for a, b in zip(out_am["input_ids"], out_am["attention_mask"])))
+
+    # 5. SentencePiece literal '▁' isolation + multi-thread 1T==MT parity (Phi-3.5 & cached Gemma-3)
+    lit_sp_text = ("Hello world! " * 300 + "literal_\u2581_bar foo \u2581 baz " + "German über Straße\n" * 200) * 8
+    for tok_sp, hf_sp in [(phi, HFAuto.from_pretrained("microsoft/Phi-3.5-mini-instruct", local_files_only=True))]:
+        got_1t = tok_sp._core.encode_ordinary_batch([lit_sp_text], num_threads=1)[0]
+        got_mt = tok_sp._core.encode_ordinary_batch([lit_sp_text], num_threads=0)[0]
+        want_hf = hf_sp.encode(lit_sp_text, add_special_tokens=False)
+        tot += 2
+        ok += int(got_1t == want_hf)
+        ok += int(got_mt == want_hf)
+
+    # 6. Cached modern model regressions: gpt-oss-20b (ignore_merges), Falcon-H1/Falcon3 (PretokPipe)
+    from tokenizers import Tokenizer as HFTok
+    adv_pipe = "Digits 1234567890 & punct!!! Café òóùüýþ ¼½¾ ²³¹ 日本語 🚀\n" * 40
+    for repo in ("openai/gpt-oss-20b", "tiiuae/Falcon-H1-7B-Instruct", "tiiuae/Falcon3-7B-Instruct"):
+        try:
+            tj = hf_hub_download(repo, "tokenizer.json", local_files_only=True)
+        except Exception:
+            continue
+        tt_m = Tokenizer(tj)
+        hf_m = HFTok.from_file(tj)
+        w = hf_m.encode(adv_pipe, add_special_tokens=False).ids
+        g1 = tt_m.encode_ordinary_batch([adv_pipe], num_threads=1)[0]
+        gm = tt_m.encode_ordinary_batch([adv_pipe], num_threads=0)[0]
+        tot += 2
+        ok += int(g1 == w)
+        ok += int(gm == w)
+
+    _line("truncate, chunk_text & v0.2 regressions", ok, tot)
+    assert ok == tot, f"v0.2 regressions: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -1491,6 +1654,7 @@ def main():
         test_review_regressions(), test_whisper(), test_zero_copy_buffer_decode(),
         test_fast_and_batch_chat_templates(), test_sentencepiece_fast_meta(),
         test_decode_stream(), test_count_and_file_apis(),
+        test_truncate_chunk_and_v02_regressions(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

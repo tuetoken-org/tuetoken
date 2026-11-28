@@ -8982,6 +8982,194 @@ impl Tokenizer {
         }
     }
 
+    /// Truncate `text` to at most `max_tokens` tokens without constructing a
+    /// Python `list[int]`. Returns `text` unchanged when it already fits within
+    /// `max_tokens`. `side` is `"right"` (keep prefix, default) or `"left"`
+    /// (keep suffix); `special=True` recognizes registered special tokens.
+    #[pyo3(signature = (text, max_tokens, side = "right", special = false))]
+    fn truncate<'py>(
+        &self,
+        py: Python<'py>,
+        text: &Bound<'py, PyString>,
+        max_tokens: usize,
+        side: &str,
+        special: bool,
+    ) -> PyResult<Bound<'py, PyString>> {
+        let right = match side {
+            "right" => true,
+            "left" => false,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "side must be 'right' or 'left', not {other:?}"
+                )))
+            }
+        };
+        if max_tokens == 0 {
+            return Ok(PyString::new(py, ""));
+        }
+        let s_cow = text.to_cow()?;
+        let txt: &str = &s_cow;
+        if txt.is_empty() {
+            return Ok(text.clone());
+        }
+        if txt.len() < Self::DETACH_MIN {
+            return Ok(self.with_scratch(|sc| {
+                sc.out.clear();
+                if special && self.special_ac.is_some() {
+                    self.encode_special_into(txt, sc);
+                } else {
+                    self.encode_into(txt, Merge::Auto, true, sc);
+                }
+                if sc.out.len() <= max_tokens {
+                    return text.clone();
+                }
+                let sub = if right {
+                    &sc.out[..max_tokens]
+                } else {
+                    &sc.out[sc.out.len() - max_tokens..]
+                };
+                self.decode_slice_to_pystr(py, sub, false, false, 0.02, 1500, &mut sc.utf8)
+            }));
+        }
+        let ids: Vec<u32> = py.detach(|| {
+            if !special && txt.len() >= SPLIT_MIN && self.splittable() {
+                self.encode_direct(&[txt], 0, true).0
+            } else {
+                self.with_scratch(|sc| {
+                    sc.out.clear();
+                    if special && self.special_ac.is_some() {
+                        self.encode_special_into(txt, sc);
+                    } else {
+                        self.encode_into(txt, Merge::Auto, true, sc);
+                    }
+                    sc.out.clone()
+                })
+            }
+        });
+        if ids.len() <= max_tokens {
+            return Ok(text.clone());
+        }
+        let sub = if right {
+            &ids[..max_tokens]
+        } else {
+            &ids[ids.len() - max_tokens..]
+        };
+        Ok(self.with_scratch(|sc| {
+            self.decode_slice_to_pystr(py, sub, false, false, 0.02, 1500, &mut sc.utf8)
+        }))
+    }
+
+    /// Split `text` into consecutive text chunks of at most `max_tokens` tokens
+    /// each (with `overlap` shared tokens between adjacent chunks) directly in
+    /// Rust without Python `list[int]` boxing. Ideal for RAG and long-context
+    /// windowing.
+    #[pyo3(signature = (text, max_tokens, overlap = 0, special = false))]
+    fn chunk_text<'py>(
+        &self,
+        py: Python<'py>,
+        text: &Bound<'py, PyString>,
+        max_tokens: usize,
+        overlap: usize,
+        special: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        if max_tokens == 0 {
+            return Err(PyValueError::new_err("max_tokens must be > 0"));
+        }
+        if overlap >= max_tokens {
+            return Err(PyValueError::new_err("overlap must be < max_tokens"));
+        }
+        let s_cow = text.to_cow()?;
+        let txt: &str = &s_cow;
+        if txt.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        let single_list = || -> Bound<'py, PyList> {
+            unsafe {
+                let list = pyo3::ffi::PyList_New(1);
+                assert!(!list.is_null(), "list alloc");
+                pyo3::ffi::PyList_SET_ITEM(list, 0, text.clone().into_ptr());
+                Bound::from_owned_ptr(py, list).cast_into_unchecked()
+            }
+        };
+        if txt.len() < Self::DETACH_MIN {
+            return Ok(self.with_scratch(|sc| {
+                sc.out.clear();
+                if special && self.special_ac.is_some() {
+                    self.encode_special_into(txt, sc);
+                } else {
+                    self.encode_into(txt, Merge::Auto, true, sc);
+                }
+                let n = sc.out.len();
+                if n <= max_tokens {
+                    return single_list();
+                }
+                let step = max_tokens - overlap;
+                let nchunks = (n - overlap).div_ceil(step);
+                unsafe {
+                    let list = pyo3::ffi::PyList_New(nchunks as pyo3::ffi::Py_ssize_t);
+                    assert!(!list.is_null(), "list alloc");
+                    let mut pos = 0usize;
+                    for idx in 0..nchunks {
+                        let end = (pos + max_tokens).min(n);
+                        let piece = self.decode_slice_to_pystr(
+                            py,
+                            &sc.out[pos..end],
+                            false,
+                            false,
+                            0.02,
+                            1500,
+                            &mut sc.utf8,
+                        );
+                        pyo3::ffi::PyList_SET_ITEM(list, idx as pyo3::ffi::Py_ssize_t, piece.into_ptr());
+                        pos += step;
+                    }
+                    Bound::from_owned_ptr(py, list).cast_into_unchecked()
+                }
+            }));
+        }
+        let ids: Vec<u32> = py.detach(|| {
+            if !special && txt.len() >= SPLIT_MIN && self.splittable() {
+                self.encode_direct(&[txt], 0, true).0
+            } else {
+                self.with_scratch(|sc| {
+                    sc.out.clear();
+                    if special && self.special_ac.is_some() {
+                        self.encode_special_into(txt, sc);
+                    } else {
+                        self.encode_into(txt, Merge::Auto, true, sc);
+                    }
+                    sc.out.clone()
+                })
+            }
+        });
+        let n = ids.len();
+        if n <= max_tokens {
+            return Ok(single_list());
+        }
+        let step = max_tokens - overlap;
+        let nchunks = (n - overlap).div_ceil(step);
+        Ok(self.with_scratch(|sc| unsafe {
+            let list = pyo3::ffi::PyList_New(nchunks as pyo3::ffi::Py_ssize_t);
+            assert!(!list.is_null(), "list alloc");
+            let mut pos = 0usize;
+            for idx in 0..nchunks {
+                let end = (pos + max_tokens).min(n);
+                let piece = self.decode_slice_to_pystr(
+                    py,
+                    &ids[pos..end],
+                    false,
+                    false,
+                    0.02,
+                    1500,
+                    &mut sc.utf8,
+                );
+                pyo3::ffi::PyList_SET_ITEM(list, idx as pyo3::ffi::Py_ssize_t, piece.into_ptr());
+                pos += step;
+            }
+            Bound::from_owned_ptr(py, list).cast_into_unchecked()
+        }))
+    }
+
     /// Encode and return, for each token, its byte span `(start, end)` in `text`
     /// — for highlighting, NER alignment, char-level truncation. Returns
     /// `(ids, offsets)`. ByteLevel models only (byte_fallback/SentencePiece

@@ -231,10 +231,59 @@ class AutoTokenizer:
 
     @classmethod
     def from_pretrained(cls, repo_id, revision=None, warmup=None,
-                        language=None, task=None, predict_timestamps=None, **_):
-        from huggingface_hub import hf_hub_download
-        kw = {"revision": revision} if revision else {}
+                        language=None, task=None, predict_timestamps=None,
+                        local_files_only=False, cache_dir=None, token=None, **_):
         extra = dict(language=language, task=task, predict_timestamps=predict_timestamps)
+
+        # Fast local-directory loading (zero huggingface_hub / network calls).
+        if isinstance(repo_id, (str, os.PathLike)) and os.path.isdir(repo_id):
+            d = os.fspath(repo_id)
+            tj = os.path.join(d, "tokenizer.json")
+            if os.path.isfile(tj):
+                cfg = {}
+                for name in ("special_tokens_map.json", "tokenizer_config.json"):
+                    p = os.path.join(d, name)
+                    if os.path.isfile(p):
+                        with open(p, encoding="utf-8") as f:
+                            cfg.update(json.load(f))
+                if not cfg.get("chat_template"):
+                    ct = os.path.join(d, "chat_template.jinja")
+                    if os.path.isfile(ct):
+                        with open(ct, encoding="utf-8") as f:
+                            cfg["chat_template"] = f.read()
+                norm_json = None
+                if (cfg.get("tokenizer_class") or "").startswith("Whisper"):
+                    cand = os.path.join(d, "normalizer.json")
+                    if os.path.isfile(cand):
+                        norm_json = cand
+                return cls(tj, cfg, warmup=warmup, normalizer_json=norm_json, **extra)
+            tek = os.path.join(d, "tekken.json")
+            if os.path.isfile(tek):
+                return cls.from_tekken(tek, warmup=warmup)
+            from . import _formats as _fmt
+            legacy = _fmt.try_load_legacy_bpe_repo(d, revision=revision)
+            if legacy is not None:
+                tj_path, cfg = legacy
+                norm_json = None
+                if (cfg.get("tokenizer_class") or "").startswith("Whisper"):
+                    cand = os.path.join(d, "normalizer.json")
+                    if os.path.isfile(cand):
+                        norm_json = cand
+                return cls(tj_path, cfg, warmup=warmup, normalizer_json=norm_json, **extra)
+            raise FileNotFoundError(
+                f"no tokenizer.json, tekken.json, or vocab.json+merges.txt found in {d!r}"
+            )
+
+        from huggingface_hub import hf_hub_download
+        kw = {}
+        if revision:
+            kw["revision"] = revision
+        if local_files_only:
+            kw["local_files_only"] = True
+        if cache_dir is not None:
+            kw["cache_dir"] = cache_dir
+        if token is not None:
+            kw["token"] = token
         try:
             tj = hf_hub_download(repo_id, "tokenizer.json", **kw)
         except Exception as e:
@@ -257,15 +306,10 @@ class AutoTokenizer:
                 tj_path, cfg = legacy
                 norm_json = None
                 if (cfg.get("tokenizer_class") or "").startswith("Whisper"):
-                    if os.path.isdir(repo_id):
-                        cand = os.path.join(repo_id, "normalizer.json")
-                        if os.path.isfile(cand):
-                            norm_json = cand
-                    else:
-                        try:
-                            norm_json = hf_hub_download(repo_id, "normalizer.json", **kw)
-                        except Exception:
-                            pass
+                    try:
+                        norm_json = hf_hub_download(repo_id, "normalizer.json", **kw)
+                    except Exception:
+                        pass
                 return cls(tj_path, cfg, warmup=warmup, normalizer_json=norm_json, **extra)
             # Not auto-recoverable: actionable error if it IS tiktoken-format, else
             # re-raise the original download failure.
@@ -285,6 +329,12 @@ class AutoTokenizer:
             try:
                 with open(hf_hub_download(repo_id, name, **kw), encoding="utf-8") as f:
                     cfg.update(json.load(f))
+            except Exception:
+                pass
+        if not cfg.get("chat_template"):
+            try:
+                with open(hf_hub_download(repo_id, "chat_template.jinja", **kw), encoding="utf-8") as f:
+                    cfg["chat_template"] = f.read()
             except Exception:
                 pass
         norm_json = None
@@ -640,6 +690,55 @@ class AutoTokenizer:
         """Zero-copy mmap ordinary token count for a file on disk (returns `int`
         when `separator is None`, or `list[int]` per separated document)."""
         return self._core.count_tokens_file(path, int(num_threads), separator)
+
+    def truncate(self, text, max_tokens, side="right", add_special_tokens=False):
+        """Truncate `text` to fit within `max_tokens` tokens without allocating
+        a Python `list[int]`. When `add_special_tokens=True`, reserves budget for
+        the tokenizer's post-processor prefix/suffix tokens."""
+        max_tokens = int(max_tokens)
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be >= 0")
+        if side not in ("right", "left"):
+            raise ValueError(f"side must be 'right' or 'left', not {side!r}")
+        if not add_special_tokens:
+            return self._core.truncate(text, max_tokens, side, True)
+        prefix, suffix = self._post_prefix_suffix()
+        if self.__dict__.get("_ps_exact", False):
+            budget = max(0, max_tokens - len(prefix) - len(suffix))
+            return self._core.truncate(text, budget, side, True)
+        ids = self.encode(text, add_special_tokens=True)
+        if len(ids) <= max_tokens:
+            return text
+        if max_tokens == 0:
+            return ""
+        sub = ids[:max_tokens] if side == "right" else ids[-max_tokens:]
+        return self.decode(sub, skip_special_tokens=True)
+
+    def chunk_text(self, text, max_tokens, overlap=0, add_special_tokens=False):
+        """Split `text` into consecutive chunks of at most `max_tokens` tokens
+        each (with `overlap` shared tokens between adjacent chunks) directly in
+        Rust without Python `list[int]` boxing."""
+        max_tokens = int(max_tokens)
+        overlap = int(overlap)
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be > 0")
+        if overlap < 0 or overlap >= max_tokens:
+            raise ValueError("overlap must satisfy 0 <= overlap < max_tokens")
+        if not add_special_tokens:
+            return self._core.chunk_text(text, max_tokens, overlap, True)
+        prefix, suffix = self._post_prefix_suffix()
+        if self.__dict__.get("_ps_exact", False):
+            budget = max_tokens - len(prefix) - len(suffix)
+            if budget <= 0:
+                raise ValueError(
+                    f"max_tokens ({max_tokens}) must exceed post-processor special tokens ({len(prefix) + len(suffix)})"
+                )
+            if overlap >= budget:
+                raise ValueError(
+                    f"overlap ({overlap}) must be < effective content budget ({budget})"
+                )
+            return self._core.chunk_text(text, budget, overlap, True)
+        return self._core.chunk_text(text, max_tokens, overlap, True)
 
     def _post_prefix_suffix(self):
         """Special ids the post-processor adds before/after a single sequence
