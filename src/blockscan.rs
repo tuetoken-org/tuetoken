@@ -1200,7 +1200,8 @@ fn ws_starts_nl_fast<const FULL: bool>(
     b: &[u8],
     base: usize,
     valid: u64,
-    m: &Classes,
+    m_ws: u64,
+    m_nl: u64,
     o_before: u64,
     c_ws: bool,
 ) -> (u64, u64, u64, u64, bool) {
@@ -1210,10 +1211,10 @@ fn ws_starts_nl_fast<const FULL: bool>(
     } else {
         (false, false)
     };
-    let long = m.ws & (p1(m.ws, c_ws) | n1(m.ws, next_ws));
-    let cont_ws = m.ws & !m.ws.wrapping_add(1) & (c_ws as u64).wrapping_neg();
+    let long = m_ws & (p1(m_ws, c_ws) | n1(m_ws, next_ws));
+    let cont_ws = m_ws & !m_ws.wrapping_add(1) & (c_ws as u64).wrapping_neg();
     let lr = long & !cont_ws;
-    let single_abs = m.nl & !long & o_before;
+    let single_abs = m_nl & !long & o_before;
     let wsbad = if lr >> 63 == 0 {
         0
     } else {
@@ -1221,7 +1222,7 @@ fn ws_starts_nl_fast<const FULL: bool>(
         if inv == 0 { u64::MAX } else { !(u64::MAX >> inv.leading_zeros()) }
     };
     let good = lr & !wsbad;
-    let nl_g = m.nl & good;
+    let nl_g = m_nl & good;
     let r_starts = good & !(good << 1);
     let abs_seed = r_starts & o_before & nl_g;
     let abs_lr = (nl_g.wrapping_add(abs_seed) ^ nl_g) & nl_g;
@@ -1243,7 +1244,7 @@ fn ws_starts_nl_fast<const FULL: bool>(
     } else {
         non_nl & !(rem >> 1) & (non_nl << 1) & (valid >> 1)
     };
-    let wsstart = (m.ws & !long & !single_abs)
+    let wsstart = (m_ws & !long & !single_abs)
         | (rem & !(rem << 1))
         | l1_starts
         | end_split;
@@ -1270,7 +1271,7 @@ fn generic_fast<const FULL: bool, const K: u32, const NO_NL: bool>(
     base: usize,
     max_digits: u32,
     flags: u32,
-    m: &Classes,
+    m: Classes,
     valid: u64,
     cont: u64,
 ) -> Option<(u64, u64, u32)> {
@@ -1285,7 +1286,7 @@ fn generic_fast<const FULL: bool, const K: u32, const NO_NL: bool>(
     };
     let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart_c, flags, 8)));
     let (dstart, dbad) = digit_starts_ascii::<K>(m.d, fbit(flags, F_D), max_digits);
-    let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m, if NO_NL { 0 } else { o_before }, fbit(flags, F_WS));
+    let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m.ws, m.nl, if NO_NL { 0 } else { o_before }, fbit(flags, F_WS));
     let mut starts = ostart | lstart | dstart | wsstart | (((flags >> 14) & 1) as u64);
     let mut bad = cont_ws | (m.ws & ((next_na as u64) << 63)) | dbad | wsbad;
     let mut qc = m.q & ostart;
@@ -1328,7 +1329,8 @@ fn generic_fast<const FULL: bool, const K: u32, const NO_NL: bool>(
 
 #[cold]
 #[inline(never)]
-fn generic_slow<const NO_NL: bool>(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
+fn generic_slow<const NO_NL: bool>(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32) {
+    let m = classify(b, base);
     let (c_bad_in, c_forced) = if fbit(flags, F_SLOW) {
         (slow.bad_in, slow.forced)
     } else {
@@ -1389,42 +1391,40 @@ unsafe fn generic_block<S: Simd, const K: u32, const NO_NL: bool>(avail: &[u8], 
     let doc = &avail[..doc_len];
     if base + 64 < doc_len {
         let v = S::load64(avail.as_ptr().add(base));
-        let m = S::classify_vec(v);
         if (flags & F_SLOW) == 0 {
-            let mut rm = m;
+            let mut m = S::classify_vec(v);
             let mut cont = 0u64;
             let mut ok = true;
-            if rm.na != 0 {
-                let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                ok = utf8_ok && rm.na == 0;
+            if m.na != 0 {
+                let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut m);
+                ok = utf8_ok && m.na == 0;
                 cont = c;
             }
             if ok {
-                if let Some((s, bad, nf)) = generic_fast::<true, K, NO_NL>(doc, base, max_digits, flags, &rm, u64::MAX, cont) {
+                if let Some((s, bad, nf)) = generic_fast::<true, K, NO_NL>(doc, base, max_digits, flags, m, u64::MAX, cont) {
                     return (s, bad, nf, true);
                 }
             }
         }
-        let (s, bad, nf) = generic_slow::<NO_NL>(doc, base, max_digits, flags, slow, m);
+        let (s, bad, nf) = generic_slow::<NO_NL>(doc, base, max_digits, flags, slow);
         return (s, bad, nf, false);
     }
-    let (v, m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
     if (flags & F_SLOW) == 0 {
-        let mut rm = m;
+        let (v, mut m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
         let mut cont = 0u64;
         let mut ok = true;
-        if rm.na != 0 {
-            let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            ok = utf8_ok && rm.na == 0;
+        if m.na != 0 {
+            let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut m);
+            ok = utf8_ok && m.na == 0;
             cont = c;
         }
         if ok {
-            if let Some((s, bad, nf)) = generic_fast::<false, K, NO_NL>(doc, base, max_digits, flags, &rm, valid, cont) {
+            if let Some((s, bad, nf)) = generic_fast::<false, K, NO_NL>(doc, base, max_digits, flags, m, valid, cont) {
                 return (s, bad, nf, true);
             }
         }
     }
-    let (s, bad, nf) = generic_slow::<NO_NL>(doc, base, max_digits, flags, slow, m);
+    let (s, bad, nf) = generic_slow::<NO_NL>(doc, base, max_digits, flags, slow);
     (s, bad, nf, false)
 }
 
@@ -1440,7 +1440,7 @@ fn camel_fast<const FULL: bool, const C_MODE: u8, const K: u32>(
     contractions: bool,
     max_digits: u32,
     flags: u32,
-    m: &Classes,
+    m: Classes,
     valid: u64,
     cont: u64,
 ) -> Option<(u64, u64, u32)> {
@@ -1452,7 +1452,7 @@ fn camel_fast<const FULL: bool, const C_MODE: u8, const K: u32>(
     let o = if FULL { !(m.l | m.d | m.ws) } else { !(m.l | m.d | m.ws) & valid };
     let lw = m.l & !m.up;
     let o_before = p1f(o, flags, 0);
-    let (wsstart, wsbad, abs_nl, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m, o_before, fbit(flags, F_WS));
+    let (wsstart, wsbad, abs_nl, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m.ws, m.nl, o_before, fbit(flags, F_WS));
     let seed = m.sl & p1(abs_nl, (flags & (F_ABS_NL | F_ABS_SL)) != 0);
     let abs_sl = (m.sl.wrapping_add(seed) ^ m.sl) & m.sl;
     let mut ostart = (o & !o_before & !p1f(m.sp, flags, 1) & !abs_sl) | (o & !m.sl & p1f(abs_sl, flags, 10));
@@ -1537,7 +1537,8 @@ fn camel_fast<const FULL: bool, const C_MODE: u8, const K: u32>(
 
 #[cold]
 #[inline(never)]
-fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
+fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32) {
+    let m = classify(b, base);
     let (c_bad_in, c_contr_mask, c_forced, c_suppress) = if fbit(flags, F_SLOW) {
         (slow.bad_in, slow.contr_mask, slow.forced, slow.suppress)
     } else {
@@ -1642,43 +1643,41 @@ fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, flags:
 unsafe fn camel_block<S: Simd, const C_MODE: u8, const K: u32>(avail: &[u8], doc_len: usize, base: usize, contractions: bool, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
     let doc = &avail[..doc_len];
     if base + 64 < doc_len {
-        let v = S::load64(avail.as_ptr().add(base));
-        let m = S::classify_vec(v);
         if (flags & F_SLOW) == 0 {
-            let mut rm = m;
+            let v = S::load64(avail.as_ptr().add(base));
+            let mut m = S::classify_vec(v);
             let mut cont = 0u64;
             let mut ok = true;
-            if rm.na != 0 {
-                let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                ok = utf8_ok && rm.na == 0;
+            if m.na != 0 {
+                let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut m);
+                ok = utf8_ok && m.na == 0;
                 cont = c;
             }
             if ok {
-                if let Some((s, bad, nf)) = camel_fast::<true, C_MODE, K>(doc, base, contractions, max_digits, flags, &rm, u64::MAX, cont) {
+                if let Some((s, bad, nf)) = camel_fast::<true, C_MODE, K>(doc, base, contractions, max_digits, flags, m, u64::MAX, cont) {
                     return (s, bad, nf, true);
                 }
             }
         }
-        let (s, bad, nf) = camel_slow(doc, base, contractions, max_digits, flags, slow, m);
+        let (s, bad, nf) = camel_slow(doc, base, contractions, max_digits, flags, slow);
         return (s, bad, nf, false);
     }
-    let (v, m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
     if (flags & F_SLOW) == 0 {
-        let mut rm = m;
+        let (v, mut m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
         let mut cont = 0u64;
         let mut ok = true;
-        if rm.na != 0 {
-            let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            ok = utf8_ok && rm.na == 0;
+        if m.na != 0 {
+            let (c, _punct, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut m);
+            ok = utf8_ok && m.na == 0;
             cont = c;
         }
         if ok {
-            if let Some((s, bad, nf)) = camel_fast::<false, C_MODE, K>(doc, base, contractions, max_digits, flags, &rm, valid, cont) {
+            if let Some((s, bad, nf)) = camel_fast::<false, C_MODE, K>(doc, base, contractions, max_digits, flags, m, valid, cont) {
                 return (s, bad, nf, true);
             }
         }
     }
-    let (s, bad, nf) = camel_slow(doc, base, contractions, max_digits, flags, slow, m);
+    let (s, bad, nf) = camel_slow(doc, base, contractions, max_digits, flags, slow);
     (s, bad, nf, false)
 }
 
@@ -1692,7 +1691,7 @@ fn word_fast<const FULL: bool, const I_MODE: u8>(
     base: usize,
     indiv: bool,
     flags: u32,
-    m: &Classes,
+    m: Classes,
     valid: u64,
 ) -> Option<(u64, u64, u32)> {
     let ind = match I_MODE {
@@ -1761,51 +1760,50 @@ fn word_fast<const FULL: bool, const I_MODE: u8>(
 unsafe fn word_block<S: Simd, const I_MODE: u8>(avail: &[u8], doc_len: usize, base: usize, indiv: bool, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
     let doc = &avail[..doc_len];
     if base + 64 < doc_len {
-        let v = S::load64(avail.as_ptr().add(base));
-        let m = S::classify_vec(v);
         if (flags & F_SLOW) == 0 {
-            let mut rm = m;
+            let v = S::load64(avail.as_ptr().add(base));
+            let mut m = S::classify_vec(v);
             let mut ok = true;
-            if rm.na != 0 {
-                let (_, _, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut rm);
-                ok = utf8_ok && rm.na == 0;
+            if m.na != 0 {
+                let (_, _, utf8_ok) = S::resolve_latin1_vec(v, u64::MAX, &mut m);
+                ok = utf8_ok && m.na == 0;
             }
             if ok {
-                if let Some((s, bad, nf)) = word_fast::<true, I_MODE>(doc, base, indiv, flags, &rm, u64::MAX) {
+                if let Some((s, bad, nf)) = word_fast::<true, I_MODE>(doc, base, indiv, flags, m, u64::MAX) {
                     return (s, bad, nf, true);
                 }
             }
         }
-        let (s, bad, nf) = word_slow(doc, base, indiv, flags, slow, m);
+        let (s, bad, nf) = word_slow(doc, base, indiv, flags, slow);
         return (s, bad, nf, false);
     }
-    let (v, m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
     if (flags & F_SLOW) == 0 {
-        let mut rm = m;
+        let (v, mut m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
         let mut ok = true;
-        if rm.na != 0 {
-            let (_, _, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut rm);
-            ok = utf8_ok && rm.na == 0;
+        if m.na != 0 {
+            let (_, _, utf8_ok) = S::resolve_latin1_vec(v, valid, &mut m);
+            ok = utf8_ok && m.na == 0;
         }
         if ok {
-            if let Some((s, bad, nf)) = word_fast::<false, I_MODE>(doc, base, indiv, flags, &rm, valid) {
+            if let Some((s, bad, nf)) = word_fast::<false, I_MODE>(doc, base, indiv, flags, m, valid) {
                 return (s, bad, nf, true);
             }
         }
     }
-    let (s, bad, nf) = word_slow(doc, base, indiv, flags, slow, m);
+    let (s, bad, nf) = word_slow(doc, base, indiv, flags, slow);
     (s, bad, nf, false)
 }
 
 #[cold]
 #[inline(never)]
-fn word_slow(b: &[u8], base: usize, indiv: bool, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
+fn word_slow(b: &[u8], base: usize, indiv: bool, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32) {
+    let m = classify(b, base);
     let n = b.len();
     if m.na != 0 && base + 64 < n && (flags & F_SLOW) == 0 {
         let mut r = m;
         resolve_na::<false>(b, base, &mut r);
         if r.na == 0 {
-            if let Some(out) = word_fast::<true, 2>(b, base, indiv, flags, &r, u64::MAX) {
+            if let Some(out) = word_fast::<true, 2>(b, base, indiv, flags, r, u64::MAX) {
                 return out;
             }
         }
