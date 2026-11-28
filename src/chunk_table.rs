@@ -161,7 +161,10 @@ pub fn prefetch_write(p: *const u8) {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        // `prefetchw` (`0F 0D /1`): brings the cache line in Exclusive/Modified
+        // state before `Py_INCREF`'s RMW increment; architectural NOP on CPUs
+        // without 3DNowPrefetch/PRFCHW.
+        std::arch::asm!("prefetchw [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = p;
@@ -1121,6 +1124,18 @@ fn pack_6_words(toks: &[u32]) -> Option<([u32; 3], u32)> {
 }
 
 impl View<'_, 3> {
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub fn base_addr(&self) -> u64 {
+        self.base as u64
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub fn shift(&self) -> u32 {
+        self.shift
+    }
+
     /// Address of the home slot for hash `h` (never 0).
     #[inline(always)]
     pub fn slot_addr(&self, h: u64) -> u64 {

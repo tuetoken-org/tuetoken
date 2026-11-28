@@ -2769,14 +2769,23 @@ impl Tokenizer {
         })
     }
 
+    /// Cold fallback for out-of-table token IDs in `fill_pylist_prefetched`.
+    /// Kept out-of-line so the hot loop preserves all caller-saved registers
+    /// (`ip`, `tp`, `ob_item`) with zero stack spills.
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_pylong_tagged(t: u32) -> usize {
+        (pyo3::ffi::PyLong_FromUnsignedLong(t as _) as usize) | 1
+    }
+
     /// Fill `list[base_idx .. base_idx + ids.len()]` with owned `PyLong` refs
     /// from `table` using a 2-stage 16-slot software-prefetched ring:
     /// - Stage 0 (`i + 32`): prefetch `&table[ids[i + 32]]`
     /// - Stage 1 (`i + 16`): resolve pointer `p = table[ids[i + 16]]` & issue
-    ///   write-intent prefetch `prefetch_write(p)` for `p->ob_refcnt`
-    /// - Stage 2 (`i`): `Py_INCREF(p)` (now L1d-resident!) + `PyList_SET_ITEM`.
-    ///
-    /// Eliminates the ~67% L2/L3 `ob_refcnt` RMW stall observed on Zen 4 / M4.
+    ///   write-intent prefetch `prefetch_write(p)` (`prefetchw` on x86_64 /
+    ///   `prfm pstl1keep` on ARM64) for `p->ob_refcnt`
+    /// - Stage 2 (`i`): `Py_INCREF(p)` (now L1d-resident in Exclusive state!)
+    ///   + direct store into hoisted `ob_item[i]`.
     #[inline]
     unsafe fn fill_pylist_prefetched(
         table: &[Py<PyAny>],
@@ -2792,8 +2801,28 @@ impl Tokenizer {
         let tlen = table.len();
         let tp = table.as_ptr();
         let ip = ids.as_ptr();
+        #[cfg(not(any(PyPy, GraalPy)))]
+        let ob_item = (*(list as *mut ffi::PyListObject)).ob_item.add(base_idx);
 
-        // Short slice: straight loop with simple lookahead prefetch.
+        #[inline(always)]
+        unsafe fn write_item(
+            #[cfg(not(any(PyPy, GraalPy)))] ob_item: *mut *mut ffi::PyObject,
+            #[cfg(any(PyPy, GraalPy))] list: *mut ffi::PyObject,
+            #[cfg(any(PyPy, GraalPy))] base_idx: usize,
+            i: usize,
+            p: *mut ffi::PyObject,
+        ) {
+            #[cfg(not(any(PyPy, GraalPy)))]
+            {
+                *ob_item.add(i) = p;
+            }
+            #[cfg(any(PyPy, GraalPy))]
+            {
+                ffi::PyList_SET_ITEM(list, (base_idx + i) as ffi::Py_ssize_t, p);
+            }
+        }
+
+        // Short slice: straight loop with hoisted ob_item.
         if n < 24 {
             for i in 0..n {
                 let t = *ip.add(i) as usize;
@@ -2804,7 +2833,10 @@ impl Tokenizer {
                 } else {
                     ffi::PyLong_FromUnsignedLong(t as _)
                 };
-                ffi::PyList_SET_ITEM(list, (base_idx + i) as ffi::Py_ssize_t, obj);
+                #[cfg(not(any(PyPy, GraalPy)))]
+                write_item(ob_item, i, obj);
+                #[cfg(any(PyPy, GraalPy))]
+                write_item(list, base_idx, i, obj);
             }
             return;
         }
@@ -2819,46 +2851,53 @@ impl Tokenizer {
                 chunk_table::prefetch_write(p as *const u8);
                 p as usize
             } else {
-                (ffi::PyLong_FromUnsignedLong(t as _) as usize) | 1
+                Tokenizer::alloc_pylong_tagged(t)
             }
         }
 
         const RING: usize = 16;
-        let mut ring = [0usize; RING];
+        let mut ring = [std::mem::MaybeUninit::<usize>::uninit(); RING];
         for (j, slot) in ring.iter_mut().enumerate() {
             let pt = *ip.add(j + RING) as usize;
             if pt < tlen {
                 chunk_table::prefetch(tp.add(pt) as *const u8);
             }
-            *slot = resolve_and_pf(tp, tlen, *ip.add(j));
+            slot.write(resolve_and_pf(tp, tlen, *ip.add(j)));
         }
 
+        let ring_p = ring.as_mut_ptr() as *mut usize;
         let steady = n.saturating_sub(2 * RING);
         for i in 0..steady {
             let slot = i & (RING - 1);
-            let tagged = *ring.get_unchecked(slot);
+            let tagged = *ring_p.add(slot);
             let pt = *ip.add(i + 2 * RING) as usize;
             if pt < tlen {
                 chunk_table::prefetch(tp.add(pt) as *const u8);
             }
-            *ring.get_unchecked_mut(slot) = resolve_and_pf(tp, tlen, *ip.add(i + RING));
+            *ring_p.add(slot) = resolve_and_pf(tp, tlen, *ip.add(i + RING));
             let p = (tagged & !1usize) as *mut ffi::PyObject;
             if (tagged & 1) == 0 {
                 ffi::Py_INCREF(p);
             }
-            ffi::PyList_SET_ITEM(list, (base_idx + i) as ffi::Py_ssize_t, p);
+            #[cfg(not(any(PyPy, GraalPy)))]
+            write_item(ob_item, i, p);
+            #[cfg(any(PyPy, GraalPy))]
+            write_item(list, base_idx, i, p);
         }
         for i in steady..n {
             let slot = i & (RING - 1);
-            let tagged = *ring.get_unchecked(slot);
+            let tagged = *ring_p.add(slot);
             if i + RING < n {
-                *ring.get_unchecked_mut(slot) = resolve_and_pf(tp, tlen, *ip.add(i + RING));
+                *ring_p.add(slot) = resolve_and_pf(tp, tlen, *ip.add(i + RING));
             }
             let p = (tagged & !1usize) as *mut ffi::PyObject;
             if (tagged & 1) == 0 {
                 ffi::Py_INCREF(p);
             }
-            ffi::PyList_SET_ITEM(list, (base_idx + i) as ffi::Py_ssize_t, p);
+            #[cfg(not(any(PyPy, GraalPy)))]
+            write_item(ob_item, i, p);
+            #[cfg(any(PyPy, GraalPy))]
+            write_item(list, base_idx, i, p);
         }
     }
 
@@ -4054,7 +4093,7 @@ impl Tokenizer {
     fn flush_recs_sp(
         &self,
         bytes: &[u8],
-        buf: &[PipeRec],
+        base_rp: *const PipeRec,
         len: usize,
         ends: &[u32],
         first_a: usize,
@@ -4065,7 +4104,6 @@ impl Tokenizer {
         s.out.reserve(6 * len + 16);
         let mut base_out = s.out.as_mut_ptr();
         let mut wp = unsafe { base_out.add(s.out.len()) };
-        let base_rp = buf.as_ptr();
         let mut rp = base_rp;
         let end_rp = unsafe { base_rp.add(len) };
         while rp < end_rp {
@@ -4316,9 +4354,7 @@ impl Tokenizer {
                 let lview = self.long_table.view();
                 Self::fill_recs(bytes, &ends, 0, k, first_a, buf.as_mut_ptr(), view, lview);
                 Self::prime_pipe_prefetch(&mut buf, k);
-                // SAFETY: `fill_recs` + `prime_pipe_prefetch` initialized `buf[..k + X86_PF_DIST]`.
-                let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
-                self.flush_recs_sp(bytes, sl, k, &ends[..k], first_a, s, view, lview);
+                self.flush_recs_sp(bytes, buf.as_ptr() as *const PipeRec, k, &ends[..k], first_a, s, view, lview);
             }
         } else {
             while pos < n {
@@ -4430,9 +4466,7 @@ impl Tokenizer {
                     let first_a = a;
                     a = Self::fill_recs(bytes, &ends, 0, k, a, bufp, view, lview);
                     Self::prime_pipe_prefetch(&mut buf, k);
-                    // SAFETY: fill_recs + prime_pipe_prefetch initialized buf[..k + X86_PF_DIST].
-                    let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
-                    self.flush_recs(bytes, n, sl, k, &ends[..k], first_a, s, view, lview);
+                    self.flush_recs(bytes, n, buf.as_ptr() as *const PipeRec, k, &ends[..k], first_a, s, view, lview);
                 }
                 return;
             }
@@ -4510,18 +4544,20 @@ impl Tokenizer {
 
     /// On x86_64 (32 KiB L1d / 24 LFBs), issuing 256 back-to-back `prefetcht0`s in
     /// `fill_recs` saturates LFBs and evicts earlier prefetched lines before Phase 2
-    /// consumes them. Instead, pad `buf[total..total + X86_PF_DIST]` with an L1-hot
-    /// dummy address, prime the first `X86_PF_DIST` slots, and prefetch `rp + X86_PF_DIST`
-    /// in steady state during Phase 2. On ARM64 (Apple M4 Max 128 KiB L1d), `fill_recs`
-    /// batch prefetching fits in L1d without eviction, so `X86_PF_DIST = 0`.
+    /// consumes them. Instead, write only the `.p` field of `buf[total..total + X86_PF_DIST]`
+    /// with an L1-hot dummy address (halving tail padding stores), prime the first
+    /// `X86_PF_DIST` slots, and prefetch `rp + X86_PF_DIST` in steady state during
+    /// Phase 2. On ARM64 (Apple M4 Max 128 KiB L1d), `fill_recs` batch prefetching
+    /// fits in L1d without eviction, so `X86_PF_DIST = 0`.
     #[inline(always)]
     fn prime_pipe_prefetch(buf: &mut [std::mem::MaybeUninit<PipeRec>], total: usize) {
         #[cfg(target_arch = "x86_64")]
         {
             debug_assert!(total + X86_PF_DIST <= buf.len());
-            let dummy = PipeRec { lo: 0, hi: 0, p: buf.as_ptr() as u64 };
+            let dummy_p = buf.as_ptr() as u64;
+            let tail = unsafe { buf.as_mut_ptr().add(total) as *mut PipeRec };
             for j in 0..X86_PF_DIST {
-                unsafe { (*buf.as_mut_ptr().add(total + j)).write(dummy) };
+                unsafe { std::ptr::addr_of_mut!((*tail.add(j)).p).write(dummy_p) };
             }
             let p0 = buf.as_ptr() as *const PipeRec;
             for j in 0..total.min(X86_PF_DIST) {
@@ -4567,36 +4603,51 @@ impl Tokenizer {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[cold]
+    #[inline(never)]
+    fn fill_rec_long_cold(
+        cold: &(&[u8], chunk_table::LongView<'_>),
+        a: usize,
+        len: usize,
+    ) -> PipeRec {
+        Self::fill_rec_long(cold.0, a, len, cold.1)
+    }
+
+    #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "bmi2")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn fill_recs_bmi2(
-        bytes: &[u8],
-        ends: &[u32],
+        bp: *const u8,
+        mut ep: *const u32,
+        end_ep: *const u32,
         mut a: usize,
         mut out: *mut std::mem::MaybeUninit<PipeRec>,
-        view: chunk_table::View<'_, 3>,
-        lview: &chunk_table::LongView<'_>,
+        vbase: u64,
+        vshift: u32,
+        cold: &(&[u8], chunk_table::LongView<'_>),
     ) -> usize {
-        let bp = bytes.as_ptr();
-        for &e_u32 in ends {
-            let e = e_u32 as usize;
+        while ep < end_ep {
+            let e = *ep as usize;
             let len = e - a;
             if len.wrapping_sub(1) < chunk_table::MAX_KEY {
                 let (klo, khi) = chunk_table::pack_wide_bmi2(bp.add(a), len);
-                let p = view.slot_addr(chunk_table::hash(klo, khi));
+                let h = chunk_table::hash(klo, khi);
+                let p = vbase.wrapping_add((h >> vshift) << 5);
                 (*out).write(PipeRec { lo: klo, hi: khi, p });
             } else {
-                let v = Self::fill_rec_long(bytes, a, len, *lview);
+                let v = Self::fill_rec_long_cold(cold, a, len);
                 (*out).write(v);
             }
             out = out.add(1);
+            ep = ep.add(1);
             a = e;
         }
         a
     }
 
     /// Phase 1 records for chunk ends `ends[lo..hi]` (the first chunk starts at
-    /// `a`): key, home-slot address (prefetched) per chunk; returns the last
-    /// end. Straight-line wide loads for `<= 15B` chunks; `16..=31B` chunks
+    /// `a`): key, home-slot address (prefetched on ARM64) per chunk; returns the
+    /// last end. Straight-line wide loads for `<= 15B` chunks; `16..=31B` chunks
     /// prefetch their `SharedLongTable` 64B slot out-of-line.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
@@ -4622,7 +4673,20 @@ impl Tokenizer {
             #[cfg(target_arch = "x86_64")]
             {
                 if has_avx2_bmi1() {
-                    unsafe { Self::fill_recs_bmi2(bytes, head, a, out, view, &lview) }
+                    let cold = (bytes, lview);
+                    let ep = head.as_ptr();
+                    unsafe {
+                        Self::fill_recs_bmi2(
+                            bytes.as_ptr(),
+                            ep,
+                            ep.add(head.len()),
+                            a,
+                            out,
+                            view.base_addr(),
+                            view.shift(),
+                            &cold,
+                        )
+                    }
                 } else {
                     Self::fill_recs_generic(bytes, head, a, out, view, &lview)
                 }
@@ -4694,7 +4758,7 @@ impl Tokenizer {
         &self,
         bytes: &[u8],
         n: usize,
-        buf: &[PipeRec],
+        base_rp: *const PipeRec,
         len: usize,
         ends: &[u32],
         first_a: usize,
@@ -4705,7 +4769,6 @@ impl Tokenizer {
         s.out.reserve(6 * len + 16);
         let mut base_out = s.out.as_mut_ptr();
         let mut wp = unsafe { base_out.add(s.out.len()) };
-        let base_rp = buf.as_ptr();
         let mut rp = base_rp;
         let end_rp = unsafe { base_rp.add(len) };
         while rp < end_rp {
@@ -4759,7 +4822,7 @@ impl Tokenizer {
         &self,
         bytes: &[u8],
         n: usize,
-        buf: &[PipeRec],
+        base_rp: *const PipeRec,
         len: usize,
         ends: &[u32],
         first_a: usize,
@@ -4768,7 +4831,6 @@ impl Tokenizer {
         lview: chunk_table::LongView<'_>,
     ) -> usize {
         let mut total = 0usize;
-        let base_rp = buf.as_ptr();
         let mut rp = base_rp;
         let end_rp = unsafe { base_rp.add(len) };
         while rp < end_rp {
@@ -4814,7 +4876,7 @@ impl Tokenizer {
     #[allow(clippy::too_many_arguments)]
     fn flush_seg_count<'a>(
         &self,
-        buf: &[PipeRec],
+        buf_ptr: *const PipeRec,
         ends: &[u32],
         slo: usize,
         shi: usize,
@@ -4825,9 +4887,9 @@ impl Tokenizer {
         lview: chunk_table::LongView<'_>,
     ) -> usize {
         let mut total = 0usize;
-        let base_rp = unsafe { buf.as_ptr().add(slo) };
+        let base_rp = unsafe { buf_ptr.add(slo) };
         let mut rp = base_rp;
-        let end_rp = unsafe { buf.as_ptr().add(shi) };
+        let end_rp = unsafe { buf_ptr.add(shi) };
         while rp < end_rp {
             #[cfg(target_arch = "x86_64")]
             {
@@ -4914,7 +4976,7 @@ impl Tokenizer {
     #[allow(clippy::too_many_arguments)]
     fn flush_seg_into<'a>(
         &self,
-        buf: &[PipeRec],
+        buf_ptr: *const PipeRec,
         ends: &[u32],
         slo: usize,
         shi: usize,
@@ -4929,9 +4991,9 @@ impl Tokenizer {
     ) -> usize {
         let mut emitted = 0usize;
         let mut seg_start_wp = *wp;
-        let base_rp = unsafe { buf.as_ptr().add(slo) };
+        let base_rp = unsafe { buf_ptr.add(slo) };
         let mut rp = base_rp;
-        let end_rp = unsafe { buf.as_ptr().add(shi) };
+        let end_rp = unsafe { buf_ptr.add(shi) };
         while rp < end_rp {
             #[cfg(target_arch = "x86_64")]
             {
@@ -5018,7 +5080,7 @@ impl Tokenizer {
                 return;
             }
             Self::prime_pipe_prefetch(buf, total);
-            let buf: &[PipeRec] = unsafe { &*(&buf[..total + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+            let buf = buf.as_ptr() as *const PipeRec;
             if !WANT_OUTPUT {
                 for &(slo, shi, ldi, first_a, uoff, ulen) in segs {
                     let n = self.flush_seg_count(
@@ -5612,7 +5674,7 @@ impl Tokenizer {
                 return;
             }
             Self::prime_pipe_prefetch(buf, total);
-            let buf: &[PipeRec] = unsafe { &*(&buf[..total + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+            let buf = buf.as_ptr() as *const PipeRec;
             if !WANT_OUTPUT {
                 for &(slo, shi, ii, first_a, uoff, ulen) in segs {
                     let n = self.flush_seg_count(
@@ -6494,7 +6556,7 @@ impl Tokenizer {
                 return;
             }
             Self::prime_pipe_prefetch(buf, total);
-            let buf: &[PipeRec] = unsafe { &*(&buf[..total + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+            let buf = buf.as_ptr() as *const PipeRec;
             if !WANT_OUTPUT {
                 for &(slo, shi, di, first_a, ds, de) in segs {
                     let n = self.flush_seg_count(
@@ -7008,9 +7070,7 @@ impl Tokenizer {
                 let first_a = a;
                 a = Self::fill_recs(bytes, &ends, 0, k, a, buf.as_mut_ptr(), view, lview);
                 Self::prime_pipe_prefetch(&mut buf, k);
-                // SAFETY: fill_recs + prime_pipe_prefetch initialized buf[..k + X86_PF_DIST].
-                let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
-                self.flush_recs(bytes, n, sl, k, &ends[..k], first_a, s, view, lview);
+                self.flush_recs(bytes, n, buf.as_ptr() as *const PipeRec, k, &ends[..k], first_a, s, view, lview);
             }
             return;
         }
@@ -7661,8 +7721,7 @@ impl Tokenizer {
                     let first_a = a;
                     a = Self::fill_recs(bytes, &ends, 0, k, a, buf.as_mut_ptr(), view, lview);
                     Self::prime_pipe_prefetch(&mut buf, k);
-                    let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
-                    total += self.flush_recs_count(bytes, n, sl, k, &ends[..k], first_a, s, view, lview);
+                    total += self.flush_recs_count(bytes, n, buf.as_ptr() as *const PipeRec, k, &ends[..k], first_a, s, view, lview);
                 }
                 total
             });
