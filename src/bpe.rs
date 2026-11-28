@@ -13,6 +13,9 @@ const PACK_RANK_MASK: u32 = (1u32 << PACK_RANK_BITS) - 1;
 const PACK_KEY_MASK: u64 = !(PACK_RANK_MASK as u64);
 const PACK_MAX_TOK: usize = 1 << 21;
 const PACK_MAX_RANK: usize = (1 << PACK_RANK_BITS) - 2; // +1 stored in 1..=PACK_RANK_MASK
+/// Top 2 bits of each `targets[rank]` entry store `lr_bits(tg)` when `vocab_n <= (1 << 30)`,
+/// eliminating the serialized dependent `can_lr[merged >> 2]` load after `targets[rank]`.
+const TARGET_ID_MASK: u32 = 0x3FFF_FFFF;
 const DENSE_NONE: u16 = u16::MAX;
 const DENSE_OVERFLOW: u16 = u16::MAX - 1;
 /// Direct-indexed 2D merge-rank matrix for `(t1 | t2) < DENSE_N`:
@@ -124,7 +127,7 @@ impl MergeMap {
         let bits = cap.trailing_zeros();
 
         let linear_off = if linear_ok { tg0 } else { u32::MAX };
-        let targets = if linear_off == u32::MAX {
+        let mut targets: Vec<u32> = if linear_off == u32::MAX {
             merges.iter().map(|&(_, _, tg)| tg).collect()
         } else {
             Vec::new()
@@ -341,6 +344,21 @@ impl MergeMap {
                 if entries[idx].key == 0 {
                     entries[idx] = Entry { key, rank: r };
                 }
+            }
+        }
+        if !targets.is_empty() && vocab_n <= (1 << 30) {
+            // Pack `lr_bits(tg)` into unused bits 30..32 of `targets[rank]` so
+            // non-linear vocabs (`o200k`, `cl100k`, `gpt2`, SentencePiece) get
+            // `(merged, mlr)` in ONE load instead of a serialized `targets -> can_lr` chain.
+            for slot in &mut targets {
+                let tg = *slot;
+                let b = (tg as usize) >> 2;
+                let lr = if b < can_lr.len() {
+                    (unsafe { *can_lr.get_unchecked(b) } >> (((tg as usize) & 3) * 2)) & 3
+                } else {
+                    0
+                };
+                *slot = tg | ((lr as u32) << 30);
             }
         }
         let cold_off = if use_packed && cold_nb != 0 { hot_vec.len() } else { 0 };
@@ -605,13 +623,10 @@ impl MergeMap {
         }
     }
 
-    /// Direct-indexed O(1) lookup in the `DENSE_N × DENSE_N` L2 merge matrix
-    /// for `(t1 | t2) < DENSE_N` (zero hashing, zero Bloom, zero SIMD probing).
-    ///
-    /// SAFETY: caller guarantees `t1 < DENSE_N && t2 < DENSE_N`.
+    /// Decode an already-loaded `dense` u16 entry (lets callers issue two or
+    /// more `dense` / `bloom` loads back-to-back for MLP before branching).
     #[inline(always)]
-    unsafe fn lookup_dense(&self, t1: u32, t2: u32) -> u32 {
-        let d = *self.dense.get_unchecked(((t1 as usize) << DENSE_BITS) | (t2 as usize));
+    unsafe fn decode_dense(&self, d: u16, t1: u32, t2: u32) -> u32 {
         if d < DENSE_OVERFLOW {
             d as u32
         } else if d == DENSE_NONE {
@@ -619,6 +634,16 @@ impl MergeMap {
         } else {
             self.probe_dense_overflow(t1, t2)
         }
+    }
+
+    /// Direct-indexed O(1) lookup in the `DENSE_N × DENSE_N` L2 merge matrix
+    /// for `(t1 | t2) < DENSE_N` (zero hashing, zero Bloom, zero SIMD probing).
+    ///
+    /// SAFETY: caller guarantees `t1 < DENSE_N && t2 < DENSE_N`.
+    #[inline(always)]
+    unsafe fn lookup_dense(&self, t1: u32, t2: u32) -> u32 {
+        let d = *self.dense.get_unchecked(((t1 as usize) << DENSE_BITS) | (t2 as usize));
+        self.decode_dense(d, t1, t2)
     }
 
     /// Pure-GPR k=3 Bloom hit test via right-shifts (40% fewer ops than `1 << s`
@@ -680,7 +705,24 @@ impl MergeMap {
             rank.wrapping_add(self.linear_off)
         } else {
             // SAFETY: rank came from a valid entry in this MergeMap.
-            unsafe { *self.targets.get_unchecked(rank as usize) }
+            let raw = unsafe { *self.targets.get_unchecked(rank as usize) };
+            if self.vocab_n <= (1 << 30) { raw & TARGET_ID_MASK } else { raw }
+        }
+    }
+
+    /// Resolve a valid merge `rank` to `(target_id, lr_bits(target_id))` in a
+    /// single load when `!linear_off` (eliminates the dependent `can_lr` load).
+    ///
+    /// SAFETY: caller guarantees `rank` is valid and `self.vocab_n <= (1 << 30)`
+    /// (both hold for all packed-table merges).
+    #[inline(always)]
+    unsafe fn target_and_lr_unchecked(&self, rank: u32) -> (u32, u8) {
+        if self.linear_off != u32::MAX {
+            let m = rank.wrapping_add(self.linear_off);
+            (m, self.lr_bits_unchecked(m))
+        } else {
+            let raw = *self.targets.get_unchecked(rank as usize);
+            (raw & TARGET_ID_MASK, (raw >> 30) as u8)
         }
     }
 
@@ -1372,7 +1414,7 @@ macro_rules! merge_small_ll_body {
         loop {
             let rank = best >> 6;
             let bi = (best & 63) as usize;
-            let merged = $map.target(rank);
+            let (merged, mlr) = $map.target_and_lr_unchecked(rank);
             let r = *next.add(bi) as usize;
             let rr = *next.add(r) as usize;
             *tok.add(bi) = merged;
@@ -1385,7 +1427,6 @@ macro_rules! merge_small_ll_body {
             // When bi == 0, prev[0] == MAX_SMALL == 64; wrapping_shl(64) == 1 << 0 == 1 << bi,
             // which is already cleared (becomes 3 parallel BMI2 `shlx` with zero cmove).
             active &= !((1u64 << r) | (1u64 << bi) | 1u64.wrapping_shl(l as u32));
-            let mlr = $map.lr_bits(merged);
             if mlr != 0 {
                 let do_l = bi != 0 && (mlr & 2) != 0 && ($map.lr_bits(*tok.add(l)) & 1) != 0;
                 let do_r = rr < n && (mlr & 1) != 0 && ($map.lr_bits(*tok.add(rr)) & 2) != 0;
@@ -1657,6 +1698,7 @@ macro_rules! merge_bytes_ll_body {
             if cmask != 0 {
                 let mut m = 0usize;
                 let mut i = 0usize;
+                let mut or_all = 0u32;
                 if fast_target {
                     while i < n {
                         let is_c = ((cmask >> i) & 1) != 0;
@@ -1666,22 +1708,31 @@ macro_rules! merge_bytes_ll_body {
                         // Force branch-free selection (avoids LLVM turning dual
                         // L1d loads into a 50/50 mispredicted branch).
                         let mask = (is_c as u32).wrapping_neg();
-                        *tok.add(m) = (tg & mask) | (sb & !mask);
+                        let t = (tg & mask) | (sb & !mask);
+                        *tok.add(m) = t;
+                        or_all |= t;
                         // Zero `can_lr` loads: bits 16..18 = pair_lr, bits 18..20 = b0_lr.
                         *lr.add(m) = ((entry >> (18 - ((is_c as u32) << 1))) & 3) as u8;
                         m += 1;
                         i += 1 + (is_c as usize);
                     }
                 } else {
+                    // `cmask != 0` implies at least 1 valid merge exists, so `targets[0]`
+                    // is guaranteed in-bounds and hot in L1d. Clamping the `!is_c` index to
+                    // 0 turns the 50/50 `if is_c` branch into a branch-free `cmov` and unlocks
+                    // OOO MLP across all `targets[entry]` loads in the compaction loop!
+                    debug_assert!(!$map.targets.is_empty());
+                    let tp = $map.targets.as_ptr();
                     while i < n {
                         let is_c = ((cmask >> i) & 1) != 0;
                         let entry = *br.add(i);
-                        let t = if is_c {
-                            $map.target(entry & 0xFFFF)
-                        } else {
-                            *$singleton.get_unchecked(*cp.add(i) as usize)
-                        };
+                        let idx = if is_c { (entry & 0xFFFF) as usize } else { 0 };
+                        let tg = (*tp.add(idx)) & TARGET_ID_MASK;
+                        let sb = *$singleton.get_unchecked(*cp.add(i) as usize);
+                        let mask = (is_c as u32).wrapping_neg();
+                        let t = (tg & mask) | (sb & !mask);
                         *tok.add(m) = t;
+                        or_all |= t;
                         *lr.add(m) = ((entry >> (18 - ((is_c as u32) << 1))) & 3) as u8;
                         m += 1;
                         i += 1 + (is_c as usize);
@@ -1718,29 +1769,38 @@ macro_rules! merge_bytes_ll_body {
                     let t0 = *tok;
                     let t1 = *tok.add(1);
                     let t2 = *tok.add(2);
-                    let r0 = if ((*lr & 1) & (*lr.add(1) >> 1)) != 0 {
-                        if (t0 | t1) < DENSE_N {
-                            $map.lookup_dense(t0, t1)
-                        } else {
-                            let kh = MergeMap::pack_key(t0, t1);
-                            let h = MergeMap::hash_packed(kh);
-                            let bk = $map.bucket_of(t0, t1, h);
-                            if $map.bloom_may_contain_b(h, bk) { $map.$probe(kh, bk) } else { u32::MAX }
-                        }
+                    let (r0, r1) = if or_all < DENSE_N {
+                        // Launch both 2 MiB dense loads back-to-back before branching.
+                        let dp = $map.dense.as_ptr();
+                        let d0 = *dp.add(((t0 as usize) << DENSE_BITS) | (t1 as usize));
+                        let d1 = *dp.add(((t1 as usize) << DENSE_BITS) | (t2 as usize));
+                        ($map.decode_dense(d0, t0, t1), $map.decode_dense(d1, t1, t2))
                     } else {
-                        u32::MAX
-                    };
-                    let r1 = if ((*lr.add(1) & 1) & (*lr.add(2) >> 1)) != 0 {
-                        if (t1 | t2) < DENSE_N {
-                            $map.lookup_dense(t1, t2)
+                        let r0 = if ((*lr & 1) & (*lr.add(1) >> 1)) != 0 {
+                            if (t0 | t1) < DENSE_N {
+                                $map.lookup_dense(t0, t1)
+                            } else {
+                                let kh = MergeMap::pack_key(t0, t1);
+                                let h = MergeMap::hash_packed(kh);
+                                let bk = $map.bucket_of(t0, t1, h);
+                                if $map.bloom_may_contain_b(h, bk) { $map.$probe(kh, bk) } else { u32::MAX }
+                            }
                         } else {
-                            let kh = MergeMap::pack_key(t1, t2);
-                            let h = MergeMap::hash_packed(kh);
-                            let bk = $map.bucket_of(t1, t2, h);
-                            if $map.bloom_may_contain_b(h, bk) { $map.$probe(kh, bk) } else { u32::MAX }
-                        }
-                    } else {
-                        u32::MAX
+                            u32::MAX
+                        };
+                        let r1 = if ((*lr.add(1) & 1) & (*lr.add(2) >> 1)) != 0 {
+                            if (t1 | t2) < DENSE_N {
+                                $map.lookup_dense(t1, t2)
+                            } else {
+                                let kh = MergeMap::pack_key(t1, t2);
+                                let h = MergeMap::hash_packed(kh);
+                                let bk = $map.bucket_of(t1, t2, h);
+                                if $map.bloom_may_contain_b(h, bk) { $map.$probe(kh, bk) } else { u32::MAX }
+                            }
+                        } else {
+                            u32::MAX
+                        };
+                        (r0, r1)
                     };
                     if r0 == u32::MAX && r1 == u32::MAX {
                         $out.reserve(3);
@@ -1788,12 +1848,12 @@ macro_rules! merge_bytes_ll_body {
                     } else {
                         u32::MAX
                     };
-                    if r != u32::MAX {
-                        let p = (r << 6) | (k as u32);
-                        *rnk.add(k) = p;
-                        active |= 1u64 << k;
-                        best = best.min(p);
-                    }
+                    let valid = r != u32::MAX;
+                    let p = (r << 6) | (k as u32);
+                    *rnk.add(k) = p;
+                    active |= (valid as u64) << k;
+                    let cand = if valid { p } else { u32::MAX };
+                    best = best.min(cand);
                 }
                 n = m;
             } else if !$map.has_dense_byte_overflow {
@@ -1908,7 +1968,12 @@ macro_rules! merge_bytes_ll_body {
         loop {
             let rank = best >> 6;
             let bi = (best & 63) as usize;
-            let merged = if fast_target { rank.wrapping_add(lin_off) } else { $map.target(rank) };
+            let (merged, mlr_pre) = if fast_target {
+                (rank.wrapping_add(lin_off), 0u8)
+            } else {
+                let raw = *$map.targets.get_unchecked(rank as usize);
+                (raw & TARGET_ID_MASK, (raw >> 30) as u8)
+            };
             let r = *next.add(bi) as usize;
             let rr = *next.add(r) as usize;
             *tok.add(bi) = merged;
@@ -1922,7 +1987,11 @@ macro_rules! merge_bytes_ll_body {
             // When bi == 0, prev[0] == MAX_SMALL == 64; wrapping_shl(64) == 1 << 0 == 1 << bi,
             // which is already cleared (becomes 3 parallel BMI2 `shlx` with zero cmove).
             active &= !((1u64 << r) | (1u64 << bi) | 1u64.wrapping_shl(l as u32));
-            let mlr = $map.lr_bits_unchecked(merged);
+            let mlr = if fast_target {
+                $map.lr_bits_unchecked(merged)
+            } else {
+                mlr_pre
+            };
             *lr.add(bi) = mlr;
             let (rl, rr_val) = if mlr != 0 {
                 // Sentinel lr[MAX_SMALL] == 0 (when bi == 0) and lr[n] == 0 (when rr == n).
@@ -1932,15 +2001,20 @@ macro_rules! merge_bytes_ll_body {
                     let tl = *tok.add(l);
                     let tr = *tok.add(rr);
                     if (merged | tl | tr) < DENSE_N {
-                        // Direct L2 dense matrix: 2 x movzwl loads, ZERO hash/bloom/probe!
-                        ($map.lookup_dense(tl, merged), $map.lookup_dense(merged, tr))
+                        // Launch both 2 MiB dense loads back-to-back BEFORE decoding
+                        // so both L2/L3 fetches issue in the same cycle!
+                        let dp = $map.dense.as_ptr();
+                        let dl = *dp.add(((tl as usize) << DENSE_BITS) | (merged as usize));
+                        let dr = *dp.add(((merged as usize) << DENSE_BITS) | (tr as usize));
+                        ($map.decode_dense(dl, tl, merged), $map.decode_dense(dr, merged, tr))
                     } else if (tl | merged) < DENSE_N {
                         let kh_r = MergeMap::pack_key(merged, tr);
                         let hr = MergeMap::hash_packed(kh_r);
                         let b_r = $map.bucket_of(merged, tr, hr);
                         // Issue `bloom[b_r]` load concurrently with `dense[tl, merged]` load!
                         let wr = *$map.bloom.get_unchecked(b_r);
-                        let rl = $map.lookup_dense(tl, merged);
+                        let dl = *$map.dense.get_unchecked(((tl as usize) << DENSE_BITS) | (merged as usize));
+                        let rl = $map.decode_dense(dl, tl, merged);
                         let rr_v = if MergeMap::bloom_hit(wr, hr) {
                             $map.$probe(kh_r, b_r)
                         } else {
@@ -1953,7 +2027,8 @@ macro_rules! merge_bytes_ll_body {
                         let b_l = $map.bucket_of(tl, merged, hl);
                         // Issue `bloom[b_l]` load concurrently with `dense[merged, tr]` load!
                         let wl = *$map.bloom.get_unchecked(b_l);
-                        let rr_v = $map.lookup_dense(merged, tr);
+                        let dr = *$map.dense.get_unchecked(((merged as usize) << DENSE_BITS) | (tr as usize));
+                        let rr_v = $map.decode_dense(dr, merged, tr);
                         let rl = if MergeMap::bloom_hit(wl, hl) {
                             $map.$probe(kh_l, b_l)
                         } else {
