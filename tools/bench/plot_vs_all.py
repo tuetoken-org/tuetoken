@@ -10,13 +10,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.font_manager as fm
 import matplotlib.lines as mlines
+from matplotlib.offsetbox import AnnotationBbox, OffsetImage
 import matplotlib.patches as mpatches
 from matplotlib.path import Path
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
+from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
+ASSETS = os.path.join(HERE, "assets")
 R = json.load(open(os.path.join(HERE, "results_vs_all.json")))
 META = R["meta"]
 CORES = META["cores"]
@@ -60,7 +64,7 @@ INK = "#0F172A"
 BLUE = "#1D4ED8"
 ORANGE = "#E4572E"
 GRAY_BAR = "#CBD5E1"
-GRAY_EDGE = "#94A3B8"
+GRAY_LINE = "#94A3B8"
 TICK = "#64748B"
 BASELINE = "#E2E8F0"
 GRID = "#EEF2F7"
@@ -83,6 +87,31 @@ plt.rcParams.update({
 W_REG = "normal"
 W_SEMI = "medium"
 W_BOLD = "bold"
+
+LOGO_OPENAI = np.asarray(Image.open(os.path.join(ASSETS, "openai.png")).convert("RGBA"))
+LOGO_HF = np.asarray(Image.open(os.path.join(ASSETS, "huggingface.png")).convert("RGBA"))
+
+
+def place_logo_data(ax, img, xy, size_pt=14.0, zorder=7):
+    """Place a crisp RGBA logo centered at data coordinates (xy) with exact visual size in points."""
+    # OffsetImage zoom=1 draws 1 image px = 1 pt at 72 dpi
+    zoom = size_pt / img.shape[0]
+    ab = AnnotationBbox(
+        OffsetImage(img, zoom=zoom, interpolation="lanczos"),
+        xy, xycoords="data", frameon=False, pad=0.0, zorder=zorder,
+        clip_on=False, annotation_clip=False,
+    )
+    ax.add_artist(ab)
+
+
+def place_logo_fig(fig, img, xy_fig, size_pt=12.5, zorder=7):
+    """Place a crisp RGBA logo centered at figure-fraction coordinates."""
+    zoom = size_pt / img.shape[0]
+    ab = AnnotationBbox(
+        OffsetImage(img, zoom=zoom, interpolation="lanczos"),
+        xy_fig, xycoords=fig.transFigure, frameon=False, pad=0.0, zorder=zorder,
+    )
+    fig.add_artist(ab)
 
 
 def draw_rounded_barh(ax, y_center, width, height, color, radius_pt=3.0, zorder=3):
@@ -202,69 +231,80 @@ fig.text(ML, 0.873, "Identical token IDs across all five libraries",
 CHART_TOP = 0.778
 CHART_BOT = 0.258
 
-# 1) HERO PANEL: Cold 1 GB corpus scaling (~45% width including direct labels)
-ax_hero = fig.add_axes([0.088, CHART_BOT, 0.280, CHART_TOP - CHART_BOT])
+# 1) HERO PANEL: Cold 1 GB corpus scaling (LOG Y-AXIS so all 5 curves are visible!)
+ax_hero = fig.add_axes([0.095, CHART_BOT, 0.260, CHART_TOP - CHART_BOT])
 cold = R["corpus"]["cold"]
 th_t = np.array([p["threads"] for p in cold["tuetoken"]])
-gb_t = np.array([p["mbps"] / 1000.0 for p in cold["tuetoken"]])
+mb_t = np.array([p["mbps"] for p in cold["tuetoken"]])
 th_g = np.array([p["threads"] for p in cold["gigatoken"]])
-gb_g = np.array([p["mbps"] / 1000.0 for p in cold["gigatoken"]])
-ft_14 = cold["fastokens"][-1]["mbps"] / 1000.0
-tk_14 = cold["tiktoken"][-1]["mbps"]
-hf_14 = cold["hf"][-1]["mbps"]
+mb_g = np.array([p["mbps"] for p in cold["gigatoken"]])
+ft_14 = cold["fastokens"][-1]["mbps"]
+th_tk = np.array([p["threads"] for p in cold["tiktoken"]])
+mb_tk = np.array([p["mbps"] for p in cold["tiktoken"]])
+th_hf = np.array([p["threads"] for p in cold["hf"]])
+mb_hf = np.array([p["mbps"] for p in cold["hf"]])
 
+ax_hero.set_yscale("log")
 ax_hero.set_xlim(0.5, 14.35)
-ax_hero.set_ylim(0.0, 4.88)
+ax_hero.set_ylim(4.0, 7500.0)
 ax_hero.set_xticks(th_t)
-ax_hero.set_yticks([0, 1, 2, 3, 4])
-ax_hero.set_yticklabels(["0", "1 GB/s", "2 GB/s", "3 GB/s", "4 GB/s"])
+ax_hero.set_yticks([10, 100, 1000, 5000])
+ax_hero.set_yticklabels(["10 MB/s", "100 MB/s", "1 GB/s", "5 GB/s"])
+ax_hero.yaxis.set_minor_locator(mticker.NullLocator())
 ax_hero.set_xlabel("Threads", fontsize=9.5, fontweight=W_REG, color=TICK, labelpad=8)
 clean_spines(ax_hero, baseline="bottom", hgrid=True)
 
-ax_hero.fill_between(th_t, gb_g, gb_t, color=BLUE, alpha=0.085, zorder=2)
-ax_hero.plot(th_t, gb_t, color=BLUE, lw=3.0, solid_capstyle="round", zorder=4)
-ax_hero.plot(th_g, gb_g, color=ORANGE, lw=1.75, solid_capstyle="round", zorder=3.5)
-# Subtle gray lines for fastokens, tiktoken, and HF tokenizers
-ax_hero.hlines(ft_14, 1.0, 14.0, color=GRAY_BAR, lw=1.25, linestyles="--", zorder=2.5)
-ax_hero.plot([p["threads"] for p in cold["tiktoken"]], [p["mbps"] / 1000.0 for p in cold["tiktoken"]],
-             color=GRAY_BAR, lw=1.4, zorder=2.6)
-ax_hero.plot([p["threads"] for p in cold["hf"]], [p["mbps"] / 1000.0 for p in cold["hf"]],
-             color=GRAY_BAR, lw=1.1, zorder=2.4)
+# Soft fill between tuetoken and gigatoken
+ax_hero.fill_between(th_t, mb_g, mb_t, color=BLUE, alpha=0.09, zorder=2)
 
-ax_hero.scatter([th_t[-1]], [gb_t[-1]], s=38, color=BLUE, zorder=5, clip_on=False)
-ax_hero.scatter([th_g[-1]], [gb_g[-1]], s=26, color=ORANGE, zorder=4.5, clip_on=False)
+# All five library lines clearly visible on log scale!
+ax_hero.plot(th_t, mb_t, color=BLUE, lw=3.0, solid_capstyle="round", zorder=5)
+ax_hero.plot(th_g, mb_g, color=ORANGE, lw=1.8, solid_capstyle="round", zorder=4.5)
+ax_hero.hlines(ft_14, 1.0, 14.0, color=GRAY_BAR, lw=1.5, linestyles="--", zorder=3)
+ax_hero.plot(th_tk, mb_tk, color=GRAY_LINE, lw=1.6, solid_capstyle="round", zorder=3.5)
+ax_hero.plot(th_hf, mb_hf, color=GRAY_BAR, lw=1.6, solid_capstyle="round", zorder=3.2)
 
-# Direct end labels floating cleanly in whitespace right of x=14
-lx_end = 14.75
-ax_hero.text(lx_end, gb_t[-1] + 0.04, "4.50 GB/s", fontsize=11, fontweight=W_BOLD,
+# Subtle clean endpoint anchors at 14 threads
+ax_hero.scatter([14], [mb_t[-1]], s=38, color=BLUE, zorder=6, clip_on=False)
+ax_hero.scatter([14], [mb_g[-1]], s=26, color=ORANGE, zorder=5.5, clip_on=False)
+ax_hero.scatter([14], [ft_14], s=22, color=GRAY_LINE, zorder=4, clip_on=False)
+ax_hero.scatter([14], [mb_tk[-1]], s=24, color=GRAY_LINE, zorder=4.2, clip_on=False)
+ax_hero.scatter([14], [mb_hf[-1]], s=24, color=GRAY_LINE, zorder=4.1, clip_on=False)
+
+# Direct end labels floating cleanly right of x=14
+lx_end = 14.85
+ax_hero.text(lx_end, mb_t[-1] * 1.04, "4.50 GB/s", fontsize=11, fontweight=W_BOLD,
              color=BLUE, va="bottom", clip_on=False)
-ax_hero.text(lx_end, gb_t[-1] - 0.05, "tuetoken", fontsize=9.5, fontweight=W_SEMI,
+ax_hero.text(lx_end, mb_t[-1] * 0.88, "tuetoken", fontsize=9.5, fontweight=W_SEMI,
              color=BLUE, va="top", clip_on=False)
 
-# Industry speedup callout cleanly beside the gap, no arrow
-ax_hero.text(
-    lx_end, 3.16,
-    f"{gb_t[-1] / gb_g[-1]:.1f}× vs gigatoken\n"
-    f"{cold['tuetoken'][-1]['mbps'] / tk_14:.0f}× vs tiktoken\n"
-    f"{cold['tuetoken'][-1]['mbps'] / hf_14:.0f}× vs HF",
-    fontsize=9.8, fontweight=W_SEMI, color=BLUE, va="center", ha="left",
-    linespacing=1.42, clip_on=False,
-)
-
-ax_hero.text(lx_end, gb_g[-1] + 0.04, "1.79 GB/s", fontsize=11, fontweight=W_SEMI,
+ax_hero.text(lx_end, mb_g[-1] * 1.02, "1.79 GB/s", fontsize=11, fontweight=W_SEMI,
              color=ORANGE, va="bottom", clip_on=False)
-ax_hero.text(lx_end, gb_g[-1] - 0.05, "gigatoken", fontsize=9.5, fontweight=W_REG,
+ax_hero.text(lx_end, mb_g[-1] * 0.85, "gigatoken · 2.5×", fontsize=9.2, fontweight=W_REG,
              color=ORANGE, va="top", clip_on=False)
 
-# Direct gray labels for fastokens, tiktoken, and HF tokenizers at line ends
-ax_hero.text(lx_end, ft_14, f"{ft_14:.2f} GB/s  fastokens", fontsize=9.0, fontweight=W_REG,
-             color=TICK, va="center", clip_on=False)
-ax_hero.text(lx_end, 0.24, f"{tk_14:.0f} MB/s  tiktoken", fontsize=9.0, fontweight=W_REG,
-             color=TICK, va="center", clip_on=False)
-ax_hero.text(lx_end, -0.02, f"{hf_14:.0f} MB/s  HF tokenizers", fontsize=9.0, fontweight=W_REG,
-             color=TICK, va="center", clip_on=False)
+ax_hero.text(lx_end, ft_14 * 1.02, f"{ft_14:.0f} MB/s", fontsize=10.2, fontweight=W_SEMI,
+             color=TICK, va="bottom", clip_on=False)
+ax_hero.text(lx_end, ft_14 * 0.85, f"fastokens · {mb_t[-1] / ft_14:.1f}×", fontsize=9.0, fontweight=W_REG,
+             color=TICK, va="top", clip_on=False)
 
-fig.text(0.088, CHART_TOP + 0.024, "Cold 1 GB corpus scaling",
+# OpenAI logo + tiktoken direct end label
+lx_logo = 15.25
+lx_after_logo = 16.35
+place_logo_data(ax_hero, LOGO_OPENAI, (lx_logo, mb_tk[-1]), size_pt=15.0)
+ax_hero.text(lx_after_logo, mb_tk[-1] * 1.04, f"{mb_tk[-1]:.0f} MB/s", fontsize=10.5, fontweight=W_SEMI,
+             color=INK, va="bottom", clip_on=False)
+ax_hero.text(lx_after_logo, mb_tk[-1] * 0.84, f"tiktoken · {mb_t[-1] / mb_tk[-1]:.0f}×", fontsize=9.2, fontweight=W_REG,
+             color=TICK, va="top", clip_on=False)
+
+# HuggingFace logo + HF tokenizers direct end label
+place_logo_data(ax_hero, LOGO_HF, (lx_logo, mb_hf[-1]), size_pt=16.0)
+ax_hero.text(lx_after_logo, mb_hf[-1] * 1.04, f"{mb_hf[-1]:.0f} MB/s", fontsize=10.5, fontweight=W_SEMI,
+             color=INK, va="bottom", clip_on=False)
+ax_hero.text(lx_after_logo, mb_hf[-1] * 0.84, f"HF tokenizers · {mb_t[-1] / mb_hf[-1]:.0f}×", fontsize=9.2, fontweight=W_REG,
+             color=TICK, va="top", clip_on=False)
+
+fig.text(0.095, CHART_TOP + 0.024, "Cold 1 GB corpus scaling",
          fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
 
 # 2) THROUGHPUT PANEL: LLM tokenizer throughput (top-right, wide)
@@ -302,13 +342,19 @@ for i, r in enumerate(fr):
 
 fig.text(RIGHT_AX_L, CHART_TOP + 0.024, "LLM tokenizer throughput",
          fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
+
 hf_min = min(r["hf"] for r in fr)
 hf_max = max(r["hf"] for r in fr)
 sp_min = min(r["tuetoken"] / r["hf"] for r in fr)
 sp_max = max(r["tuetoken"] / r["hf"] for r in fr)
-fig.text(MR, CHART_TOP + 0.026,
-         f"HF tokenizers: {hf_min:.0f}–{hf_max:.0f} MB/s ({sp_min:.0f}–{sp_max:.0f}× slower)",
-         fontsize=8.8, fontweight=W_REG, color=TICK, ha="right", va="bottom")
+t_hf_hdr = fig.text(
+    MR, CHART_TOP + 0.026,
+    f"HF tokenizers: {hf_min:.0f}–{hf_max:.0f} MB/s ({sp_min:.0f}–{sp_max:.0f}× slower)",
+    fontsize=8.8, fontweight=W_REG, color=TICK, ha="right", va="bottom",
+)
+fig.canvas.draw()
+bb_hf = t_hf_hdr.get_window_extent().transformed(fig.transFigure.inverted())
+place_logo_fig(fig, LOGO_HF, (bb_hf.x0 - 0.010, CHART_TOP + 0.032), size_pt=12.0)
 
 # 3) STARTUP PANEL: Dumbbell chart with tuetoken, gigatoken, and HF (bottom-right-left)
 ax_st = fig.add_axes([RIGHT_AX_L, CHART_BOT, 0.145, 0.445 - CHART_BOT])
@@ -328,14 +374,13 @@ for i, r in enumerate(st):
     hi = max(r["gigatoken"], r["hf"])
     ax_st.hlines(i, r["tuetoken"], hi, color=GRAY_BAR, lw=1.9, zorder=2)
 
-# Gray HF dots + orange gigatoken dots + blue tuetoken dots
 ax_st.scatter([r["hf"] for r in st], np.arange(n_st), s=36, color=GRAY_BAR,
-              edgecolor=GRAY_EDGE, linewidth=0.9, zorder=3.5)
+              edgecolor=GRAY_LINE, linewidth=0.9, zorder=3.5)
 ax_st.scatter([r["gigatoken"] for r in st], np.arange(n_st), s=44, color=ORANGE, zorder=4)
 ax_st.scatter([r["tuetoken"] for r in st], np.arange(n_st), s=52, color=BLUE, zorder=5)
 
-# Direct labels on row 0 (DeepSeek-V3: HF=84 ms, gt=139 ms) so both dots are instantly identified
-ax_st.text(st[0]["hf"], -0.42, "HF", fontsize=8.2, fontweight=W_SEMI, color=TICK, ha="center", va="bottom")
+# Crisp HF logo & gt label directly above row 0 dots
+place_logo_data(ax_st, LOGO_HF, (st[0]["hf"], -0.58), size_pt=10.5)
 ax_st.text(st[0]["gigatoken"], -0.42, "gt", fontsize=8.2, fontweight=W_SEMI, color=ORANGE, ha="center", va="bottom")
 
 for i, r in enumerate(st):
@@ -388,9 +433,12 @@ for i, r in enumerate(dc):
         ax_dec.text(bx, rate + 10, f"{rate:.0f}M",
                     fontsize=11, fontweight=W_SEMI, color=BLUE, ha="center", va="bottom")
 
-# Clean stacked direct label for the 3 gray bars in open white space over group 1
-ax_dec.text(xd[0] + 0.02, 34, "tiktoken\nfastokens\nHF",
-            fontsize=7.6, fontweight=W_REG, color=TICK, ha="left", va="bottom", linespacing=1.22)
+# Clean stacked direct label with micro OpenAI & HF logos over the 3 gray bars in group 1
+place_logo_data(ax_dec, LOGO_OPENAI, (xd[0] - 0.06, 86), size_pt=7.8)
+ax_dec.text(xd[0] + 0.03, 86, "tiktoken", fontsize=7.5, fontweight=W_REG, color=TICK, ha="left", va="center")
+ax_dec.text(xd[0] + 0.03, 64, "fastokens", fontsize=7.5, fontweight=W_REG, color=TICK, ha="left", va="center")
+place_logo_data(ax_dec, LOGO_HF, (xd[0] - 0.06, 42), size_pt=8.4)
+ax_dec.text(xd[0] + 0.03, 42, "HF", fontsize=7.5, fontweight=W_REG, color=TICK, ha="left", va="center")
 
 fig.text(DEC_L, 0.445 + 0.017, "Decode throughput",
          fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
