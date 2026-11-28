@@ -127,6 +127,13 @@ pub enum PretokStage {
     Digits {
         individual_digits: bool,
     },
+    /// `Digits` stage immediately following a non-prefixed `ByteLevel` stage:
+    /// operates directly on raw bytes using the exact GPT-2 ByteLevel bijection
+    /// (`b'0'..=b'9' | 0xB2 | 0xB3 | 0xB9 | 0xBC..=0xBE`), avoiding full-buffer
+    /// ByteLevel UTF-8 encoding and decoding!
+    PostBlDigits {
+        individual_digits: bool,
+    },
     Punctuation {
         behavior: SplitBehavior,
     },
@@ -148,10 +155,13 @@ pub enum PretokStage {
 pub struct PretokPipe {
     stages: Vec<PretokStage>,
     /// True when no stage mutates piece text (no `add_prefix_space: true`, no
-    /// `Metaspace`, and no stage appears *after* a `ByteLevel` stage). In this
-    /// common case we operate purely on `(start, end)` byte spans of `&str`
-    /// with zero per-piece `String` allocations.
+    /// `Metaspace`, and any stage after `ByteLevel` is a byte-exact bijection
+    /// like `AsciiDigitRun` or `PostBlDigits`). In this case we operate purely
+    /// on `(start, end)` byte spans of `&[u8]` with zero per-piece `String` allocs.
     slice_only: bool,
+    /// True when `slice_only` AND every stage provably preserves `\n` + ASCII-letter
+    /// boundaries, enabling multi-core parallel splitting and L1-hot windowed piping.
+    nl_letter_splittable: bool,
 }
 
 fn whitespace_regex() -> &'static fancy_regex::Regex {
@@ -822,10 +832,152 @@ fn emit_no_match(
     }
 }
 
-/// Partition `sub` (`text[base..base+sub.len()]`) by exact runs of `k` ASCII
+/// Exact GPT-2 ByteLevel numeric byte set (`byte_to_char(b).is_numeric()`):
+/// ASCII `'0'..='9'` (`0x30..=0x39`) plus Latin-1 superscripts/fractions
+/// `0xB2` (`²`), `0xB3` (`³`), `0xB9` (`¹`), `0xBC` (`¼`), `0xBD` (`½`), `0xBE` (`¾`).
+const BL_NUMERIC: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut b = b'0' as usize;
+    while b <= b'9' as usize {
+        t[b] = 1;
+        b += 1;
+    }
+    t[0xB2] = 1;
+    t[0xB3] = 1;
+    t[0xB9] = 1;
+    t[0xBC] = 1;
+    t[0xBD] = 1;
+    t[0xBE] = 1;
+    t
+};
+
+const ASCII_PUNCT_LUT: [u8; 128] = {
+    let mut t = [0u8; 128];
+    let mut b = 0usize;
+    while b < 128 {
+        if (b as u8).is_ascii_punctuation() {
+            t[b] = 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// Single-pass zero-`segs` `Punctuation { behavior: Contiguous }` splitter with
+/// an ASCII fast path (no UTF-8 decode or `segs` intermediary on ASCII bytes).
+#[inline]
+fn split_punct_contiguous(sub: &str, base: usize, out: &mut Vec<(usize, usize)>) {
+    let b = sub.as_bytes();
+    let n = b.len();
+    if n == 0 {
+        return;
+    }
+    let mut i = 0usize;
+    let first_p = if b[0] < 0x80 {
+        ASCII_PUNCT_LUT[b[0] as usize] != 0
+    } else {
+        let (cp, _) = crate::unicode::decode(b, 0);
+        is_hf_punctuation(cp)
+    };
+    let mut run_p = first_p;
+    let mut start = 0usize;
+    while i < n {
+        let byte = unsafe { *b.get_unchecked(i) };
+        if byte < 0x80 {
+            let is_p = unsafe { *ASCII_PUNCT_LUT.get_unchecked(byte as usize) } != 0;
+            if is_p != run_p {
+                out.push((base + start, base + i));
+                start = i;
+                run_p = is_p;
+            }
+            i += 1;
+        } else {
+            let (cp, cl) = crate::unicode::decode(b, i);
+            let is_p = is_hf_punctuation(cp);
+            if is_p != run_p {
+                out.push((base + start, base + i));
+                start = i;
+                run_p = is_p;
+            }
+            i += cl;
+        }
+    }
+    if start < n {
+        out.push((base + start, base + n));
+    }
+}
+
+/// Zero-copy raw-byte `Digits` splitter after `ByteLevel(add_prefix_space=false)`.
+#[inline]
+fn split_post_bl_digits(
+    b: &[u8],
+    base: usize,
+    individual: bool,
+    out: &mut Vec<(usize, usize)>,
+) {
+    let n = b.len();
+    if n == 0 {
+        return;
+    }
+    // Fast skip (~95% of chunks have no numeric bytes).
+    let mut first_num = n;
+    for (i, &byte) in b.iter().enumerate() {
+        if unsafe { *BL_NUMERIC.get_unchecked(byte as usize) } != 0 {
+            first_num = i;
+            break;
+        }
+    }
+    if first_num == n {
+        out.push((base, base + n));
+        return;
+    }
+    if individual {
+        if first_num > 0 {
+            out.push((base, base + first_num));
+        }
+        out.push((base + first_num, base + first_num + 1));
+        let mut last = first_num + 1;
+        let mut i = last;
+        while i < n {
+            if unsafe { *BL_NUMERIC.get_unchecked(*b.get_unchecked(i) as usize) } != 0 {
+                if i > last {
+                    out.push((base + last, base + i));
+                }
+                out.push((base + i, base + i + 1));
+                last = i + 1;
+            }
+            i += 1;
+        }
+        if last < n {
+            out.push((base + last, base + n));
+        }
+    } else {
+        let mut start = 0usize;
+        if first_num > 0 {
+            out.push((base, base + first_num));
+            start = first_num;
+        }
+        let mut run_num = true;
+        let mut i = first_num + 1;
+        while i < n {
+            let is_num = unsafe { *BL_NUMERIC.get_unchecked(*b.get_unchecked(i) as usize) } != 0;
+            if is_num != run_num {
+                out.push((base + start, base + i));
+                start = i;
+                run_num = is_num;
+            }
+            i += 1;
+        }
+        if start < n {
+            out.push((base + start, base + n));
+        }
+    }
+}
+
+/// Partition raw bytes `b` (`text[base..base+b.len()]`) by exact runs of `k` ASCII
 /// digits (`[0-9]` or `[0-9][0-9][0-9]`), matching regex left-to-right semantics.
-fn split_ascii_digit_run(
-    sub: &str,
+fn split_ascii_digit_run_bytes(
+    b: &[u8],
     base: usize,
     k: usize,
     behavior: SplitBehavior,
@@ -833,13 +985,34 @@ fn split_ascii_digit_run(
     segs: &mut Vec<(usize, usize, bool)>,
     out: &mut Vec<(usize, usize)>,
 ) {
-    let b = sub.as_bytes();
     let n = b.len();
     if n == 0 {
         return;
     }
+    if k == 1 && n == 1 {
+        if !(behavior == SplitBehavior::Removed && ((b[0].is_ascii_digit()) ^ invert)) {
+            out.push((base, base + 1));
+        }
+        return;
+    }
     if n < k || !b.iter().any(|x| x.is_ascii_digit()) {
         emit_no_match(base, n, behavior, invert, out);
+        return;
+    }
+    if k == 1 && behavior == SplitBehavior::Isolated && !invert {
+        let mut last = 0usize;
+        for (i, &byte) in b.iter().enumerate() {
+            if byte.is_ascii_digit() {
+                if i > last {
+                    out.push((base + last, base + i));
+                }
+                out.push((base + i, base + i + 1));
+                last = i + 1;
+            }
+        }
+        if last < n {
+            out.push((base + last, base + n));
+        }
         return;
     }
     segs.clear();
@@ -861,6 +1034,18 @@ fn split_ascii_digit_run(
         segs.push((base + last, base + n, invert));
     }
     apply_behavior(segs, behavior, out);
+}
+
+fn split_ascii_digit_run(
+    sub: &str,
+    base: usize,
+    k: usize,
+    behavior: SplitBehavior,
+    invert: bool,
+    segs: &mut Vec<(usize, usize, bool)>,
+    out: &mut Vec<(usize, usize)>,
+) {
+    split_ascii_digit_run_bytes(sub.as_bytes(), base, k, behavior, invert, segs, out);
 }
 
 /// Partition `sub` on `[\r\n]` via SIMD `memchr2`.
@@ -902,6 +1087,32 @@ fn split_crlf(
         segs.push((base + last, base + n, invert));
     }
     apply_behavior(segs, behavior, out);
+}
+
+/// Apply one non-mutating stage to a single byte slice `sub_bytes` (`base`-anchored).
+/// SAFETY invariant: UTF-8 stages only run before any `PostBlDigits` stage (enforced
+/// by `PretokPipe::from_json`), so `sub_bytes` is guaranteed valid UTF-8 on all UTF-8 stages.
+fn apply_stage_slice_bytes(
+    stage: &PretokStage,
+    sub_bytes: &[u8],
+    base: usize,
+    segs: &mut Vec<(usize, usize, bool)>,
+    out: &mut Vec<(usize, usize)>,
+) {
+    match stage {
+        PretokStage::PostBlDigits { individual_digits } => {
+            split_post_bl_digits(sub_bytes, base, *individual_digits, out);
+        }
+        PretokStage::Split { pattern: SplitPattern::AsciiDigitRun(k), behavior, invert } => {
+            split_ascii_digit_run_bytes(sub_bytes, base, *k, *behavior, *invert, segs, out);
+        }
+        _ => {
+            // SAFETY: only `PostBlDigits` can split inside UTF-8, and `from_json`
+            // ensures no UTF-8 stage follows `PostBlDigits` when `slice_only == true`.
+            let sub = unsafe { std::str::from_utf8_unchecked(sub_bytes) };
+            apply_stage_slice(stage, sub, base, segs, out);
+        }
+    }
 }
 
 /// Apply one non-mutating stage to a single slice `sub` (`base`-anchored).
@@ -975,6 +1186,10 @@ fn apply_stage_slice(
             split_by_char_pred(sub, base, |c| c.is_numeric(), beh, false, segs, out);
         }
         PretokStage::Punctuation { behavior } => {
+            if *behavior == SplitBehavior::Contiguous {
+                split_punct_contiguous(sub, base, out);
+                return;
+            }
             if sub.bytes().all(|b| b < 0x80 && !b.is_ascii_punctuation()) {
                 if !sub.is_empty() {
                     out.push((base, base + sub.len()));
@@ -991,6 +1206,7 @@ fn apply_stage_slice(
                 out,
             );
         }
+        PretokStage::PostBlDigits { .. } => unreachable!("handled in apply_stage_slice_bytes"),
         PretokStage::ByteLevel { use_regex, .. } => {
             if *use_regex {
                 split_gpt2_word(sub, base, out);
@@ -1037,12 +1253,30 @@ impl PretokPipe {
             return Ok(None);
         }
         // Slice-only iff no Metaspace, no ByteLevel(add_prefix_space=true), and
-        // no stage follows a ByteLevel stage (which transforms UTF-8 bytes into
-        // ByteLevel Unicode characters for downstream stages).
+        // any stage after ByteLevel is a byte-exact bijection (`AsciiDigitRun` or
+        // `Digits` -> `PostBlDigits`, with no UTF-8 stage after `PostBlDigits`).
         let mut seen_bl = false;
+        let mut split_utf8 = false;
         let mut slice_only = true;
-        for st in &stages {
+        let mut rewritten = stages.clone();
+        for st in &mut rewritten {
             if seen_bl {
+                match st {
+                    PretokStage::Split { pattern: SplitPattern::AsciiDigitRun(_), .. } => {
+                        // Exact ByteLevel bijection: `b'0'..=b'9'` <-> `'0'..='9'`.
+                    }
+                    PretokStage::Digits { individual_digits } => {
+                        *st = PretokStage::PostBlDigits { individual_digits: *individual_digits };
+                        split_utf8 = true;
+                    }
+                    _ => {
+                        slice_only = false;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if split_utf8 {
                 slice_only = false;
                 break;
             }
@@ -1061,7 +1295,78 @@ impl PretokPipe {
                 _ => {}
             }
         }
-        Ok(Some(PretokPipe { stages, slice_only }))
+        if slice_only {
+            // Elide pure no-op stages in `slice_only` pipelines:
+            // 1. `ByteLevel { add_prefix_space: false, use_regex: false }` does zero splitting.
+            // 2. `Split(AsciiDigitRun(1), Isolated, invert=false)` after any stage that
+            //    already guarantees single-digit isolation (`CamelCase/Generic { max_digits: 1 }`
+            //    or `Word(true)`) is a proven mathematical no-op (e.g. Falcon-H1).
+            let mut single_digit_done = false;
+            let mut compacted = Vec::with_capacity(rewritten.len());
+            for st in rewritten {
+                match &st {
+                    PretokStage::ByteLevel { add_prefix_space: false, use_regex: false } => {
+                        continue;
+                    }
+                    PretokStage::Split {
+                        pattern: SplitPattern::FastMachine(kind),
+                        behavior,
+                        invert,
+                    } if (*behavior == SplitBehavior::Isolated && !invert)
+                        || (*behavior == SplitBehavior::Removed && *invert) =>
+                    {
+                        if matches!(
+                            kind,
+                            Pretok::Word(true)
+                                | Pretok::Generic { max_digits: 1, .. }
+                                | Pretok::CamelCase { max_digits: 1, .. }
+                        ) {
+                            single_digit_done = true;
+                        }
+                    }
+                    PretokStage::Split {
+                        pattern: SplitPattern::AsciiDigitRun(1),
+                        behavior: SplitBehavior::Isolated,
+                        invert: false,
+                    } if single_digit_done => {
+                        continue;
+                    }
+                    _ => {}
+                }
+                compacted.push(st);
+            }
+            stages = compacted;
+        }
+        // Fail-closed proof that `b[p - 1] == b'\n' && b[p].is_ascii_alphabetic()`
+        // is an uncrossable chunk boundary for every stage in the pipeline.
+        let nl_letter_splittable = slice_only
+            && stages.iter().all(|st| match st {
+                PretokStage::Punctuation { .. } => true,
+                PretokStage::Digits { .. } | PretokStage::PostBlDigits { .. } => true,
+                PretokStage::ByteLevel { add_prefix_space: false, .. } => true,
+                PretokStage::Split { pattern, behavior, invert } => match pattern {
+                    SplitPattern::FastMachine(_)
+                    | SplitPattern::GenericNoNl { .. }
+                    | SplitPattern::CjkMain => {
+                        (*behavior == SplitBehavior::Isolated && !invert)
+                            || (*behavior == SplitBehavior::Removed && *invert)
+                    }
+                    SplitPattern::AsciiDigitRun(_) => true,
+                    SplitPattern::CrLf => {
+                        !*invert
+                            && matches!(
+                                *behavior,
+                                SplitBehavior::Isolated
+                                    | SplitBehavior::Removed
+                                    | SplitBehavior::MergedWithPrevious
+                                    | SplitBehavior::Contiguous
+                            )
+                    }
+                    _ => false,
+                },
+                _ => false,
+            });
+        Ok(Some(PretokPipe { stages, slice_only, nl_letter_splittable }))
     }
 
     /// True if this pipeline only slices the original `&str` without mutating
@@ -1069,6 +1374,13 @@ impl PretokPipe {
     #[inline]
     pub fn is_slice_only(&self) -> bool {
         self.slice_only
+    }
+
+    /// True when `b[p - 1] == b'\n' && b[p].is_ascii_alphabetic()` is a proven-exact
+    /// chunk boundary for every stage in the pipeline (e.g. Falcon3, Falcon-H1).
+    #[inline]
+    pub fn is_nl_letter_splittable(&self) -> bool {
+        self.nl_letter_splittable
     }
 
     /// If the pipeline is a single unsplit `Metaspace { replacement, split: false }`
@@ -1100,24 +1412,80 @@ impl PretokPipe {
         None
     }
 
-    /// Zero-copy byte ranges for `slice_only` pipelines, reusing `ps`.
-    fn chunk_ranges_into(&self, text: &str, ps: &mut PipeScratch) {
+    /// Zero-copy byte ranges for `slice_only` pipelines over `bytes[win_start..win_end]`,
+    /// reusing `ps` and producing absolute offsets in `win_start..win_end`.
+    fn chunk_ranges_window(&self, full_bytes: &[u8], win_start: usize, win_end: usize, ps: &mut PipeScratch) {
         debug_assert!(self.slice_only);
         ps.cur_spans.clear();
-        if text.is_empty() {
+        if win_start >= win_end {
             return;
         }
-        ps.cur_spans.push((0, text.len()));
+        ps.cur_spans.push((win_start, win_end));
         for st in &self.stages {
             ps.nxt_spans.clear();
             for &(s, e) in &ps.cur_spans {
-                apply_stage_slice(st, &text[s..e], s, &mut ps.segs, &mut ps.nxt_spans);
+                apply_stage_slice_bytes(st, &full_bytes[s..e], s, &mut ps.segs, &mut ps.nxt_spans);
             }
             std::mem::swap(&mut ps.cur_spans, &mut ps.nxt_spans);
             if ps.cur_spans.is_empty() {
                 break;
             }
         }
+    }
+
+    /// Stream `(start, end)` byte spans for a `slice_only` pipeline in L1-hot
+    /// ~8 KiB `\n + ASCII letter` windows whenever `nl_letter_splittable` holds,
+    /// avoiding multi-MB intermediate span vectors on large documents.
+    pub fn for_each_slice_spans(
+        &self,
+        text: &str,
+        ps: &mut PipeScratch,
+        mut emit_spans: impl FnMut(&[(usize, usize)]),
+    ) {
+        debug_assert!(self.slice_only);
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        if n == 0 {
+            return;
+        }
+        if self.nl_letter_splittable && n > 8192 {
+            const WIN: usize = 8192;
+            let mut pos = 0usize;
+            while pos < n {
+                let mut end = n;
+                if pos + WIN < n {
+                    let mut i = pos + WIN;
+                    let lim = (pos + WIN * 2).min(n);
+                    while i < lim {
+                        if let Some(rel) = memchr::memchr(b'\n', &bytes[i..lim]) {
+                            let p = i + rel + 1;
+                            if p < n && bytes[p].is_ascii_alphabetic() {
+                                end = p;
+                                break;
+                            }
+                            i = p;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.chunk_ranges_window(bytes, pos, end, ps);
+                if !ps.cur_spans.is_empty() {
+                    emit_spans(&ps.cur_spans);
+                }
+                pos = end;
+            }
+            return;
+        }
+        self.chunk_ranges_window(bytes, 0, n, ps);
+        if !ps.cur_spans.is_empty() {
+            emit_spans(&ps.cur_spans);
+        }
+    }
+
+    /// Zero-copy byte ranges for `slice_only` pipelines, reusing `ps`.
+    fn chunk_ranges_into(&self, text: &str, ps: &mut PipeScratch) {
+        self.chunk_ranges_window(text.as_bytes(), 0, text.len(), ps);
     }
 
     /// Zero-copy byte ranges for `slice_only` pipelines.

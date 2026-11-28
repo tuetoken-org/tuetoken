@@ -4799,8 +4799,7 @@ impl Tokenizer {
         total
     }
 
-    /// Phase 2 fallback for buffers > 4 GiB (explicit 64-bit spans).
-    #[cold]
+    /// Phase 2 span-based flush (used by >4 GiB buffers and pipelined `PretokPipe`).
     fn flush_recs_spans(
         &self,
         bytes: &[u8],
@@ -5936,6 +5935,10 @@ impl Tokenizer {
         self.fast_pretok == FastPretok::BlockScan
             || (self.fast_pretok == FastPretok::Cjk && self.singleton_eow.is_none())
             || self.sp_fast_meta != SpFastMeta::None
+            || (self.fast_pretok == FastPretok::Pipe
+                && !self.byte_fallback
+                && self.singleton_eow.is_none()
+                && self.pretok_pipe.as_ref().is_some_and(|p| p.is_nl_letter_splittable()))
     }
 
     /// True when whole-document serial normalization can be deferred to parallel
@@ -6285,6 +6288,21 @@ impl Tokenizer {
                 self.encode_cjk_range(d, a, b, s);
             } else {
                 self.encode_cjk_range(d, 0, d.len(), s);
+            }
+            return true;
+        }
+        if self.fast_pretok == FastPretok::Pipe
+            && !self.byte_fallback
+            && self.singleton_eow.is_none()
+            && self.pretok_pipe.as_ref().is_some_and(|p| p.is_slice_only())
+        {
+            let pipe = self.pretok_pipe.as_ref().unwrap();
+            let sub = unsafe { std::str::from_utf8_unchecked(&d[a..b]) };
+            if self.parallel_unicode_norm() {
+                let norm_sub = self.normalizer.apply(sub);
+                self.encode_pipe_piped(norm_sub.as_ref(), pipe, s);
+            } else {
+                self.encode_pipe_piped(sub, pipe, s);
             }
             return true;
         }
@@ -7033,6 +7051,58 @@ impl Tokenizer {
         self.encode_into_norm(norm.as_ref(), mode, prepend, s);
     }
 
+    /// Pipelined 256-deep L1-prefetched `SharedTable`+`SharedLongTable` encoder
+    /// for any `slice_only` `PretokPipe` model (e.g. Falcon3, Falcon-H1). Streams
+    /// L1-hot windows of byte spans through `pack_wide` + `prefetch` + `flush_recs_spans`.
+    fn encode_pipe_piped(&self, text: &str, pipe: &pretok_pipe::PretokPipe, s: &mut Scratch) {
+        const CAP: usize = 256;
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        if n == 0 {
+            return;
+        }
+        let bp = bytes.as_ptr();
+        let mut ps = std::mem::take(&mut s.pipe);
+        let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP];
+        let mut spans_buf = [(0usize, 0usize); CAP];
+        let mut cnt = 0usize;
+        let mut view = self.learned.view();
+        pipe.for_each_slice_spans(text, &mut ps, |spans| {
+            for &(a, e) in spans {
+                if cnt == 0 {
+                    view = self.learned.view();
+                }
+                let len = e - a;
+                let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY {
+                    let (lo, hi) = if a + 16 <= n {
+                        unsafe { chunk_table::pack_wide(bp.add(a), len) }
+                    } else {
+                        chunk_table::pack(&bytes[a..e])
+                    };
+                    let p = view.slot_addr(chunk_table::hash(lo, hi));
+                    chunk_table::prefetch(p as *const u8);
+                    PipeRec { lo, hi, p }
+                } else {
+                    PipeRec { lo: 0, hi: 0, p: 0 }
+                };
+                buf[cnt].write(v);
+                spans_buf[cnt] = (a, e);
+                cnt += 1;
+                if cnt == CAP {
+                    // SAFETY: buf[..CAP] initialized.
+                    let sl = unsafe { &*(&buf[..CAP] as *const _ as *const [PipeRec]) };
+                    self.flush_recs_spans(bytes, n, sl, &spans_buf[..CAP], s, view);
+                    cnt = 0;
+                }
+            }
+        });
+        if cnt > 0 {
+            let sl = unsafe { &*(&buf[..cnt] as *const _ as *const [PipeRec]) };
+            self.flush_recs_spans(bytes, n, sl, &spans_buf[..cnt], s, view);
+        }
+        s.pipe = ps;
+    }
+
     /// `encode_into` for text that is ALREADY normalized. Appends to `s.out`.
     fn encode_into_norm(&self, text: &str, mode: Merge, prepend: bool, s: &mut Scratch) {
         match self.fast_pretok {
@@ -7047,6 +7117,10 @@ impl Tokenizer {
                 let use_shared =
                     mode == Merge::Auto && !self.byte_fallback && self.singleton_eow.is_none();
                 let split_ms = self.safe_meta_split;
+                if use_shared && split_ms.is_none() && pipe.is_slice_only() {
+                    self.encode_pipe_piped(text, pipe, s);
+                    return;
+                }
                 let mut ps = std::mem::take(&mut s.pipe);
                 pipe.for_each_chunk(text, prepend, &self.c2b, &mut ps, |chunk| {
                     if let Some(rep) = split_ms {
