@@ -1644,6 +1644,88 @@ def test_truncate_chunk_and_v02_regressions():
     return ok, tot
 
 
+def test_early_exit_right_truncation_parity():
+    """Verify exact O(max_tokens) early-exit right-truncation across ByteLevel, NFC, CJK, and SentencePiece."""
+    print("=== O(max_tokens) early-exit right-truncation parity ===")
+    import numpy as np
+    from transformers import AutoTokenizer as HFAuto
+    from tuetoken import AutoTokenizer as TTAuto, Tokenizer
+
+    docs = [
+        "",
+        "hello",
+        "   \n\t  hello world! " * 300,
+        "<s>hello</s><|endoftext|><|im_start|>system\nYou are helpful.<|im_end|>\n" * 50,
+        "  <|endoftext|>  " + "café naïve résumé 日本語 한국어 🚀 " * 200,
+        "e\u0301" * 100 + " " + "hello world " * 400,
+        "▁hello▁world " * 300,
+        "   " + "a" * 5000,
+        "def foo(x):\n    return x + 1\n" * 400,
+        "hello<|user|>   world   <|end|>  " * 100,
+        "The quick brown fox jumps over the lazy dog. " * 2000,
+        "foo   <s>   bar",
+        "<s><s><s><s><s>",
+        "word " * 16 + "   <|endoftext|> tail " * 50,
+        "word " * 17 + "<|im_start|> tail " * 50,
+        "word " * 16 + "   <s> tail " * 50,
+        "a " * 32 + "e\u0301" + " tail " * 500,
+        "word " * 64 + "▁literal_sp " + "tail " * 500,
+        # NFC combining mark straddling prefix window boundary (~3328 bytes)
+        ("café — hello world " * 170) + "e\u0301" + (" trailing text " * 1000),
+    ]
+
+    ok = tot = 0
+    # 1. Core tiktoken models: encode_batch + truncate(special=F/T)
+    for enc in ("o200k_base", "cl100k_base", "gpt2"):
+        t = Tokenizer.from_tiktoken(enc)
+        full = [t.encode_ordinary(d) for d in docs]
+        full_sp = [t.encode_special(d) for d in docs]
+        for ml in (0, 1, 2, 16, 17, 64, 512):
+            got = t.encode_batch(docs, max_length=ml, pad_id=99)
+            exp_ids = np.full((len(docs), ml), 99, dtype=np.uint32)
+            exp_mask = np.zeros((len(docs), ml), dtype=np.uint8)
+            for i, f in enumerate(full):
+                k = min(len(f), ml)
+                exp_ids[i, :k] = f[:k]
+                exp_mask[i, :k] = 1
+            tot += 2
+            ok += int(np.array_equal(got["input_ids"], exp_ids))
+            ok += int(np.array_equal(got["attention_mask"], exp_mask))
+            for i, d in enumerate(docs):
+                tot += 2
+                exp_tr = d if len(full[i]) <= ml else t.decode(full[i][:ml])
+                ok += int(t.truncate(d, ml, side="right", special=False) == exp_tr)
+                exp_sp = d if len(full_sp[i]) <= ml else t.decode(full_sp[i][:ml])
+                ok += int(t.truncate(d, ml, side="right", special=True) == exp_sp)
+
+    # 2. Diverse HF AutoTokenizer families (NFC, CJK, SP NormPrependAlways, SP NormNoPrepend, SP Metaspace)
+    for repo in (
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "deepseek-ai/DeepSeek-V3",
+        "microsoft/Phi-3.5-mini-instruct",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "unsloth/gemma-3-4b-it",
+    ):
+        try:
+            hf = HFAuto.from_pretrained(repo, local_files_only=True)
+            tt = TTAuto.from_pretrained(repo, local_files_only=True)
+        except Exception:
+            continue
+        for d in docs:
+            for ml in (1, 2, 5, 16, 17, 64, 512):
+                for sp in (True, False):
+                    ref = hf(d, truncation=True, max_length=ml, add_special_tokens=sp)["input_ids"]
+                    gl = tt(d, truncation=True, max_length=ml, add_special_tokens=sp)["input_ids"]
+                    gn = tt([d], truncation=True, max_length=ml, add_special_tokens=sp, return_tensors="np")["input_ids"][0].tolist()
+                    tot += 2
+                    ok += int(gl == ref)
+                    ok += int(gn == ref)
+
+    _line("early-exit right truncation (all families)", ok, tot)
+    assert ok == tot, f"early-exit truncation: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -1655,6 +1737,7 @@ def main():
         test_fast_and_batch_chat_templates(), test_sentencepiece_fast_meta(),
         test_decode_stream(), test_count_and_file_apis(),
         test_truncate_chunk_and_v02_regressions(),
+        test_early_exit_right_truncation_parity(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)
