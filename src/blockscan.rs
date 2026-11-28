@@ -1141,12 +1141,12 @@ fn digit_starts_ascii<const K: u32>(d: u64, cd: bool, runtime_k: u32) -> (u64, u
 }
 
 #[inline(always)]
-fn ws_starts_nl(x: &Ctx, flags: u32, base: usize, n: usize) -> (u64, u64, u64) {
+fn ws_starts_nl<const NO_NL: bool>(x: &Ctx, flags: u32, base: usize, n: usize) -> (u64, u64, u64) {
     let m = &x.m;
     let c_ws = fbit(flags, F_WS);
     let c_na = fbit(flags, F_NA);
     let long = m.ws & (p1(m.ws, c_ws) | n1(m.ws, x.next_ws));
-    let o_before = p1f(x.o, flags, 0);
+    let o_before = if NO_NL { 0 } else { p1f(x.o, flags, 0) };
     let single_abs = m.nl & !long & o_before;
     let mut starts = m.ws & !long & !single_abs;
     let (mut bad, mut abs) = (0u64, single_abs);
@@ -1265,7 +1265,7 @@ fn span_bad(bad: &mut u64, bad_next: &mut u64, i: usize, end: usize) {
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn generic_fast<const FULL: bool, const K: u32>(
+fn generic_fast<const FULL: bool, const K: u32, const NO_NL: bool>(
     b: &[u8],
     base: usize,
     max_digits: u32,
@@ -1285,7 +1285,7 @@ fn generic_fast<const FULL: bool, const K: u32>(
     };
     let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (o_before & !p1f(ostart_c, flags, 8)));
     let (dstart, dbad) = digit_starts_ascii::<K>(m.d, fbit(flags, F_D), max_digits);
-    let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m, o_before, fbit(flags, F_WS));
+    let (wsstart, wsbad, _, cont_ws, next_na) = ws_starts_nl_fast::<FULL>(b, base, valid, m, if NO_NL { 0 } else { o_before }, fbit(flags, F_WS));
     let mut starts = ostart | lstart | dstart | wsstart | (((flags >> 14) & 1) as u64);
     let mut bad = cont_ws | (m.ws & ((next_na as u64) << 63)) | dbad | wsbad;
     let mut qc = m.q & ostart;
@@ -1328,7 +1328,7 @@ fn generic_fast<const FULL: bool, const K: u32>(
 
 #[cold]
 #[inline(never)]
-fn generic_slow(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
+fn generic_slow<const NO_NL: bool>(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry, m: Classes) -> (u64, u64, u32) {
     let (c_bad_in, c_forced) = if fbit(flags, F_SLOW) {
         (slow.bad_in, slow.forced)
     } else {
@@ -1342,7 +1342,7 @@ fn generic_slow(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut S
     let ostart_c = ostart_c | ((ostart_c << 1) & x.cont);
     let lstart = m.l & (p1f(m.d, flags, 2) | p1f(m.nl, flags, 3) | (p1f(o, flags, 0) & !p1f(ostart_c, flags, 8)));
     let (dstart, dbad) = digit_starts(m, flags, max_digits, false);
-    let (wsstart, wsbad, _) = ws_starts_nl(&x, flags, base, n);
+    let (wsstart, wsbad, _) = ws_starts_nl::<NO_NL>(&x, flags, base, n);
     let mut starts = ostart | lstart | dstart | wsstart | c_forced;
     let mut forced = 0u64;
     let mut bad = common_bad(&x, flags) | dbad | wsbad | c_bad_in;
@@ -1385,7 +1385,7 @@ fn generic_slow(b: &[u8], base: usize, max_digits: u32, flags: u32, slow: &mut S
 }
 
 #[inline(always)]
-unsafe fn generic_block<S: Simd, const K: u32>(avail: &[u8], doc_len: usize, base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
+unsafe fn generic_block<S: Simd, const K: u32, const NO_NL: bool>(avail: &[u8], doc_len: usize, base: usize, max_digits: u32, flags: u32, slow: &mut SlowCarry) -> (u64, u64, u32, bool) {
     let doc = &avail[..doc_len];
     if base + 64 < doc_len {
         let v = S::load64(avail.as_ptr().add(base));
@@ -1400,12 +1400,12 @@ unsafe fn generic_block<S: Simd, const K: u32>(avail: &[u8], doc_len: usize, bas
                 cont = c;
             }
             if ok {
-                if let Some((s, bad, nf)) = generic_fast::<true, K>(doc, base, max_digits, flags, &rm, u64::MAX, cont) {
+                if let Some((s, bad, nf)) = generic_fast::<true, K, NO_NL>(doc, base, max_digits, flags, &rm, u64::MAX, cont) {
                     return (s, bad, nf, true);
                 }
             }
         }
-        let (s, bad, nf) = generic_slow(doc, base, max_digits, flags, slow, m);
+        let (s, bad, nf) = generic_slow::<NO_NL>(doc, base, max_digits, flags, slow, m);
         return (s, bad, nf, false);
     }
     let (v, m, valid) = load_and_classify_tail::<S>(avail, doc_len, base);
@@ -1419,12 +1419,12 @@ unsafe fn generic_block<S: Simd, const K: u32>(avail: &[u8], doc_len: usize, bas
             cont = c;
         }
         if ok {
-            if let Some((s, bad, nf)) = generic_fast::<false, K>(doc, base, max_digits, flags, &rm, valid, cont) {
+            if let Some((s, bad, nf)) = generic_fast::<false, K, NO_NL>(doc, base, max_digits, flags, &rm, valid, cont) {
                 return (s, bad, nf, true);
             }
         }
     }
-    let (s, bad, nf) = generic_slow(doc, base, max_digits, flags, slow, m);
+    let (s, bad, nf) = generic_slow::<NO_NL>(doc, base, max_digits, flags, slow, m);
     (s, bad, nf, false)
 }
 
@@ -1547,7 +1547,7 @@ fn camel_slow(b: &[u8], base: usize, contractions: bool, max_digits: u32, flags:
     let x = ctx_m::<true, true>(b, base, m);
     let (m, o) = (&x.m, x.o);
     let lw = m.l & !m.up;
-    let (wsstart, wsbad, abs_nl) = ws_starts_nl(&x, flags, base, n);
+    let (wsstart, wsbad, abs_nl) = ws_starts_nl::<false>(&x, flags, base, n);
     let seed = m.sl & p1(abs_nl, (flags & (F_ABS_NL | F_ABS_SL)) != 0);
     let abs_sl = (m.sl.wrapping_add(seed) ^ m.sl) & m.sl;
     let mut ostart = (o & !p1f(o, flags, 0) & !p1f(m.sp, flags, 1) & !abs_sl) | (o & !m.sl & p1f(abs_sl, flags, 10));
@@ -1888,7 +1888,8 @@ pub fn block(kind: Pretok, b: &[u8], base: usize, c: Carry) -> Block {
 #[inline(always)]
 unsafe fn block_with<S: Simd>(kind: Pretok, b: &[u8], base: usize, flags: &mut u32, slow: &mut SlowCarry) -> (u64, u64) {
     let (s, bad, out_flags, _) = match kind {
-        Pretok::Generic { max_digits, .. } => generic_block::<S, { u32::MAX }>(b, b.len(), base, max_digits, *flags, slow),
+        Pretok::Generic { max_digits, no_nl: false, .. } => generic_block::<S, { u32::MAX }, false>(b, b.len(), base, max_digits, *flags, slow),
+        Pretok::Generic { max_digits, no_nl: true, .. } => generic_block::<S, { u32::MAX }, true>(b, b.len(), base, max_digits, *flags, slow),
         Pretok::CamelCase { contractions, max_digits } => camel_block::<S, 2, { u32::MAX }>(b, b.len(), base, contractions, max_digits, *flags, slow),
         Pretok::Word(indiv) => word_block::<S, 2>(b, b.len(), base, indiv, *flags, slow),
     };
@@ -1903,7 +1904,7 @@ pub fn block_m(kind: Pretok, b: &[u8], base: usize, c: &mut Carry) -> (u64, u64)
     #[cfg(target_arch = "aarch64")]
     {
         match kind {
-            Pretok::Generic { max_digits, .. } => generic_m_neon(b, base, max_digits, c),
+            Pretok::Generic { max_digits, no_nl, .. } => generic_m_neon(b, base, max_digits, no_nl, c),
             Pretok::CamelCase { contractions, max_digits } => camel_m_neon(b, base, contractions, max_digits, c),
             Pretok::Word(indiv) => word_m_neon(b, base, indiv, c),
         }
@@ -1912,17 +1913,17 @@ pub fn block_m(kind: Pretok, b: &[u8], base: usize, c: &mut Carry) -> (u64, u64)
     {
         match x86_tier() {
             3 | 4 => match kind {
-                Pretok::Generic { max_digits, .. } => unsafe { generic_m_avx512(b, base, max_digits, c) },
+                Pretok::Generic { max_digits, no_nl, .. } => unsafe { generic_m_avx512(b, base, max_digits, no_nl, c) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { camel_m_avx512(b, base, contractions, max_digits, c) },
                 Pretok::Word(indiv) => unsafe { word_m_avx512(b, base, indiv, c) },
             },
             2 => match kind {
-                Pretok::Generic { max_digits, .. } => unsafe { generic_m_avx2(b, base, max_digits, c) },
+                Pretok::Generic { max_digits, no_nl, .. } => unsafe { generic_m_avx2(b, base, max_digits, no_nl, c) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { camel_m_avx2(b, base, contractions, max_digits, c) },
                 Pretok::Word(indiv) => unsafe { word_m_avx2(b, base, indiv, c) },
             },
             _ => match kind {
-                Pretok::Generic { max_digits, .. } => unsafe { generic_m_sse2(b, base, max_digits, c) },
+                Pretok::Generic { max_digits, no_nl, .. } => unsafe { generic_m_sse2(b, base, max_digits, no_nl, c) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { camel_m_sse2(b, base, contractions, max_digits, c) },
                 Pretok::Word(indiv) => unsafe { word_m_sse2(b, base, indiv, c) },
             },
@@ -1941,8 +1942,12 @@ fn word_m_neon(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64, u64) 
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn generic_m_neon(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = unsafe { generic_block::<Neon, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow) };
+fn generic_m_neon(b: &[u8], base: usize, max_digits: u32, no_nl: bool, c: &mut Carry) -> (u64, u64) {
+    let (s, bad, nf, _) = if no_nl {
+        unsafe { generic_block::<Neon, { u32::MAX }, true>(b, b.len(), base, max_digits, c.flags, &mut c.slow) }
+    } else {
+        unsafe { generic_block::<Neon, { u32::MAX }, false>(b, b.len(), base, max_digits, c.flags, &mut c.slow) }
+    };
     c.flags = nf;
     (s, bad)
 }
@@ -1963,8 +1968,12 @@ unsafe fn word_m_avx512(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn generic_m_avx512(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = generic_block::<Avx512, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
+unsafe fn generic_m_avx512(b: &[u8], base: usize, max_digits: u32, no_nl: bool, c: &mut Carry) -> (u64, u64) {
+    let (s, bad, nf, _) = if no_nl {
+        generic_block::<Avx512, { u32::MAX }, true>(b, b.len(), base, max_digits, c.flags, &mut c.slow)
+    } else {
+        generic_block::<Avx512, { u32::MAX }, false>(b, b.len(), base, max_digits, c.flags, &mut c.slow)
+    };
     c.flags = nf;
     (s, bad)
 }
@@ -1985,8 +1994,12 @@ unsafe fn word_m_avx2(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn generic_m_avx2(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = generic_block::<Avx2, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
+unsafe fn generic_m_avx2(b: &[u8], base: usize, max_digits: u32, no_nl: bool, c: &mut Carry) -> (u64, u64) {
+    let (s, bad, nf, _) = if no_nl {
+        generic_block::<Avx2, { u32::MAX }, true>(b, b.len(), base, max_digits, c.flags, &mut c.slow)
+    } else {
+        generic_block::<Avx2, { u32::MAX }, false>(b, b.len(), base, max_digits, c.flags, &mut c.slow)
+    };
     c.flags = nf;
     (s, bad)
 }
@@ -2007,8 +2020,12 @@ unsafe fn word_m_sse2(b: &[u8], base: usize, indiv: bool, c: &mut Carry) -> (u64
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-unsafe fn generic_m_sse2(b: &[u8], base: usize, max_digits: u32, c: &mut Carry) -> (u64, u64) {
-    let (s, bad, nf, _) = generic_block::<Sse2, { u32::MAX }>(b, b.len(), base, max_digits, c.flags, &mut c.slow);
+unsafe fn generic_m_sse2(b: &[u8], base: usize, max_digits: u32, no_nl: bool, c: &mut Carry) -> (u64, u64) {
+    let (s, bad, nf, _) = if no_nl {
+        generic_block::<Sse2, { u32::MAX }, true>(b, b.len(), base, max_digits, c.flags, &mut c.slow)
+    } else {
+        generic_block::<Sse2, { u32::MAX }, false>(b, b.len(), base, max_digits, c.flags, &mut c.slow)
+    };
     c.flags = nf;
     (s, bad)
 }
@@ -2455,8 +2472,8 @@ fn fill_word_neon<const I_MODE: u8>(scan: &mut Scan, kind: Pretok, avail: &[u8],
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn fill_generic_neon<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Neon, K>(a, dl, base, max_digits, f, s), handle_bad_neon) }
+fn fill_generic_neon<const K: u32, const NO_NL: bool>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    unsafe { fill_loop::<Neon>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Neon, K, NO_NL>(a, dl, base, max_digits, f, s), handle_bad_neon) }
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
@@ -2474,8 +2491,8 @@ unsafe fn fill_word_avx512_vbmi2<const I_MODE: u8>(scan: &mut Scan, kind: Pretok
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_generic_avx512_vbmi2<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512Vbmi2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512Vbmi2, K>(a, dl, base, max_digits, f, s), handle_bad_avx512_vbmi2)
+unsafe fn fill_generic_avx512_vbmi2<const K: u32, const NO_NL: bool>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512Vbmi2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512Vbmi2, K, NO_NL>(a, dl, base, max_digits, f, s), handle_bad_avx512_vbmi2)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,lzcnt,popcnt")]
@@ -2493,8 +2510,8 @@ unsafe fn fill_word_avx512<const I_MODE: u8>(scan: &mut Scan, kind: Pretok, avai
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_generic_avx512<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512, K>(a, dl, base, max_digits, f, s), handle_bad_avx512)
+unsafe fn fill_generic_avx512<const K: u32, const NO_NL: bool>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx512>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx512, K, NO_NL>(a, dl, base, max_digits, f, s), handle_bad_avx512)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
@@ -2512,8 +2529,8 @@ unsafe fn fill_word_avx2<const I_MODE: u8>(scan: &mut Scan, kind: Pretok, avail:
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_generic_avx2<const K: u32>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx2, K>(a, dl, base, max_digits, f, s), handle_bad_avx2)
+unsafe fn fill_generic_avx2<const K: u32, const NO_NL: bool>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Avx2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Avx2, K, NO_NL>(a, dl, base, max_digits, f, s), handle_bad_avx2)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -2531,8 +2548,8 @@ unsafe fn fill_word_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: u
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fill_generic_sse2(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
-    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Sse2, { u32::MAX }>(a, dl, base, max_digits, f, s), handle_bad_sse2)
+unsafe fn fill_generic_sse2<const NO_NL: bool>(scan: &mut Scan, kind: Pretok, avail: &[u8], doc_len: usize, stop: usize, max_digits: u32, out: &mut [u32], k: usize, limit: usize) -> usize {
+    fill_loop::<Sse2>(scan, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Sse2, { u32::MAX }, NO_NL>(a, dl, base, max_digits, f, s), handle_bad_sse2)
 }
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
@@ -2602,9 +2619,11 @@ impl Scan {
         return match kind {
             Pretok::Word(false) => fill_word_neon::<0>(self, kind, avail, doc_len, stop, false, out, k, limit),
             Pretok::Word(true) => fill_word_neon::<1>(self, kind, avail, doc_len, stop, true, out, k, limit),
-            Pretok::Generic { max_digits: 3, .. } => fill_generic_neon::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit),
-            Pretok::Generic { max_digits: 1, .. } => fill_generic_neon::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit),
-            Pretok::Generic { max_digits, .. } => fill_generic_neon::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit),
+            Pretok::Generic { max_digits: 3, no_nl: false, .. } => fill_generic_neon::<3, false>(self, kind, avail, doc_len, stop, 3, out, k, limit),
+            Pretok::Generic { max_digits: 1, no_nl: false, .. } => fill_generic_neon::<1, false>(self, kind, avail, doc_len, stop, 1, out, k, limit),
+            Pretok::Generic { max_digits: 1, no_nl: true, .. } => fill_generic_neon::<1, true>(self, kind, avail, doc_len, stop, 1, out, k, limit),
+            Pretok::Generic { max_digits, no_nl: false, .. } => fill_generic_neon::<{ u32::MAX }, false>(self, kind, avail, doc_len, stop, max_digits, out, k, limit),
+            Pretok::Generic { max_digits, no_nl: true, .. } => fill_generic_neon::<{ u32::MAX }, true>(self, kind, avail, doc_len, stop, max_digits, out, k, limit),
             Pretok::CamelCase { contractions: true, max_digits: 3 } => fill_camel_neon::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit),
             Pretok::CamelCase { contractions, max_digits } => fill_camel_neon::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit),
         };
@@ -2613,40 +2632,48 @@ impl Scan {
             4 => match kind {
                 Pretok::Word(false) => unsafe { fill_word_avx512_vbmi2::<0>(self, kind, avail, doc_len, stop, false, out, k, limit) },
                 Pretok::Word(true) => unsafe { fill_word_avx512_vbmi2::<1>(self, kind, avail, doc_len, stop, true, out, k, limit) },
-                Pretok::Generic { max_digits: 3, .. } => unsafe { fill_generic_avx512_vbmi2::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
-                Pretok::Generic { max_digits: 1, .. } => unsafe { fill_generic_avx512_vbmi2::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
-                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx512_vbmi2::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits: 3, no_nl: false, .. } => unsafe { fill_generic_avx512_vbmi2::<3, false>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
+                Pretok::Generic { max_digits: 1, no_nl: false, .. } => unsafe { fill_generic_avx512_vbmi2::<1, false>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits: 1, no_nl: true, .. } => unsafe { fill_generic_avx512_vbmi2::<1, true>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: false, .. } => unsafe { fill_generic_avx512_vbmi2::<{ u32::MAX }, false>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: true, .. } => unsafe { fill_generic_avx512_vbmi2::<{ u32::MAX }, true>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
                 Pretok::CamelCase { contractions: true, max_digits: 3 } => unsafe { fill_camel_avx512_vbmi2::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx512_vbmi2::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
             },
             3 => match kind {
                 Pretok::Word(false) => unsafe { fill_word_avx512::<0>(self, kind, avail, doc_len, stop, false, out, k, limit) },
                 Pretok::Word(true) => unsafe { fill_word_avx512::<1>(self, kind, avail, doc_len, stop, true, out, k, limit) },
-                Pretok::Generic { max_digits: 3, .. } => unsafe { fill_generic_avx512::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
-                Pretok::Generic { max_digits: 1, .. } => unsafe { fill_generic_avx512::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
-                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx512::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits: 3, no_nl: false, .. } => unsafe { fill_generic_avx512::<3, false>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
+                Pretok::Generic { max_digits: 1, no_nl: false, .. } => unsafe { fill_generic_avx512::<1, false>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits: 1, no_nl: true, .. } => unsafe { fill_generic_avx512::<1, true>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: false, .. } => unsafe { fill_generic_avx512::<{ u32::MAX }, false>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: true, .. } => unsafe { fill_generic_avx512::<{ u32::MAX }, true>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
                 Pretok::CamelCase { contractions: true, max_digits: 3 } => unsafe { fill_camel_avx512::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx512::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
             },
             2 => match kind {
                 Pretok::Word(false) => unsafe { fill_word_avx2::<0>(self, kind, avail, doc_len, stop, false, out, k, limit) },
                 Pretok::Word(true) => unsafe { fill_word_avx2::<1>(self, kind, avail, doc_len, stop, true, out, k, limit) },
-                Pretok::Generic { max_digits: 3, .. } => unsafe { fill_generic_avx2::<3>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
-                Pretok::Generic { max_digits: 1, .. } => unsafe { fill_generic_avx2::<1>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
-                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_avx2::<{ u32::MAX }>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits: 3, no_nl: false, .. } => unsafe { fill_generic_avx2::<3, false>(self, kind, avail, doc_len, stop, 3, out, k, limit) },
+                Pretok::Generic { max_digits: 1, no_nl: false, .. } => unsafe { fill_generic_avx2::<1, false>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits: 1, no_nl: true, .. } => unsafe { fill_generic_avx2::<1, true>(self, kind, avail, doc_len, stop, 1, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: false, .. } => unsafe { fill_generic_avx2::<{ u32::MAX }, false>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: true, .. } => unsafe { fill_generic_avx2::<{ u32::MAX }, true>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
                 Pretok::CamelCase { contractions: true, max_digits: 3 } => unsafe { fill_camel_avx2::<1, 3>(self, kind, avail, doc_len, stop, true, 3, out, k, limit) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_avx2::<2, { u32::MAX }>(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
             },
             _ => match kind {
                 Pretok::Word(indiv) => unsafe { fill_word_sse2(self, kind, avail, doc_len, stop, indiv, out, k, limit) },
-                Pretok::Generic { max_digits, .. } => unsafe { fill_generic_sse2(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: false, .. } => unsafe { fill_generic_sse2::<false>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
+                Pretok::Generic { max_digits, no_nl: true, .. } => unsafe { fill_generic_sse2::<true>(self, kind, avail, doc_len, stop, max_digits, out, k, limit) },
                 Pretok::CamelCase { contractions, max_digits } => unsafe { fill_camel_sse2(self, kind, avail, doc_len, stop, contractions, max_digits, out, k, limit) },
             },
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         match kind {
             Pretok::Word(indiv) => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| word_block::<Scalar, 2>(a, dl, base, indiv, f, s), handle_bad_scalar) },
-            Pretok::Generic { max_digits, .. } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Scalar, { u32::MAX }>(a, dl, base, max_digits, f, s), handle_bad_scalar) },
+            Pretok::Generic { max_digits, no_nl: false, .. } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Scalar, { u32::MAX }, false>(a, dl, base, max_digits, f, s), handle_bad_scalar) },
+            Pretok::Generic { max_digits, no_nl: true, .. } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| generic_block::<Scalar, { u32::MAX }, true>(a, dl, base, max_digits, f, s), handle_bad_scalar) },
             Pretok::CamelCase { contractions, max_digits } => unsafe { fill_loop::<Scalar>(self, kind, avail, doc_len, stop, out, k, limit, |a, dl, base, f, s| camel_block::<Scalar, 2, { u32::MAX }>(a, dl, base, contractions, max_digits, f, s), handle_bad_scalar) },
         }
     }
@@ -2678,18 +2705,19 @@ mod tests {
         std::env::var("BLOCKSCAN_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000)
     }
 
-    const KINDS: [Pretok; 11] = [
-        Pretok::Generic { max_digits: 0, marks: false },
-        Pretok::Generic { max_digits: 1, marks: false },
-        Pretok::Generic { max_digits: 3, marks: false },
-        Pretok::Generic { max_digits: 3, marks: true },
+    const KINDS: [Pretok; 12] = [
+        Pretok::Generic { max_digits: 0, marks: false, no_nl: false },
+        Pretok::Generic { max_digits: 1, marks: false, no_nl: false },
+        Pretok::Generic { max_digits: 1, marks: false, no_nl: true },
+        Pretok::Generic { max_digits: 3, marks: false, no_nl: false },
+        Pretok::Generic { max_digits: 3, marks: true, no_nl: false },
         Pretok::CamelCase { contractions: true, max_digits: 3 },
         Pretok::CamelCase { contractions: false, max_digits: 3 },
         Pretok::CamelCase { contractions: true, max_digits: 0 },
         Pretok::CamelCase { contractions: true, max_digits: 1 },
         Pretok::Word(false),
         Pretok::Word(true),
-        Pretok::Generic { max_digits: 2, marks: false },
+        Pretok::Generic { max_digits: 2, marks: false, no_nl: false },
     ];
 
     #[test]
@@ -2958,7 +2986,7 @@ mod perf {
         let data = std::fs::read(path).unwrap();
         let b = &data[..data.len().min(30_000_000)];
         for kind in [
-            Pretok::Generic { max_digits: 3, marks: false },
+            Pretok::Generic { max_digits: 3, marks: false, no_nl: false },
             Pretok::CamelCase { contractions: true, max_digits: 3 },
             Pretok::Word(false),
         ] {

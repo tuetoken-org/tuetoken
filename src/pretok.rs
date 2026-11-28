@@ -21,7 +21,9 @@ pub enum Pretok {
     // mark-inclusive letter runs (`[\p{L}\p{M}]+`) and excludes Marks from the
     // symbol class (`[^\s\p{L}\p{M}\p{N}]`) — combining marks join the preceding
     // letters instead of being lumped with symbols (e.g. the Qwen3.6 variant).
-    Generic { max_digits: u32, marks: bool },
+    // `no_nl`: when true, the symbol branch does NOT absorb trailing `[\r\n]*`
+    // (e.g. Seed-Coder's ` ?[^\s\p{L}\p{N}\r\n]+`).
+    Generic { max_digits: u32, marks: bool, no_nl: bool },
     // Case-aware (camelCase) letter runs. `contractions`: whether the `(?i:'s|'t|..)`
     // suffix is emitted (some variants drop it). `max_digits`: digit-run cap.
     CamelCase { contractions: bool, max_digits: u32 },
@@ -241,8 +243,8 @@ fn word(b: &[u8], start: usize, indiv_digits: bool) -> usize {
     start + cl
 }
 
-fn generic(b: &[u8], start: usize, max_digits: u32, marks: bool) -> usize {
-    generic_impl(b, start, max_digits, marks, 1)
+fn generic(b: &[u8], start: usize, max_digits: u32, marks: bool, no_nl: bool) -> usize {
+    generic_impl(b, start, max_digits, marks, if no_nl { 0 } else { 1 })
 }
 
 /// Generic pre-tokenizer variant whose symbol branch (` ?[^\s\p{L}\p{N}\r\n]+`)
@@ -613,7 +615,7 @@ fn fast_word(b: &[u8], start: usize, indiv: bool) -> Option<usize> {
 }
 
 #[inline(always)]
-fn fast_generic(b: &[u8], start: usize, max_digits: u32) -> Option<usize> {
+fn fast_generic(b: &[u8], start: usize, max_digits: u32, no_nl: bool) -> Option<usize> {
     let n = b.len();
     let c = b[start];
     if c >= 0x80 {
@@ -639,7 +641,7 @@ fn fast_generic(b: &[u8], start: usize, max_digits: u32) -> Option<usize> {
     if cls == b'N' {
         return f_digits(b, start, max_digits);
     }
-    if let Some(e) = f_symbol_run(b, start, 1)? {
+    if let Some(e) = f_symbol_run(b, start, if no_nl { 0 } else { 1 })? {
         return Some(e);
     }
     // `\s*[\r\n]+` then `\s+(?!\S)|\s+`
@@ -699,7 +701,7 @@ fn fast_camel(b: &[u8], start: usize, contractions: bool, max_digits: u32) -> Op
 pub fn fast_chunk_end(kind: Pretok, b: &[u8], start: usize) -> Option<usize> {
     match kind {
         Pretok::Word(indiv) => fast_word(b, start, indiv),
-        Pretok::Generic { max_digits, .. } => fast_generic(b, start, max_digits),
+        Pretok::Generic { max_digits, no_nl, .. } => fast_generic(b, start, max_digits, no_nl),
         Pretok::CamelCase { contractions, max_digits } => fast_camel(b, start, contractions, max_digits),
     }
 }
@@ -709,7 +711,7 @@ pub fn fast_chunk_end(kind: Pretok, b: &[u8], start: usize) -> Option<usize> {
 pub fn slow_chunk_end(kind: Pretok, b: &[u8], start: usize) -> usize {
     match kind {
         Pretok::Word(indiv) => word(b, start, indiv),
-        Pretok::Generic { max_digits, marks } => generic(b, start, max_digits, marks),
+        Pretok::Generic { max_digits, marks, no_nl } => generic(b, start, max_digits, marks, no_nl),
         Pretok::CamelCase { contractions, max_digits } => camelcase(b, start, contractions, max_digits),
     }
 }
@@ -732,13 +734,14 @@ mod tests {
         *s >> 33
     }
 
-    const KINDS: [Pretok; 9] = [
+    const KINDS: [Pretok; 10] = [
         Pretok::Word(false),
         Pretok::Word(true),
-        Pretok::Generic { max_digits: 0, marks: false },
-        Pretok::Generic { max_digits: 1, marks: false },
-        Pretok::Generic { max_digits: 3, marks: false },
-        Pretok::Generic { max_digits: 3, marks: true },
+        Pretok::Generic { max_digits: 0, marks: false, no_nl: false },
+        Pretok::Generic { max_digits: 1, marks: false, no_nl: false },
+        Pretok::Generic { max_digits: 1, marks: false, no_nl: true },
+        Pretok::Generic { max_digits: 3, marks: false, no_nl: false },
+        Pretok::Generic { max_digits: 3, marks: true, no_nl: false },
         Pretok::CamelCase { contractions: true, max_digits: 3 },
         Pretok::CamelCase { contractions: false, max_digits: 3 },
         Pretok::CamelCase { contractions: true, max_digits: 0 },
@@ -812,7 +815,7 @@ mod tests {
     fn k_name(k: Pretok) -> String {
         match k {
             Pretok::Word(i) => format!("Word({i})"),
-            Pretok::Generic { max_digits, marks } => format!("Generic({max_digits},{marks})"),
+            Pretok::Generic { max_digits, marks, no_nl } => format!("Generic({max_digits},{marks},{no_nl})"),
             Pretok::CamelCase { contractions, max_digits } => format!("Camel({contractions},{max_digits})"),
         }
     }

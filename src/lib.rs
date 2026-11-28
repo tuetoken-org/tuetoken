@@ -886,15 +886,29 @@ pub(crate) fn match_fast_split_regex(raw_pat: &str) -> Option<Pretok> {
         };
         let (dig_part, rest) = rest.split_once('|')?;
         let max_digits = parse_exact_digit_branch(dig_part)?;
-        let rest = if marks {
-            rest.strip_prefix(r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|")?
+        let (no_nl, rest) = if marks {
+            if let Some(r) = rest.strip_prefix(r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|") {
+                (false, r)
+            } else {
+                let r = rest
+                    .strip_prefix(r" ?[^\s\p{L}\p{M}\p{N}\r\n]+|")
+                    .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{M}\p{N}]+|"))?;
+                (true, r)
+            }
+        } else if let Some(r) = rest
+            .strip_prefix(r" ?[^\s\p{L}\p{N}]+[\r\n]*|")
+            .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{N}]++[\r\n]*|"))
+            .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{N}]++[\r\n]*+|"))
+        {
+            (false, r)
         } else {
-            rest.strip_prefix(r" ?[^\s\p{L}\p{N}]+[\r\n]*|")
-                .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{N}]++[\r\n]*|"))
-                .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{N}]++[\r\n]*+|"))?
+            let r = rest
+                .strip_prefix(r" ?[^\s\p{L}\p{N}\r\n]+|")
+                .or_else(|| rest.strip_prefix(r" ?[^\s\p{L}\p{N}]+|"))?;
+            (true, r)
         };
         if is_exact_ws_tail(rest) {
-            return Some(Pretok::Generic { max_digits, marks });
+            return Some(Pretok::Generic { max_digits, marks, no_nl });
         }
         return None;
     }
