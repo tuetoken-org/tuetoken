@@ -7150,12 +7150,28 @@ impl Tokenizer {
         };
 
         let table = self.ints(py);
-        let one_ptr = if let Some(o) = table.get(1) {
-            o.as_ptr()
+        // Build a 1-element template list `[1]` once when `want_mask` is set:
+        // `PySequence_Repeat([1], n)` hits CPython's C `list_repeat` fast path,
+        // which allocates via `PyMem_Malloc` (avoiding `PyList_New`'s redundant
+        // `calloc` zero-fill), updates `1`'s refcount at most once (or zero
+        // times when immortal on 3.12+), and fills the buffer in a tight loop.
+        let one_list = if want_mask {
+            unsafe {
+                let l = pyo3::ffi::PyList_New(1);
+                assert!(!l.is_null(), "list alloc");
+                let one_ptr = if let Some(o) = table.get(1) {
+                    let p = o.as_ptr();
+                    pyo3::ffi::Py_INCREF(p);
+                    p
+                } else {
+                    pyo3::ffi::PyLong_FromLong(1)
+                };
+                pyo3::ffi::PyList_SET_ITEM(l, 0, one_ptr);
+                l
+            }
         } else {
-            unsafe { pyo3::ffi::PyLong_FromLong(1) }
+            std::ptr::null_mut()
         };
-        let one_owned = table.get(1).is_none();
         // SAFETY: each new list's slots are filled exactly once with owned refs.
         unsafe {
             let outer = pyo3::ffi::PyList_New(nrows as pyo3::ffi::Py_ssize_t);
@@ -7188,19 +7204,15 @@ impl Tokenizer {
                     }
                     pyo3::ffi::PyList_SET_ITEM(outer, r as pyo3::ffi::Py_ssize_t, inner);
                     if !m_outer.is_null() {
-                        let m_inner = pyo3::ffi::PyList_New(n as pyo3::ffi::Py_ssize_t);
+                        let m_inner = pyo3::ffi::PySequence_Repeat(one_list, n as pyo3::ffi::Py_ssize_t);
                         assert!(!m_inner.is_null(), "list alloc");
-                        for k in 0..n {
-                            pyo3::ffi::Py_INCREF(one_ptr);
-                            pyo3::ffi::PyList_SET_ITEM(m_inner, k as pyo3::ffi::Py_ssize_t, one_ptr);
-                        }
                         pyo3::ffi::PyList_SET_ITEM(m_outer, r as pyo3::ffi::Py_ssize_t, m_inner);
                     }
                     r += 1;
                 }
             }
-            if one_owned {
-                pyo3::ffi::Py_DECREF(one_ptr);
+            if !one_list.is_null() {
+                pyo3::ffi::Py_DECREF(one_list);
             }
             let seqs = Bound::from_owned_ptr(py, outer).cast_into_unchecked();
             let masks = if m_outer.is_null() {
