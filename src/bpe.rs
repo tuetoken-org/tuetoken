@@ -16,6 +16,13 @@ const PACK_MAX_RANK: usize = (1 << PACK_RANK_BITS) - 2; // +1 stored in 1..=PACK
 /// Top 2 bits of each `targets[rank]` entry store `lr_bits(tg)` when `vocab_n <= (1 << 30)`,
 /// eliminating the serialized dependent `can_lr[merged >> 2]` load after `targets[rank]`.
 const TARGET_ID_MASK: u32 = 0x3FFF_FFFF;
+/// When frequency-ranked dense remapping is active (`use_dense_remap`, for SentencePiece /
+/// non-linear vocabs with `vocab_n <= 524,288`), each `targets[rank]` entry packs all three
+/// hot fields into one 32-bit load:
+/// - bits  0..19: target token ID (`0..524,287`)
+/// - bits 19..30: `dense_id[tg]` (`0..1023` = top-1024 dense slot, `1024` = not in dense)
+/// - bits 30..32: `lr_bits(tg)`
+const TARGET_REMAP_ID_MASK: u32 = (1u32 << 19) - 1;
 const DENSE_NONE: u16 = u16::MAX;
 const DENSE_OVERFLOW: u16 = u16::MAX - 1;
 /// Direct-indexed 2D merge-rank matrix for `(t1 | t2) < DENSE_N`:
@@ -50,10 +57,16 @@ pub struct MergeMap {
     entries: Vec<Entry>,
     mask: usize,
     shift: u32,
-    /// Dense 16-bit rank table for `(t1 | t2) < DENSE_N` (2 MiB, THP-backed on Linux).
+    /// Dense 16-bit rank table for `(d1 | d2) < DENSE_N` (2 MiB, THP-backed on Linux).
     /// `DENSE_NONE` = no merge; `DENSE_OVERFLOW` = rare rank >= 65534 (probe table).
     dense: crate::chunk_table::HugeVec<u16>,
-    /// True iff any byte-byte merge had rank >= DENSE_OVERFLOW (false for gpt2).
+    /// Frequency-ranked dense-slot remap for non-linear/SentencePiece vocabs whose
+    /// single characters live at high IDs (e.g. Gemma-3 236,743+, Mistral 29,473+):
+    /// maps the top `DENSE_N` highest-degree merge tokens to `0..DENSE_N` (`DENSE_N` = none).
+    /// Empty for ByteLevel/linear vocabs (0 bytes, 0 overhead).
+    dense_id: Vec<u16>,
+    use_dense_remap: bool,
+    /// True iff any dense-range merge had rank >= DENSE_OVERFLOW (false for gpt2/Mistral/Phi-3.5).
     has_dense_overflow: bool,
     /// Raw-byte indexed pair table `byte_pair[(b0 << 8) | b1]` (populated for
     /// ByteLevel models): packs 3 `u16` fields into one 64-bit load:
@@ -87,15 +100,18 @@ pub struct MergeMap {
     linear_off: u32,
     /// Number of token IDs covered by `can_lr` (`can_lr.len() * 4`).
     vocab_n: usize,
+    /// Bitmask extracting raw target token ID from `targets[rank]`.
+    target_mask: u32,
     targets: Vec<u32>,
 }
 
 impl MergeMap {
+    #[cfg(test)]
     pub fn new(merges: &[(u32, u32, u32)]) -> Self {
-        Self::new_with_parallel(merges, false)
+        Self::new_with_opts(merges, false, false)
     }
 
-    pub fn new_with_parallel(merges: &[(u32, u32, u32)], allow_par: bool) -> Self {
+    pub fn new_with_opts(merges: &[(u32, u32, u32)], allow_par: bool, allow_dense_remap: bool) -> Self {
         let mut max_tok = 255usize;
         let tg0 = merges.first().map_or(0, |&(_, _, tg)| tg);
         let mut linear_ok = !merges.is_empty();
@@ -117,6 +133,56 @@ impl MergeMap {
         }
         let vocab_n = max_tok + 1;
         let use_packed = vocab_n <= PACK_MAX_TOK && merges.len() <= PACK_MAX_RANK;
+        // For non-linear SentencePiece/byte_fallback vocabs (Gemma-2/3, Mistral,
+        // Phi-3.5, Yi-1.5, ERNIE-4.5, Nemotron, SOLAR), single characters live at
+        // high IDs (29k-237k), leaving the raw `< 1024` dense matrix 0-3% effective.
+        // Selecting the top-1024 highest-degree merge tokens and packing `dense_id`
+        // directly into bits 19..30 of `targets[rank]` gives 3-35x more L2-direct
+        // dense coverage with ZERO extra loads in the hot merge loop!
+        let use_dense_remap =
+            allow_dense_remap && !linear_ok && use_packed && vocab_n <= (1 << 19);
+        let dense_id: Vec<u16> = if use_dense_remap {
+            let mut deg = vec![0u32; vocab_n];
+            for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                // Prioritize early (<65534) merges that fit in `dense` without overflow.
+                let w = if i < DENSE_OVERFLOW as usize { 4u32 } else { 1u32 };
+                unsafe {
+                    *deg.get_unchecked_mut(t1 as usize) += w;
+                    *deg.get_unchecked_mut(t2 as usize) += w;
+                }
+            }
+            let mut cand: Vec<(u32, u32)> = deg
+                .iter()
+                .enumerate()
+                .filter_map(|(t, &d)| if d > 0 { Some((d, t as u32)) } else { None })
+                .collect();
+            let lim = DENSE_N as usize;
+            if cand.len() > lim {
+                cand.select_nth_unstable_by(lim, |a, b| {
+                    b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+                });
+                cand.truncate(lim);
+            }
+            let mut map_id = vec![DENSE_N as u16; vocab_n];
+            for (slot, &(_, t)) in cand.iter().enumerate() {
+                map_id[t as usize] = slot as u16;
+            }
+            // Recompute exact `n_table` and `hist` under the remapped dense slots.
+            hist = [0usize; 33];
+            n_table = 0;
+            for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                let d1 = unsafe { *map_id.get_unchecked(t1 as usize) } as u32;
+                let d2 = unsafe { *map_id.get_unchecked(t2 as usize) } as u32;
+                if (d1 | d2) >= DENSE_N || i >= DENSE_OVERFLOW as usize {
+                    n_table += 1;
+                    let bw = 32 - (t1 | t2).leading_zeros();
+                    hist[bw as usize] += 1;
+                }
+            }
+            map_id
+        } else {
+            Vec::new()
+        };
         if !use_packed {
             n_table = merges.len();
         }
@@ -211,17 +277,25 @@ impl MergeMap {
         let mut cold_bloom = Vec::new();
 
         if use_packed {
-            // Collect overflow dense-range entries (rare: rank >= 65534 with (t1|t2) < DENSE_N)
+            // Collect overflow dense-range entries (rank >= 65534 with both tokens in dense)
             // so Pass 2 never needs to touch `dense` again and can run hot/cold in parallel!
             let mut dense_ov: Vec<(u32, u32, u32)> = Vec::new();
+            let did_slice = dense_id.as_slice();
             for (i, &(t1, t2, _)) in merges.iter().enumerate() {
                 let r = i as u32;
                 unsafe {
                     *can_lr.get_unchecked_mut((t1 as usize) >> 2) |= 1u8 << (((t1 as usize) & 3) * 2);
                     *can_lr.get_unchecked_mut((t2 as usize) >> 2) |= 2u8 << (((t2 as usize) & 3) * 2);
                 }
-                if (t1 | t2) < DENSE_N {
-                    let d = unsafe { dense.get_unchecked_mut(((t1 as usize) << DENSE_BITS) | (t2 as usize)) };
+                let (d1, d2) = if use_dense_remap {
+                    unsafe {
+                        (*did_slice.get_unchecked(t1 as usize) as u32, *did_slice.get_unchecked(t2 as usize) as u32)
+                    }
+                } else {
+                    (t1, t2)
+                };
+                if (d1 | d2) < DENSE_N {
+                    let d = unsafe { dense.get_unchecked_mut(((d1 as usize) << DENSE_BITS) | (d2 as usize)) };
                     if *d == DENSE_NONE {
                         if r < DENSE_OVERFLOW as u32 {
                             *d = r as u16;
@@ -265,10 +339,22 @@ impl MergeMap {
                             push_item(&mut vec, &mut bl, t1, t2, r);
                         }
                     }
-                    for (i, &(t1, t2, _)) in merges.iter().enumerate() {
-                        let or = t1 | t2;
-                        if or >= DENSE_N && or < hot_t {
-                            push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                    if use_dense_remap {
+                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                            if (t1 | t2) < hot_t {
+                                let d1 = unsafe { *did_slice.get_unchecked(t1 as usize) } as u32;
+                                let d2 = unsafe { *did_slice.get_unchecked(t2 as usize) } as u32;
+                                if (d1 | d2) >= DENSE_N {
+                                    push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                                }
+                            }
+                        }
+                    } else {
+                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                            let or = t1 | t2;
+                            if or >= DENSE_N && or < hot_t {
+                                push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                            }
                         }
                     }
                 } else {
@@ -277,10 +363,22 @@ impl MergeMap {
                             push_item(&mut vec, &mut bl, t1, t2, r);
                         }
                     }
-                    for (i, &(t1, t2, _)) in merges.iter().enumerate() {
-                        let or = t1 | t2;
-                        if or >= DENSE_N && or >= hot_t {
-                            push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                    if use_dense_remap {
+                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                            if (t1 | t2) >= hot_t {
+                                let d1 = unsafe { *did_slice.get_unchecked(t1 as usize) } as u32;
+                                let d2 = unsafe { *did_slice.get_unchecked(t2 as usize) } as u32;
+                                if (d1 | d2) >= DENSE_N {
+                                    push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                                }
+                            }
+                        }
+                    } else {
+                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                            let or = t1 | t2;
+                            if or >= DENSE_N && or >= hot_t {
+                                push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                            }
                         }
                     }
                 }
@@ -346,10 +444,22 @@ impl MergeMap {
                 }
             }
         }
-        if !targets.is_empty() && vocab_n <= (1 << 30) {
+        let target_mask = if use_dense_remap {
+            for slot in &mut targets {
+                let tg = *slot;
+                let b = (tg as usize) >> 2;
+                let lr = if b < can_lr.len() {
+                    (unsafe { *can_lr.get_unchecked(b) } >> (((tg as usize) & 3) * 2)) & 3
+                } else {
+                    0
+                };
+                let did = unsafe { *dense_id.get_unchecked(tg as usize) } as u32;
+                *slot = tg | (did << 19) | ((lr as u32) << 30);
+            }
+            TARGET_REMAP_ID_MASK
+        } else if !targets.is_empty() && vocab_n <= (1 << 30) {
             // Pack `lr_bits(tg)` into unused bits 30..32 of `targets[rank]` so
-            // non-linear vocabs (`o200k`, `cl100k`, `gpt2`, SentencePiece) get
-            // `(merged, mlr)` in ONE load instead of a serialized `targets -> can_lr` chain.
+            // non-linear vocabs get `(merged, mlr)` in ONE load.
             for slot in &mut targets {
                 let tg = *slot;
                 let b = (tg as usize) >> 2;
@@ -360,7 +470,10 @@ impl MergeMap {
                 };
                 *slot = tg | ((lr as u32) << 30);
             }
-        }
+            TARGET_ID_MASK
+        } else {
+            u32::MAX
+        };
         let cold_off = if use_packed && cold_nb != 0 { hot_vec.len() } else { 0 };
         let buckets = if use_packed {
             let mut bv = crate::chunk_table::HugeVec::<MergeBucket>::zeroed(hot_vec.len() + cold_vec.len());
@@ -398,6 +511,8 @@ impl MergeMap {
             mask,
             shift,
             dense,
+            dense_id,
+            use_dense_remap,
             has_dense_overflow,
             byte_pair: Vec::new(),
             has_dense_byte_overflow: false,
@@ -407,6 +522,7 @@ impl MergeMap {
             bloom,
             linear_off,
             vocab_n,
+            target_mask,
             targets,
         }
     }
@@ -421,7 +537,10 @@ impl MergeMap {
         merges: &[(u32, u32, u32)],
         monotonic: bool,
     ) -> bool {
-        if self.buckets.is_empty() || singleton.iter().any(|&t| t < 0 || (t as usize) >= self.vocab_n) {
+        if self.buckets.is_empty()
+            || self.use_dense_remap
+            || singleton.iter().any(|&t| t < 0 || (t as usize) >= self.vocab_n)
+        {
             return false;
         }
         let mut rank_tbl = vec![DENSE_NONE; 1 << 16];
@@ -636,10 +755,33 @@ impl MergeMap {
         }
     }
 
+    /// Map a token ID to its dense-matrix slot (`0..DENSE_N` = in dense,
+    /// `DENSE_N` = not in dense). For ByteLevel/linear vocabs (`!use_dense_remap`),
+    /// slot is the identity `t` (`< DENSE_N`).
+    #[inline(always)]
+    fn dense_slot(&self, t: u32) -> u32 {
+        if self.use_dense_remap {
+            self.dense_id.get(t as usize).copied().unwrap_or(DENSE_N as u16) as u32
+        } else {
+            t
+        }
+    }
+
     /// Direct-indexed O(1) lookup in the `DENSE_N × DENSE_N` L2 merge matrix
-    /// for `(t1 | t2) < DENSE_N` (zero hashing, zero Bloom, zero SIMD probing).
+    /// using pre-resolved dense slots `(d1, d2) < DENSE_N` and original IDs `(t1, t2)`
+    /// for rare `DENSE_OVERFLOW` fallback.
     ///
-    /// SAFETY: caller guarantees `t1 < DENSE_N && t2 < DENSE_N`.
+    /// SAFETY: caller guarantees `d1 < DENSE_N && d2 < DENSE_N`.
+    #[inline(always)]
+    unsafe fn lookup_dense_at(&self, d1: u32, d2: u32, t1: u32, t2: u32) -> u32 {
+        let d = *self.dense.get_unchecked(((d1 as usize) << DENSE_BITS) | (d2 as usize));
+        self.decode_dense(d, t1, t2)
+    }
+
+    /// Direct-indexed O(1) lookup in the `DENSE_N × DENSE_N` L2 merge matrix
+    /// for `(t1 | t2) < DENSE_N` (identity dense slots, `!use_dense_remap`).
+    ///
+    /// SAFETY: caller guarantees `!self.use_dense_remap && t1 < DENSE_N && t2 < DENSE_N`.
     #[inline(always)]
     unsafe fn lookup_dense(&self, t1: u32, t2: u32) -> u32 {
         let d = *self.dense.get_unchecked(((t1 as usize) << DENSE_BITS) | (t2 as usize));
@@ -705,24 +847,26 @@ impl MergeMap {
             rank.wrapping_add(self.linear_off)
         } else {
             // SAFETY: rank came from a valid entry in this MergeMap.
-            let raw = unsafe { *self.targets.get_unchecked(rank as usize) };
-            if self.vocab_n <= (1 << 30) { raw & TARGET_ID_MASK } else { raw }
+            (unsafe { *self.targets.get_unchecked(rank as usize) }) & self.target_mask
         }
     }
 
-    /// Resolve a valid merge `rank` to `(target_id, lr_bits(target_id))` in a
-    /// single load when `!linear_off` (eliminates the dependent `can_lr` load).
+    /// Resolve a valid merge `rank` to `(target_id, dense_slot, lr_bits)` in a
+    /// single load when `use_dense_remap` is true (SentencePiece / non-linear vocabs).
     ///
-    /// SAFETY: caller guarantees `rank` is valid and `self.vocab_n <= (1 << 30)`
-    /// (both hold for all packed-table merges).
+    /// SAFETY: caller guarantees `rank` is valid and `!self.buckets.is_empty()`.
     #[inline(always)]
-    unsafe fn target_and_lr_unchecked(&self, rank: u32) -> (u32, u8) {
-        if self.linear_off != u32::MAX {
+    unsafe fn target_did_lr_unchecked(&self, rank: u32) -> (u32, u32, u8) {
+        if self.use_dense_remap {
+            let raw = *self.targets.get_unchecked(rank as usize);
+            (raw & TARGET_REMAP_ID_MASK, (raw >> 19) & 0x7FF, (raw >> 30) as u8)
+        } else if self.linear_off != u32::MAX {
             let m = rank.wrapping_add(self.linear_off);
-            (m, self.lr_bits_unchecked(m))
+            (m, m.min(DENSE_N), self.lr_bits_unchecked(m))
         } else {
             let raw = *self.targets.get_unchecked(rank as usize);
-            (raw & TARGET_ID_MASK, (raw >> 30) as u8)
+            let m = raw & TARGET_ID_MASK;
+            (m, m.min(DENSE_N), (raw >> 30) as u8)
         }
     }
 
@@ -900,9 +1044,11 @@ impl MergeMap {
 
     #[inline(always)]
     pub fn lookup_rank(&self, t1: u32, t2: u32) -> u32 {
-        if (t1 | t2) < DENSE_N {
-            // SAFETY: t1, t2 < DENSE_N, so index < dense.len().
-            return unsafe { self.lookup_dense(t1, t2) };
+        let d1 = self.dense_slot(t1);
+        let d2 = self.dense_slot(t2);
+        if (d1 | d2) < DENSE_N {
+            // SAFETY: d1, d2 < DENSE_N, so index < dense.len().
+            return unsafe { self.lookup_dense_at(d1, d2, t1, t2) };
         } else if !self.can_merge(t1, t2) {
             return u32::MAX;
         }
@@ -976,8 +1122,10 @@ impl MergeMap {
         const AMBIG: u32 = u32::MAX - 1;
         let packed = !self.buckets.is_empty();
         let lookup_fast = |t1: u32, t2: u32| -> u32 {
-            if (t1 | t2) < DENSE_N {
-                return unsafe { self.lookup_dense(t1, t2) };
+            let d1 = self.dense_slot(t1);
+            let d2 = self.dense_slot(t2);
+            if (d1 | d2) < DENSE_N {
+                return unsafe { self.lookup_dense_at(d1, d2, t1, t2) };
             } else if !self.can_merge(t1, t2) {
                 return u32::MAX;
             }
@@ -1330,173 +1478,358 @@ fn bpe_x86_tier() -> u8 {
     detected
 }
 
-/// Stack doubly-linked-list canonical BPE merge with zero-STLF `active: u64`
-/// bitmask min-reduction and 64B cache-line SIMD bucket probing.
+/// Stack doubly-linked-list canonical BPE merge with frequency-ranked `dense`
+/// slots (`did[64]` unpacked from `targets[rank]` in 1 load), stack `lr[65]`
+/// sentinel cache, overlapped `dense`/`bloom` loads, OOO latency-hiding 2-way
+/// ILP `active: u64` min-reduction, and 64B cache-line SIMD bucket probing.
 macro_rules! merge_small_ll_body {
     ($tokens:expr, $map:expr, $probe:ident) => {{
         let n = $tokens.len();
         debug_assert!((2..=MAX_SMALL).contains(&n) && !$map.buckets.is_empty());
         if n == 2 {
-            let r = $map.lookup_rank(*$tokens.get_unchecked(0), *$tokens.get_unchecked(1));
+            let t0 = *$tokens.get_unchecked(0);
+            let t1 = *$tokens.get_unchecked(1);
+            let d0 = $map.dense_slot(t0);
+            let d1 = $map.dense_slot(t1);
+            let r = if (d0 | d1) < DENSE_N {
+                $map.lookup_dense_at(d0, d1, t0, t1)
+            } else if $map.can_merge(t0, t1) {
+                let kh = MergeMap::pack_key(t0, t1);
+                let h = MergeMap::hash_packed(kh);
+                let b = $map.bucket_of(t0, t1, h);
+                if $map.bloom_may_contain_b(h, b) { $map.$probe(kh, b) } else { u32::MAX }
+            } else {
+                u32::MAX
+            };
             if r != u32::MAX {
                 *$tokens.get_unchecked_mut(0) = $map.target(r);
                 $tokens.truncate(1);
             }
             return;
         }
+        if n == 3 {
+            let t0 = *$tokens.get_unchecked(0);
+            let t1 = *$tokens.get_unchecked(1);
+            let t2 = *$tokens.get_unchecked(2);
+            let d0 = $map.dense_slot(t0);
+            let d1 = $map.dense_slot(t1);
+            let d2 = $map.dense_slot(t2);
+            let (r0, r1) = if (d0 | d1 | d2) < DENSE_N {
+                let dp = $map.dense.as_ptr();
+                let v0 = *dp.add(((d0 as usize) << DENSE_BITS) | (d1 as usize));
+                let v1 = *dp.add(((d1 as usize) << DENSE_BITS) | (d2 as usize));
+                ($map.decode_dense(v0, t0, t1), $map.decode_dense(v1, t1, t2))
+            } else {
+                let r0 = if (d0 | d1) < DENSE_N {
+                    $map.lookup_dense_at(d0, d1, t0, t1)
+                } else if $map.can_merge(t0, t1) {
+                    let kh = MergeMap::pack_key(t0, t1);
+                    let h = MergeMap::hash_packed(kh);
+                    let b = $map.bucket_of(t0, t1, h);
+                    if $map.bloom_may_contain_b(h, b) { $map.$probe(kh, b) } else { u32::MAX }
+                } else {
+                    u32::MAX
+                };
+                let r1 = if (d1 | d2) < DENSE_N {
+                    $map.lookup_dense_at(d1, d2, t1, t2)
+                } else if $map.can_merge(t1, t2) {
+                    let kh = MergeMap::pack_key(t1, t2);
+                    let h = MergeMap::hash_packed(kh);
+                    let b = $map.bucket_of(t1, t2, h);
+                    if $map.bloom_may_contain_b(h, b) { $map.$probe(kh, b) } else { u32::MAX }
+                } else {
+                    u32::MAX
+                };
+                (r0, r1)
+            };
+            if r0 == u32::MAX && r1 == u32::MAX {
+                return;
+            }
+            let (a, b) = if r0 <= r1 {
+                ($map.target(r0), t2)
+            } else {
+                (t0, $map.target(r1))
+            };
+            let r2 = $map.lookup_rank(a, b);
+            if r2 != u32::MAX {
+                *$tokens.get_unchecked_mut(0) = $map.target(r2);
+                $tokens.truncate(1);
+            } else {
+                *$tokens.get_unchecked_mut(0) = a;
+                *$tokens.get_unchecked_mut(1) = b;
+                $tokens.truncate(2);
+            }
+            return;
+        }
         let mut tok_buf = std::mem::MaybeUninit::<[u32; MAX_SMALL]>::uninit();
+        let mut did_buf = std::mem::MaybeUninit::<[u16; MAX_SMALL]>::uninit();
+        let mut lr_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL + 1]>::uninit();
         let tok = tok_buf.as_mut_ptr() as *mut u32;
-        let mut or_all = 0u32;
+        let did = did_buf.as_mut_ptr() as *mut u16;
+        let lr = lr_buf.as_mut_ptr() as *mut u8;
+        let mut or_did = 0u32;
         for i in 0..n {
             let t = *$tokens.get_unchecked(i);
+            let d = $map.dense_slot(t);
             *tok.add(i) = t;
-            or_all |= t;
+            *did.add(i) = d.min(DENSE_N) as u16;
+            *lr.add(i) = $map.lr_bits(t);
+            or_did |= d;
         }
         let nr = n - 1;
         let mut rnk_buf = std::mem::MaybeUninit::<[u32; MAX_SMALL]>::uninit();
         let rnk = rnk_buf.as_mut_ptr() as *mut u32;
         let mut best = u32::MAX;
         let mut active = 0u64;
-        if or_all < DENSE_N {
+        if or_did < DENSE_N {
             let dense = $map.dense.as_ptr();
             if !$map.has_dense_overflow {
+                let mut d0 = *did as usize;
                 for i in 0..nr {
-                    let a = *tok.add(i) as usize;
-                    let b = *tok.add(i + 1) as usize;
-                    let d = *dense.add((a << DENSE_BITS) | b);
-                    if d != DENSE_NONE {
-                        let p = ((d as u32) << 6) | (i as u32);
-                        *rnk.add(i) = p;
-                        active |= 1u64 << i;
-                        best = best.min(p);
-                    }
+                    let d1 = *did.add(i + 1) as usize;
+                    let v = *dense.add((d0 << DENSE_BITS) | d1);
+                    let valid = v != DENSE_NONE;
+                    let p = ((v as u32) << 6) | (i as u32);
+                    *rnk.add(i) = p;
+                    active |= (valid as u64) << i;
+                    best = best.min(if valid { p } else { u32::MAX });
+                    d0 = d1;
                 }
             } else {
+                let mut d0 = *did as usize;
                 for i in 0..nr {
-                    let a = *tok.add(i);
-                    let b = *tok.add(i + 1);
-                    let d = *dense.add(((a as usize) << DENSE_BITS) | (b as usize));
-                    let r = if d < DENSE_OVERFLOW {
-                        d as u32
-                    } else if d == DENSE_NONE {
+                    let d1 = *did.add(i + 1) as usize;
+                    let v = *dense.add((d0 << DENSE_BITS) | d1);
+                    let r = if v < DENSE_OVERFLOW {
+                        v as u32
+                    } else if v == DENSE_NONE {
                         u32::MAX
                     } else {
-                        $map.probe_dense_overflow(a, b)
+                        $map.probe_dense_overflow(*tok.add(i), *tok.add(i + 1))
                     };
-                    if r != u32::MAX {
-                        let p = (r << 6) | (i as u32);
-                        *rnk.add(i) = p;
-                        active |= 1u64 << i;
-                        best = best.min(p);
-                    }
+                    let valid = r != u32::MAX;
+                    let p = (r << 6) | (i as u32);
+                    *rnk.add(i) = p;
+                    active |= (valid as u64) << i;
+                    best = best.min(if valid { p } else { u32::MAX });
+                    d0 = d1;
                 }
             }
         } else {
             for i in 0..nr {
-                let r = $map.lookup_rank(*tok.add(i), *tok.add(i + 1));
-                if r != u32::MAX {
-                    let p = (r << 6) | (i as u32);
-                    *rnk.add(i) = p;
-                    active |= 1u64 << i;
-                    best = best.min(p);
-                }
+                let t0 = *tok.add(i);
+                let t1 = *tok.add(i + 1);
+                let d0 = *did.add(i) as u32;
+                let d1 = *did.add(i + 1) as u32;
+                let r = if (d0 | d1) < DENSE_N {
+                    $map.lookup_dense_at(d0, d1, t0, t1)
+                } else if ((*lr.add(i) & 1) & (*lr.add(i + 1) >> 1)) != 0 {
+                    let kh = MergeMap::pack_key(t0, t1);
+                    let h = MergeMap::hash_packed(kh);
+                    let b = $map.bucket_of(t0, t1, h);
+                    if $map.bloom_may_contain_b(h, b) {
+                        $map.$probe(kh, b)
+                    } else {
+                        u32::MAX
+                    }
+                } else {
+                    u32::MAX
+                };
+                let valid = r != u32::MAX;
+                let p = (r << 6) | (i as u32);
+                *rnk.add(i) = p;
+                active |= (valid as u64) << i;
+                best = best.min(if valid { p } else { u32::MAX });
             }
         }
         if active == 0 {
             return;
         }
+        // Sentinels: prev[0] == MAX_SMALL and next[last] == n both map to lr == 0.
+        *lr.add(n) = 0;
+        *lr.add(MAX_SMALL) = 0;
         let mut prev_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL + 1]>::uninit();
         let mut next_buf = std::mem::MaybeUninit::<[u8; MAX_SMALL]>::uninit();
         let prev = prev_buf.as_mut_ptr() as *mut u8;
         let next = next_buf.as_mut_ptr() as *mut u8;
-        std::ptr::copy_nonoverlapping(INIT_PREV.as_ptr(), prev, n);
-        std::ptr::copy_nonoverlapping(INIT_NEXT.as_ptr(), next, n);
+        if n <= 16 {
+            std::ptr::copy_nonoverlapping(INIT_PREV.as_ptr(), prev, 16);
+            std::ptr::copy_nonoverlapping(INIT_NEXT.as_ptr(), next, 16);
+        } else if n <= 32 {
+            std::ptr::copy_nonoverlapping(INIT_PREV.as_ptr(), prev, 32);
+            std::ptr::copy_nonoverlapping(INIT_NEXT.as_ptr(), next, 32);
+        } else {
+            std::ptr::copy_nonoverlapping(INIT_PREV.as_ptr(), prev, 64);
+            std::ptr::copy_nonoverlapping(INIT_NEXT.as_ptr(), next, 64);
+        }
         loop {
             let rank = best >> 6;
             let bi = (best & 63) as usize;
-            let (merged, mlr) = $map.target_and_lr_unchecked(rank);
+            let (merged, mdid, mlr) = $map.target_did_lr_unchecked(rank);
             let r = *next.add(bi) as usize;
             let rr = *next.add(r) as usize;
             *tok.add(bi) = merged;
+            *did.add(bi) = mdid as u16;
             *next.add(bi) = rr as u8;
             *prev.add(rr) = bi as u8;
-            if bi == 0 && rr == n {
+            if (bi | (rr ^ n)) == 0 {
                 break;
             }
             let l = *prev.add(bi) as usize;
-            // When bi == 0, prev[0] == MAX_SMALL == 64; wrapping_shl(64) == 1 << 0 == 1 << bi,
-            // which is already cleared (becomes 3 parallel BMI2 `shlx` with zero cmove).
             active &= !((1u64 << r) | (1u64 << bi) | 1u64.wrapping_shl(l as u32));
-            if mlr != 0 {
-                let do_l = bi != 0 && (mlr & 2) != 0 && ($map.lr_bits(*tok.add(l)) & 1) != 0;
-                let do_r = rr < n && (mlr & 1) != 0 && ($map.lr_bits(*tok.add(rr)) & 2) != 0;
-                let (rl, rr_val) = if merged >= DENSE_N {
-                    let mut idx_l = usize::MAX;
-                    let mut idx_r = usize::MAX;
-                    let mut kh_l = 0u64;
-                    let mut kh_r = 0u64;
-                    if do_l {
-                        let tl = *tok.add(l);
-                        kh_l = MergeMap::pack_key(tl, merged);
-                        let hl = MergeMap::hash_packed(kh_l);
-                        let b = $map.bucket_of(tl, merged, hl);
-                        if $map.bloom_may_contain_b(hl, b) {
-                            idx_l = b;
-                        }
-                    }
-                    if do_r {
-                        let tr = *tok.add(rr);
-                        kh_r = MergeMap::pack_key(merged, tr);
+            *lr.add(bi) = mlr;
+            let (rl, rr_val) = if mlr != 0 {
+                let do_l = ((mlr >> 1) & *lr.add(l) & 1) != 0;
+                let do_r = (mlr & (*lr.add(rr) >> 1) & 1) != 0;
+                if do_l && do_r {
+                    let tl = *tok.add(l);
+                    let tr = *tok.add(rr);
+                    let dl_did = *did.add(l) as u32;
+                    let dr_did = *did.add(rr) as u32;
+                    if (mdid | dl_did | dr_did) < DENSE_N {
+                        let dp = $map.dense.as_ptr();
+                        let vl = *dp.add(((dl_did as usize) << DENSE_BITS) | (mdid as usize));
+                        let vr = *dp.add(((mdid as usize) << DENSE_BITS) | (dr_did as usize));
+                        ($map.decode_dense(vl, tl, merged), $map.decode_dense(vr, merged, tr))
+                    } else if (dl_did | mdid) < DENSE_N {
+                        let kh_r = MergeMap::pack_key(merged, tr);
                         let hr = MergeMap::hash_packed(kh_r);
-                        let b = $map.bucket_of(merged, tr, hr);
-                        if $map.bloom_may_contain_b(hr, b) {
-                            idx_r = b;
+                        let b_r = $map.bucket_of(merged, tr, hr);
+                        let wr = *$map.bloom.get_unchecked(b_r);
+                        let vl = *$map.dense.get_unchecked(((dl_did as usize) << DENSE_BITS) | (mdid as usize));
+                        let rl = $map.decode_dense(vl, tl, merged);
+                        let rr_v = if MergeMap::bloom_hit(wr, hr) {
+                            $map.$probe(kh_r, b_r)
+                        } else {
+                            u32::MAX
+                        };
+                        (rl, rr_v)
+                    } else if (mdid | dr_did) < DENSE_N {
+                        let kh_l = MergeMap::pack_key(tl, merged);
+                        let hl = MergeMap::hash_packed(kh_l);
+                        let b_l = $map.bucket_of(tl, merged, hl);
+                        let wl = *$map.bloom.get_unchecked(b_l);
+                        let vr = *$map.dense.get_unchecked(((mdid as usize) << DENSE_BITS) | (dr_did as usize));
+                        let rr_v = $map.decode_dense(vr, merged, tr);
+                        let rl = if MergeMap::bloom_hit(wl, hl) {
+                            $map.$probe(kh_l, b_l)
+                        } else {
+                            u32::MAX
+                        };
+                        (rl, rr_v)
+                    } else {
+                        let kh_l = MergeMap::pack_key(tl, merged);
+                        let kh_r = MergeMap::pack_key(merged, tr);
+                        let hl = MergeMap::hash_packed(kh_l);
+                        let hr = MergeMap::hash_packed(kh_r);
+                        let b_l = $map.bucket_of(tl, merged, hl);
+                        let b_r = $map.bucket_of(merged, tr, hr);
+                        let bp = $map.bloom.as_ptr();
+                        let wl = *bp.add(b_l);
+                        let wr = *bp.add(b_r);
+                        let ok_l = MergeMap::bloom_hit(wl, hl);
+                        let ok_r = MergeMap::bloom_hit(wr, hr);
+                        if ok_l && ok_r {
+                            $map.prefetch_bucket_packed(b_r);
+                            ($map.$probe(kh_l, b_l), $map.$probe(kh_r, b_r))
+                        } else {
+                            (
+                                if ok_l { $map.$probe(kh_l, b_l) } else { u32::MAX },
+                                if ok_r { $map.$probe(kh_r, b_r) } else { u32::MAX },
+                            )
                         }
                     }
-                    if idx_l != usize::MAX && idx_r != usize::MAX {
-                        $map.prefetch_bucket_packed(idx_l);
-                        $map.prefetch_bucket_packed(idx_r);
-                        ($map.$probe(kh_l, idx_l), $map.$probe(kh_r, idx_r))
+                } else if do_l {
+                    let tl = *tok.add(l);
+                    let dl_did = *did.add(l) as u32;
+                    let rl = if (dl_did | mdid) < DENSE_N {
+                        $map.lookup_dense_at(dl_did, mdid, tl, merged)
                     } else {
-                        (
-                            if idx_l != usize::MAX { $map.$probe(kh_l, idx_l) } else { u32::MAX },
-                            if idx_r != usize::MAX { $map.$probe(kh_r, idx_r) } else { u32::MAX },
-                        )
-                    }
+                        let kh_l = MergeMap::pack_key(tl, merged);
+                        let hl = MergeMap::hash_packed(kh_l);
+                        let b_l = $map.bucket_of(tl, merged, hl);
+                        if $map.bloom_may_contain_b(hl, b_l) {
+                            $map.$probe(kh_l, b_l)
+                        } else {
+                            u32::MAX
+                        }
+                    };
+                    (rl, u32::MAX)
+                } else if do_r {
+                    let tr = *tok.add(rr);
+                    let dr_did = *did.add(rr) as u32;
+                    let rr_v = if (mdid | dr_did) < DENSE_N {
+                        $map.lookup_dense_at(mdid, dr_did, merged, tr)
+                    } else {
+                        let kh_r = MergeMap::pack_key(merged, tr);
+                        let hr = MergeMap::hash_packed(kh_r);
+                        let b_r = $map.bucket_of(merged, tr, hr);
+                        if $map.bloom_may_contain_b(hr, b_r) {
+                            $map.$probe(kh_r, b_r)
+                        } else {
+                            u32::MAX
+                        }
+                    };
+                    (u32::MAX, rr_v)
                 } else {
-                    (
-                        if do_l { $map.lookup_rank(*tok.add(l), merged) } else { u32::MAX },
-                        if do_r { $map.lookup_rank(merged, *tok.add(rr)) } else { u32::MAX },
-                    )
-                };
-                if rl != u32::MAX {
-                    *rnk.add(l) = (rl << 6) | (l as u32);
-                    active |= 1u64 << l;
+                    (u32::MAX, u32::MAX)
                 }
-                if rr_val != u32::MAX {
-                    *rnk.add(bi) = (rr_val << 6) | (bi as u32);
-                    active |= 1u64 << bi;
+            } else {
+                (u32::MAX, u32::MAX)
+            };
+            // OOO latency-hiding 2-way ILP min-reduction of untouched `active`.
+            let mut m = active;
+            best = if m != 0 {
+                let i0 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let mut b0 = *rnk.add(i0);
+                if m != 0 {
+                    let i1 = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let mut b1 = *rnk.add(i1);
+                    while m != 0 {
+                        let ia = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        b0 = b0.min(*rnk.add(ia));
+                        if m == 0 {
+                            break;
+                        }
+                        let ib = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        b1 = b1.min(*rnk.add(ib));
+                    }
+                    b0.min(b1)
+                } else {
+                    b0
                 }
+            } else {
+                u32::MAX
+            };
+            if rl != u32::MAX {
+                let p = (rl << 6) | (l as u32);
+                *rnk.add(l) = p;
+                active |= 1u64 << l;
+                best = best.min(p);
+            }
+            if rr_val != u32::MAX {
+                let p = (rr_val << 6) | (bi as u32);
+                *rnk.add(bi) = p;
+                active |= 1u64 << bi;
+                best = best.min(p);
             }
             if active == 0 {
                 break;
             }
-            let mut m = active;
-            let i0 = m.trailing_zeros() as usize;
-            m &= m - 1;
-            best = *rnk.add(i0);
-            while m != 0 {
-                let i = m.trailing_zeros() as usize;
-                m &= m - 1;
-                best = best.min(*rnk.add(i));
-            }
         }
         $tokens.clear();
+        let mut wp = $tokens.as_mut_ptr();
         let mut cur = 0usize;
         while cur < n {
-            $tokens.push(*tok.add(cur));
+            *wp = *tok.add(cur);
+            wp = wp.add(1);
             cur = *next.add(cur) as usize;
         }
+        $tokens.set_len(wp.offset_from($tokens.as_ptr()) as usize);
     }};
 }
 
@@ -2334,8 +2667,8 @@ pub fn merge_canonical(tokens: &mut Vec<u32>, map: &MergeMap, s: &mut CanonScrat
         s.prev.push(if i == 0 { none } else { (i - 1) as u32 });
         s.next.push((i + 1) as u32); // next[n - 1] == n == none
     }
-    // Initial adjacent-pair ranks: direct L2 dense table when all tokens < DENSE_N.
-    if or_all < DENSE_N {
+    // Initial adjacent-pair ranks: direct L2 dense table when all tokens < DENSE_N (unremapped).
+    if !map.use_dense_remap && or_all < DENSE_N {
         let dense = map.dense.as_ptr();
         for i in 0..n - 1 {
             let a = unsafe { *tokens.get_unchecked(i) };

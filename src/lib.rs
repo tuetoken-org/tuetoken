@@ -4098,17 +4098,113 @@ impl Tokenizer {
     }
 
     /// Zero-allocation SIMD-chunked, `SharedTable`-pipelined SentencePiece encoder.
-    /// Returns `true` if handled, or `false` if `text` contains a literal `'▁'`
-    /// (caller falls back to exact `normalizer.apply` + `encode_meta_char`).
+    /// Clean spans containing no literal `'▁'` run through the full SIMD pipeline;
+    /// rare literal `'▁'` words are isolated to their exact surrounding safe space
+    /// boundaries and routed to the exact normalizer/metaspace fallback so one
+    /// literal `'▁'` in a 5 MB corpus never degrades the entire document.
     fn encode_sp_fast(&self, text: &str, prepend: bool, is_doc_start: bool, s: &mut Scratch) -> bool {
         if text.is_empty() {
             return true;
         }
         let bytes = text.as_bytes();
+        let Some(first_u) = memchr::memmem::find(bytes, "\u{2581}".as_bytes()) else {
+            return self.encode_sp_fast_clean(bytes, prepend, is_doc_start, s);
+        };
         let n = bytes.len();
-        // Literal `'▁'` in raw text is rare (~0.0001%); fall back to exact normalizer path.
-        if memchr::memmem::find(bytes, "\u{2581}".as_bytes()).is_some() {
-            return false;
+        let cross = &self.sp_cross_prev;
+        let is_safe_split = |p: usize| -> bool {
+            if p == 0 || p >= n || bytes[p] != b' ' {
+                return false;
+            }
+            let prev = bytes[p - 1];
+            prev < 0x80 && prev != b' ' && ((cross[(prev as usize) >> 6] >> (prev & 63)) & 1) == 0
+        };
+        let mut start = 0usize;
+        let mut cur_u = first_u;
+        loop {
+            // Walk back from `cur_u` to the nearest proven-safe `' '` boundary > `start`.
+            let mut safe_a = start;
+            let mut search_end = cur_u;
+            while search_end > start {
+                match memchr::memrchr(b' ', &bytes[start..search_end]) {
+                    Some(rel) => {
+                        let p = start + rel;
+                        if p > start && is_safe_split(p) {
+                            safe_a = p;
+                            break;
+                        }
+                        search_end = p;
+                    }
+                    None => break,
+                }
+            }
+            if safe_a > start {
+                self.encode_sp_fast_clean(
+                    &bytes[start..safe_a],
+                    prepend && start == 0,
+                    is_doc_start && start == 0,
+                    s,
+                );
+            }
+            // Walk forward past `cur_u + 3` to the nearest proven-safe `' '` boundary,
+            // merging any adjacent literal `'▁'`s within the same fallback window.
+            let mut scan = cur_u + 3;
+            let safe_b = loop {
+                let cand = match memchr::memchr(b' ', &bytes[scan..]) {
+                    Some(rel) => {
+                        let p = scan + rel;
+                        if is_safe_split(p) {
+                            p
+                        } else {
+                            scan = p + 1;
+                            continue;
+                        }
+                    }
+                    None => n,
+                };
+                if let Some(rel_u) = memchr::memmem::find(&bytes[cur_u + 3..cand], "\u{2581}".as_bytes()) {
+                    cur_u = cur_u + 3 + rel_u;
+                    scan = cur_u + 3;
+                    continue;
+                }
+                break cand;
+            };
+            let sub = &text[safe_a..safe_b];
+            if safe_a == 0 && is_doc_start {
+                let norm = self.normalize(sub);
+                self.encode_into_norm(norm.as_ref(), Merge::Auto, prepend, s);
+            } else {
+                match self.sp_fast_meta {
+                    SpFastMeta::NormPrependAlways | SpFastMeta::NormNoPrepend => {
+                        let replaced = sub.replace(' ', "\u{2581}");
+                        self.encode_into_norm(&replaced, Merge::Auto, false, s);
+                    }
+                    SpFastMeta::Metaspace { .. } => {
+                        self.encode_into_norm(sub, Merge::Auto, false, s);
+                    }
+                    SpFastMeta::None => return false,
+                }
+            }
+            start = safe_b;
+            if start >= n {
+                break;
+            }
+            match memchr::memmem::find(&bytes[start..], "\u{2581}".as_bytes()) {
+                Some(rel) => cur_u = start + rel,
+                None => {
+                    self.encode_sp_fast_clean(&bytes[start..], false, false, s);
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    /// SIMD-chunked SentencePiece fast path for a `'▁'`-free byte slice.
+    fn encode_sp_fast_clean(&self, bytes: &[u8], prepend: bool, is_doc_start: bool, s: &mut Scratch) -> bool {
+        let n = bytes.len();
+        if n == 0 {
+            return true;
         }
         let need_prepend = match self.sp_fast_meta {
             SpFastMeta::NormPrependAlways => is_doc_start,
@@ -5831,7 +5927,9 @@ impl Tokenizer {
                 if let Some(rel) = memchr::memchr(b' ', &b[i..lim]) {
                     let p = i + rel;
                     let prev = b[p - 1];
-                    if prev != b' ' && ((cross[(prev as usize) >> 6] >> (prev & 63)) & 1) == 0 {
+                    // Require ASCII `prev < 0x80` so a split never lands directly after a
+                    // literal `'▁'` (`0xE2 0x96 0x81`) followed by `' '` (which becomes `"▁▁"`).
+                    if prev < 0x80 && prev != b' ' && ((cross[(prev as usize) >> 6] >> (prev & 63)) & 1) == 0 {
                         found = Some(p);
                         break;
                     }
@@ -6077,13 +6175,9 @@ impl Tokenizer {
             let b: &[u8] = d;
             if splittable && b.len() >= SPLIT_MIN {
                 if self.sp_fast_meta != SpFastMeta::None {
-                    if memchr::memmem::find(b, "\u{2581}".as_bytes()).is_none() {
-                        let pts = Self::split_points_sp(b, seg_bytes, &self.sp_cross_prev);
-                        for w in pts.windows(2) {
-                            items.push((i as u32, w[0], w[1], true));
-                        }
-                    } else {
-                        items.push((i as u32, 0, b.len(), false));
+                    let pts = Self::split_points_sp(b, seg_bytes, &self.sp_cross_prev);
+                    for w in pts.windows(2) {
+                        items.push((i as u32, w[0], w[1], true));
                     }
                 } else if self.fast_pretok == FastPretok::Cjk && !defer_norm {
                     let pts = Self::split_points_cjk(b, seg_bytes);
@@ -7535,11 +7629,11 @@ impl Tokenizer {
         };
         let (mut map, monotonic) = if allow_par {
             rayon::join(
-                || bpe::MergeMap::new_with_parallel(&merges, true),
+                || bpe::MergeMap::new_with_opts(&merges, true, byte_fallback),
                 check_monotonic,
             )
         } else {
-            (bpe::MergeMap::new(&merges), check_monotonic())
+            (bpe::MergeMap::new_with_opts(&merges, false, byte_fallback), check_monotonic())
         };
 
         let ignore_lookup = if ignore_merges {
@@ -7955,11 +8049,11 @@ impl Tokenizer {
         };
         let (mut map, monotonic) = if allow_par {
             rayon::join(
-                || bpe::MergeMap::new_with_parallel(&merges, true),
+                || bpe::MergeMap::new_with_opts(&merges, true, byte_fallback),
                 check_monotonic,
             )
         } else {
-            (bpe::MergeMap::new(&merges), check_monotonic())
+            (bpe::MergeMap::new_with_opts(&merges, false, byte_fallback), check_monotonic())
         };
 
         let ignore_lookup = if ignore_merges {
