@@ -60,6 +60,7 @@ INK = "#0F172A"
 BLUE = "#1D4ED8"
 ORANGE = "#E4572E"
 GRAY_BAR = "#CBD5E1"
+GRAY_EDGE = "#94A3B8"
 TICK = "#64748B"
 BASELINE = "#E2E8F0"
 GRID = "#EEF2F7"
@@ -201,14 +202,16 @@ fig.text(ML, 0.873, "Identical token IDs across all five libraries",
 CHART_TOP = 0.778
 CHART_BOT = 0.258
 
-# 1) HERO PANEL: Cold 1 GB corpus scaling (~45% of width including direct labels)
-# Axes stop cleanly at 14 threads so gridlines & baseline don't run under labels.
-ax_hero = fig.add_axes([0.088, CHART_BOT, 0.285, CHART_TOP - CHART_BOT])
+# 1) HERO PANEL: Cold 1 GB corpus scaling (~45% width including direct labels)
+ax_hero = fig.add_axes([0.088, CHART_BOT, 0.280, CHART_TOP - CHART_BOT])
 cold = R["corpus"]["cold"]
 th_t = np.array([p["threads"] for p in cold["tuetoken"]])
 gb_t = np.array([p["mbps"] / 1000.0 for p in cold["tuetoken"]])
 th_g = np.array([p["threads"] for p in cold["gigatoken"]])
 gb_g = np.array([p["mbps"] / 1000.0 for p in cold["gigatoken"]])
+ft_14 = cold["fastokens"][-1]["mbps"] / 1000.0
+tk_14 = cold["tiktoken"][-1]["mbps"]
+hf_14 = cold["hf"][-1]["mbps"]
 
 ax_hero.set_xlim(0.5, 14.35)
 ax_hero.set_ylim(0.0, 4.88)
@@ -221,6 +224,13 @@ clean_spines(ax_hero, baseline="bottom", hgrid=True)
 ax_hero.fill_between(th_t, gb_g, gb_t, color=BLUE, alpha=0.085, zorder=2)
 ax_hero.plot(th_t, gb_t, color=BLUE, lw=3.0, solid_capstyle="round", zorder=4)
 ax_hero.plot(th_g, gb_g, color=ORANGE, lw=1.75, solid_capstyle="round", zorder=3.5)
+# Subtle gray lines for fastokens, tiktoken, and HF tokenizers
+ax_hero.hlines(ft_14, 1.0, 14.0, color=GRAY_BAR, lw=1.25, linestyles="--", zorder=2.5)
+ax_hero.plot([p["threads"] for p in cold["tiktoken"]], [p["mbps"] / 1000.0 for p in cold["tiktoken"]],
+             color=GRAY_BAR, lw=1.4, zorder=2.6)
+ax_hero.plot([p["threads"] for p in cold["hf"]], [p["mbps"] / 1000.0 for p in cold["hf"]],
+             color=GRAY_BAR, lw=1.1, zorder=2.4)
+
 ax_hero.scatter([th_t[-1]], [gb_t[-1]], s=38, color=BLUE, zorder=5, clip_on=False)
 ax_hero.scatter([th_g[-1]], [gb_g[-1]], s=26, color=ORANGE, zorder=4.5, clip_on=False)
 
@@ -231,29 +241,34 @@ ax_hero.text(lx_end, gb_t[-1] + 0.04, "4.50 GB/s", fontsize=11, fontweight=W_BOL
 ax_hero.text(lx_end, gb_t[-1] - 0.05, "tuetoken", fontsize=9.5, fontweight=W_SEMI,
              color=BLUE, va="top", clip_on=False)
 
+# Industry speedup callout cleanly beside the gap, no arrow
+ax_hero.text(
+    lx_end, 3.16,
+    f"{gb_t[-1] / gb_g[-1]:.1f}× vs gigatoken\n"
+    f"{cold['tuetoken'][-1]['mbps'] / tk_14:.0f}× vs tiktoken\n"
+    f"{cold['tuetoken'][-1]['mbps'] / hf_14:.0f}× vs HF",
+    fontsize=9.8, fontweight=W_SEMI, color=BLUE, va="center", ha="left",
+    linespacing=1.42, clip_on=False,
+)
+
 ax_hero.text(lx_end, gb_g[-1] + 0.04, "1.79 GB/s", fontsize=11, fontweight=W_SEMI,
              color=ORANGE, va="bottom", clip_on=False)
 ax_hero.text(lx_end, gb_g[-1] - 0.05, "gigatoken", fontsize=9.5, fontweight=W_REG,
              color=ORANGE, va="top", clip_on=False)
 
-# One gap annotation only, beside the gap, no arrow
-ax_hero.text(
-    lx_end, 0.5 * (gb_t[-1] + gb_g[-1]),
-    "2.5× faster\nat 14 threads",
-    fontsize=10.5, fontweight=W_SEMI, color=BLUE, va="center", ha="left",
-    linespacing=1.25, clip_on=False,
-)
-
-# Single gray label near the baseline, no separate markers
-ax_hero.hlines(0.58, 1.0, 14.0, color=GRAY_BAR, lw=1.15, linestyles="--", zorder=2.5)
-ax_hero.text(14.0, 0.28, "others < 0.6 GB/s", fontsize=9.2, fontweight=W_REG,
-             color=TICK, ha="right", va="center")
+# Direct gray labels for fastokens, tiktoken, and HF tokenizers at line ends
+ax_hero.text(lx_end, ft_14, f"{ft_14:.2f} GB/s  fastokens", fontsize=9.0, fontweight=W_REG,
+             color=TICK, va="center", clip_on=False)
+ax_hero.text(lx_end, 0.24, f"{tk_14:.0f} MB/s  tiktoken", fontsize=9.0, fontweight=W_REG,
+             color=TICK, va="center", clip_on=False)
+ax_hero.text(lx_end, -0.02, f"{hf_14:.0f} MB/s  HF tokenizers", fontsize=9.0, fontweight=W_REG,
+             color=TICK, va="center", clip_on=False)
 
 fig.text(0.088, CHART_TOP + 0.024, "Cold 1 GB corpus scaling",
          fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
 
 # 2) THROUGHPUT PANEL: LLM tokenizer throughput (top-right, wide)
-RIGHT_AX_L = 0.578
+RIGHT_AX_L = 0.585
 ax_thr = fig.add_axes([RIGHT_AX_L, 0.542, MR - RIGHT_AX_L, CHART_TOP - 0.542])
 fr = sorted(R["frontier"], key=lambda r: r["tuetoken"], reverse=True)
 n_fr = len(fr)
@@ -267,7 +282,6 @@ ax_thr.set_xticklabels(["0", "3 GB/s", "6 GB/s", "9 GB/s"])
 clean_spines(ax_thr, baseline="left", hgrid=False)
 ax_thr.tick_params(axis="y", pad=8)
 
-# Consistent ~8.8pt visual blue bar thickness across Throughput and Decode
 blue_h = 0.39
 orange_h = 0.16
 gap_bar = 0.05
@@ -288,47 +302,61 @@ for i, r in enumerate(fr):
 
 fig.text(RIGHT_AX_L, CHART_TOP + 0.024, "LLM tokenizer throughput",
          fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
+hf_min = min(r["hf"] for r in fr)
+hf_max = max(r["hf"] for r in fr)
+sp_min = min(r["tuetoken"] / r["hf"] for r in fr)
+sp_max = max(r["tuetoken"] / r["hf"] for r in fr)
+fig.text(MR, CHART_TOP + 0.026,
+         f"HF tokenizers: {hf_min:.0f}–{hf_max:.0f} MB/s ({sp_min:.0f}–{sp_max:.0f}× slower)",
+         fontsize=8.8, fontweight=W_REG, color=TICK, ha="right", va="bottom")
 
-# 3) STARTUP PANEL: Dumbbell chart (bottom-right-left)
-# Axes stop cleanly at 305 ms; right-side speedup labels float outside baseline.
+# 3) STARTUP PANEL: Dumbbell chart with tuetoken, gigatoken, and HF (bottom-right-left)
 ax_st = fig.add_axes([RIGHT_AX_L, CHART_BOT, 0.145, 0.445 - CHART_BOT])
 st = sorted(R["startup"], key=lambda r: r["tuetoken"])
 n_st = len(st)
 
-ax_st.set_xlim(-6.0, 306.0)
-ax_st.set_ylim(n_st - 0.45, -0.55)
+ax_st.set_xlim(-6.0, 360.0)
+ax_st.set_ylim(n_st - 0.45, -0.78)
 ax_st.set_yticks(np.arange(n_st))
 ax_st.set_yticklabels([r["model"] for r in st], fontsize=9.2, color=INK)
-ax_st.set_xticks([0, 100, 200, 300])
-ax_st.set_xticklabels(["0", "100 ms", "200 ms", "300 ms"])
+ax_st.set_xticks([0, 150, 300])
+ax_st.set_xticklabels(["0", "150 ms", "300 ms"])
 clean_spines(ax_st, baseline="bottom", hgrid=False)
 ax_st.tick_params(axis="y", pad=8)
 
 for i, r in enumerate(st):
-    ax_st.hlines(i, r["tuetoken"], r["gigatoken"], color=GRAY_BAR, lw=2.0, zorder=2)
+    hi = max(r["gigatoken"], r["hf"])
+    ax_st.hlines(i, r["tuetoken"], hi, color=GRAY_BAR, lw=1.9, zorder=2)
 
+# Gray HF dots + orange gigatoken dots + blue tuetoken dots
+ax_st.scatter([r["hf"] for r in st], np.arange(n_st), s=36, color=GRAY_BAR,
+              edgecolor=GRAY_EDGE, linewidth=0.9, zorder=3.5)
 ax_st.scatter([r["gigatoken"] for r in st], np.arange(n_st), s=44, color=ORANGE, zorder=4)
 ax_st.scatter([r["tuetoken"] for r in st], np.arange(n_st), s=52, color=BLUE, zorder=5)
 
+# Direct labels on row 0 (DeepSeek-V3: HF=84 ms, gt=139 ms) so both dots are instantly identified
+ax_st.text(st[0]["hf"], -0.42, "HF", fontsize=8.2, fontweight=W_SEMI, color=TICK, ha="center", va="bottom")
+ax_st.text(st[0]["gigatoken"], -0.42, "gt", fontsize=8.2, fontweight=W_SEMI, color=ORANGE, ha="center", va="bottom")
+
 for i, r in enumerate(st):
-    tv, gv = r["tuetoken"], r["gigatoken"]
-    sp = round(gv / tv)
-    blue_lbl = f"{tv:.1f} ms" if i == 0 else f"{tv:.1f}"
+    tv, gv, hv = r["tuetoken"], r["gigatoken"], r["hf"]
+    hi = max(gv, hv)
+    sp = round(hi / tv)
     ax_st.text(
-        tv + 15, i, blue_lbl,
-        fontsize=10.2, fontweight=W_SEMI, color=BLUE, va="center", ha="left",
-        bbox=dict(facecolor=BG, edgecolor="none", pad=1.2), zorder=6,
+        tv + 15, i, f"{tv:.1f}",
+        fontsize=9.6, fontweight=W_SEMI, color=BLUE, va="center", ha="left",
+        bbox=dict(facecolor=BG, edgecolor="none", pad=0.9), zorder=6,
     )
     ax_st.text(
-        gv + 15, i, f"{sp}×",
-        fontsize=11, fontweight=W_SEMI, color=INK, va="center", ha="left", clip_on=False,
+        hi + 16, i, f"{sp}×",
+        fontsize=10.8, fontweight=W_SEMI, color=INK, va="center", ha="left", clip_on=False,
     )
 
-ax_st.text(0.0, 1.09, "Startup latency",
-           transform=ax_st.transAxes, fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
+fig.text(RIGHT_AX_L, 0.445 + 0.017, "Startup latency",
+         fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
 
 # 4) DECODE PANEL: Grouped bars (bottom-right-right)
-DEC_L = 0.788
+DEC_L = 0.790
 ax_dec = fig.add_axes([DEC_L, CHART_BOT, MR - DEC_L, 0.445 - CHART_BOT])
 dc = R["decode"]
 xd = np.arange(len(dc))
@@ -343,14 +371,13 @@ ax_dec.set_yticks([0, 100, 200, 300])
 ax_dec.set_yticklabels(["0", "100M", "200M", "300M"])
 clean_spines(ax_dec, baseline="bottom", hgrid=True)
 
-# Match visual blue bar thickness (~8.8pt)
 bar_w = 0.160
 for j, (k, col) in enumerate(zip(keys_d, cols_d)):
     for i, r in enumerate(dc):
         rate = r["tokens"] / r[k]
         draw_rounded_barv(ax_dec, xd[i] + (j - 2) * bar_w, rate, bar_w * 0.85, col, radius_pt=2.8)
 
-# Label ONLY the blue bars ("109M", "231M", "248M tokens/s") — zero overflow
+# Label ONLY the blue bars ("109M", "231M", "248M tokens/s")
 for i, r in enumerate(dc):
     rate = r["tokens"] / r["tuetoken"]
     bx = xd[i] - 2 * bar_w
@@ -361,12 +388,12 @@ for i, r in enumerate(dc):
         ax_dec.text(bx, rate + 10, f"{rate:.0f}M",
                     fontsize=11, fontweight=W_SEMI, color=BLUE, ha="center", va="bottom")
 
-# Clean non-overlapping gray direct label over the 3 gray bars in group 1
-ax_dec.text(xd[0] + 0.02, 33, "others",
-            fontsize=8.2, fontweight=W_REG, color=TICK, ha="left", va="bottom")
+# Clean stacked direct label for the 3 gray bars in open white space over group 1
+ax_dec.text(xd[0] + 0.02, 34, "tiktoken\nfastokens\nHF",
+            fontsize=7.6, fontweight=W_REG, color=TICK, ha="left", va="bottom", linespacing=1.22)
 
-ax_dec.text(0.0, 1.09, "Decode throughput",
-            transform=ax_dec.transAxes, fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
+fig.text(DEC_L, 0.445 + 0.017, "Decode throughput",
+         fontsize=13, fontweight=W_SEMI, color=INK, va="bottom")
 
 # ── Bottom Stat Strip (4 tiles, thin dividers, no boxes) ──────────────────
 fig.add_artist(mlines.Line2D([ML, MR], [0.180, 0.180], transform=fig.transFigure, color=BASELINE, lw=0.9))
@@ -378,8 +405,10 @@ ex = R["extras"]
 tiles = [
     (f"{warm['tuetoken'] / 1000:.2f} GB/s", "warm steady-state"),
     (f"{bt['padded_10k_mbps']['tuetoken'] / 1000:.2f} GB/s", "10K docs padded"),
-    (f"{bt['trunc_50mb_ms']['tuetoken_right']:.2f} ms", "50 MB truncation"),
-    (f"{ex['whisper_batch_500_ms']['hf'] / ex['whisper_batch_500_ms']['tuetoken']:.0f}×", "Whisper timestamps vs HF"),
+    (f"{bt['trunc_50mb_ms']['tuetoken_right']:.2f} ms",
+     f"50 MB truncation · {bt['trunc_50mb_ms']['hf'] / bt['trunc_50mb_ms']['tuetoken_right']:,.0f}× vs HF"),
+    (f"{ex['whisper_batch_500_ms']['hf'] / ex['whisper_batch_500_ms']['tuetoken']:.0f}×",
+     "Whisper timestamps vs HF"),
 ]
 
 span_w = MR - ML
