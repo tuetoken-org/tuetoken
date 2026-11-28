@@ -45,14 +45,24 @@ maturin develop --release
 | Single prompt, 128 B to 128 KB (p50) | 4-7x | 26-63x |
 | Batch of documents to `list[list[int]]` | 5-6x | 10-13x |
 | Decode (p50) | 2x | 7x |
-| `AutoTokenizer`: `tok(texts)` / chat template | | 12x / 8.6x |
-| Whisper (`whisper-large-v3-turbo`, M4 Max): encode batch / padded `np` | | **31-46x** / **180x** |
-| Whisper (`whisper-large-v3-turbo`, M4 Max): decode / `decode_with_timestamps` | | **32-51x** / **151x** |
+| `AutoTokenizer`: `tok(texts)` / chat template | | **122-300x** / **3.2x+** (5.5 µs) |
+| `AutoTokenizer` truncation (`50 MB`, `max_length=512`, right & left) | | **up to 11,842x** (1.3-2.8 ms) |
+| Startup (`o200k` 10.5 ms; Qwen3 / Llama-4 / Gemma-3 9-20 ms) | | **8.5-15.4x** |
+| Offsets (`encode_with_offsets` / `encode_with_offsets_buffer`) | | **18-26x** / **254-391x** |
+| Whisper (`whisper-large-v3`, M4 Max): encode batch / padded `np` | | **31-46x** / **180x** |
+| Whisper (`whisper-large-v3`, M4 Max): decode / `decode_with_timestamps` | | **32-51x** / **290-505x** |
 
 Token ids are identical across all three libraries. Every number uses text the
 tokenizer has not seen before, and corpus runs start a fresh process (no warm
 caches). Reproduce with `python tools/bench/bench.py corpus.txt && python tools/bench/plot.py`
 (raw numbers in `tools/bench/results.json`).
+
+New in 0.1.10:
+- **Exact O(`max_tokens`) early-exit right & left truncation**: truncating a 10 MB document to 512 tokens takes **2.75 µs right / 3.67 µs left** (up to 3,600 GB/s effective); 50 MB `AutoTokenizer` batch truncation (`1,000 × 50 KB`) runs in **1.3–2.8 ms** (**up to 11,842x faster** than 🤗 `transformers` on Qwen2.5, **8,017x** on DeepSeek-V3), token-for-token identical.
+- **5x–15x faster startup**: parallel zero-malloc SIMD JSON loader + parallel table builders (`o200k_base` in **10.5 ms**, 33.4 MB `gemma-3-4b` in **19.6 ms** — **8.5–15.4x** faster than 🤗 `tokenizers` across Qwen3, Llama-4, DeepSeek-V3, Gemma-2/3, GPT-OSS, and Falcon-H1).
+- **Frontier model-family & core speedups**: SIMD/parallel engines for DeepSeek-V3/R1 CJK (**11.9 GB/s**, 2,733x vs HF), SentencePiece (`Gemma-2/3`, `Mistral`, `Phi-3.5`, `Yi-1.5` up to **3.8 GB/s**, 274–666x vs HF), parallel O(1) NFC (`Qwen3.6` **4.8 GB/s**, 1,024x vs HF), `Seed-Coder` (**3.1 GB/s**), and `Falcon-H1/3` (**1.8 GB/s**), plus **10+ GB/s** core `o200k`/`cl100k` encode and SIMD UTF-32 transcoding.
+- **Decode, Whisper, chat & offsets**: inline-16B `DecodeEntry` + zero-copy NumPy/tensor decode (**421–441 Mtok/s**; Whisper timestamped batch decode **290–505x** vs HF), compiled & batched chat templates (**5.5 µs**, 380k chats/s), universal `FastBatch` + SIMD nibble-table special prefilter (`10K` prompts in **1.2–1.7 ms**, 122–300x vs HF), and zero-copy `encode_with_offsets_buffer` (**254–391x** vs HF).
+- **New utilities & typing**: incremental UTF-8 `DecodeStream` (10–12x vs HF), zero-copy `mmap` `encode_file_to_buffer` / `count_tokens_file` (up to **11.55 GB/s**), `truncate`, `chunk_text`, `count_special_tokens(_batch)`, local-directory `AutoTokenizer.from_pretrained` (with `chat_template.jinja`), and full PEP 561 `.pyi` stubs.
 
 New in 0.1.9:
 - **OpenAI Whisper ASR support**: full `WhisperTokenizerFast` parity (`whisper-tiny` through `whisper-large-v3-turbo`, `distil-whisper`, and legacy `vocab.json`+`merges.txt`), with SIMD `<|` special-token prefiltering and all-Rust decode / `decode_with_timestamps` (31-180x faster than 🤗 `transformers`).
@@ -146,9 +156,14 @@ byte-span offsets:
 ```python
 import numpy as np
 arr   = np.frombuffer(enc.encode_to_bytes(text), dtype=np.uint32)   # skip per-token boxing
-text  = enc.decode_array(arr)
+text  = enc.decode(arr)                                             # zero-copy 1D/2D buffer decode
 batch = enc.encode_batch(texts, max_length=512, pad_id=0)           # input_ids + attention_mask
-ids, offsets = enc.encode_with_offsets("Hello café")                # byte spans, ByteLevel only
+ids, offsets = enc.encode_with_offsets("Hello café")                # exact byte spans
+obuf  = enc.encode_with_offsets_buffer("Hello café")                # zero-copy uint32 + int64[N, 2]
+short = enc.truncate(long_text, 512, side="right")                  # O(max_tokens) right or left
+parts = enc.chunk_text(long_text, max_tokens=512, overlap=64)       # overlapping token chunks
+ds    = enc.decode_stream(); out = ds.step(tok_id) + ds.flush()     # incremental UTF-8 stream
+fbuf  = enc.encode_file_to_buffer("corpus.txt", separator=b"\n")    # zero-copy mmap file encode
 ```
 
 Tokenizing a whole corpus: pass `bytes` straight from disk (no UTF-8 conversion in
