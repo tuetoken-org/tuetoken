@@ -1221,6 +1221,112 @@ def test_sentencepiece_fast_meta():
     return ok, tot
 
 
+def test_decode_stream():
+    """Verify incremental streaming DecodeStream parity across ASCII, split UTF-8/emojis/CJK, invalid bytes, specials, and SentencePiece."""
+    print("=== DecodeStream incremental streaming parity ===")
+    import array
+    import numpy as np
+    from tuetoken import AutoTokenizer as TTAuto
+
+    ok = tot = 0
+    cases = [
+        "",
+        "Hello, world!",
+        "The quick brown fox jumps over the lazy dog. 12345!",
+        "Emojis: 🚀🔥👨‍👩‍👧‍👦🎉✨🇺🇸",
+        "Multilingual: café naïve über ß 日本語テスト 人工智能 한국어 Привет мир! — “quoted”",
+        "   leading spaces and\nnewlines\n\n  end ",
+    ]
+
+    # 1. ByteLevel (o200k_base & Qwen2.5): split multi-byte UTF-8 emojis & CJK NEVER emit bogus \ufffd mid-stream!
+    tok = tuetoken.Tokenizer.from_tiktoken("o200k_base")
+    for s in cases:
+        ids = tok.encode_ordinary(s)
+        ds = tok.decode_stream()
+        chunks = [ds.step(t) for t in ids]
+        tail = ds.flush()
+        got = "".join(chunks) + tail
+        tot += 3
+        ok += int(got == s)
+        ok += int("\ufffd" not in got)
+        ok += int(ds.pending_bytes == 0)
+        # step_many in slices of 1, 2, 3, 5 + numpy array + array.array
+        for k in (2, 3, 5):
+            ds.reset()
+            parts = [ds.step_many(ids[i:i + k]) for i in range(0, len(ids), k)]
+            parts.append(ds.flush())
+            tot += 1
+            ok += int("".join(parts) == s)
+        ds.reset()
+        tot += 2
+        ok += int(ds.step_many(np.array(ids, dtype=np.uint32)) + ds.flush() == s)
+        ds.reset()
+        ok += int(ds.step_many(array.array("I", ids)) + ds.flush() == s)
+
+    # Specifically prove a 4-byte emoji split across 2+ single-byte tokens buffers until complete!
+    emoji_ids = tok.encode_ordinary("🚀👨‍👩‍👧‍👦")
+    assert len(emoji_ids) >= 2
+    ds = tok.decode_stream()
+    mid_chunks = []
+    saw_pending = False
+    for t in emoji_ids:
+        c = ds.step(t)
+        if ds.pending_bytes > 0:
+            saw_pending = True
+        assert "\ufffd" not in c, f"spurious replacement char mid-stream: {c!r}"
+        mid_chunks.append(c)
+    mid_chunks.append(ds.flush())
+    tot += 2
+    ok += int("".join(mid_chunks) == "🚀👨‍👩‍👧‍👦")
+    ok += int(saw_pending)
+
+    # 2. Invalid / truncated UTF-8 byte tokens match decode() byte-for-byte (maximal-subpart U+FFFD)
+    for cut in (1, 2, len(emoji_ids) - 1):
+        sub = emoji_ids[:cut]
+        ds = tok.decode_stream()
+        got = "".join(ds.step(t) for t in sub) + ds.flush()
+        tot += 1
+        ok += int(got == tok.decode(sub))
+
+    # Genuinely ill-formed mid-stream byte sequences via Phi-3.5 <0xXX> byte-fallback tokens
+    phi = TTAuto.from_pretrained("microsoft/Phi-3.5-mini-instruct")
+    b_tok = lambda byte: phi.convert_tokens_to_ids(f"<0x{byte:02X}>")
+    tok_a = phi.encode("A", add_special_tokens=False)[-1]
+    bad_seqs = [
+        [b_tok(0xFF), tok_a],
+        [b_tok(0x80), b_tok(0x80), tok_a],
+        [b_tok(0xC2), tok_a],
+        [b_tok(0xE0), b_tok(0x80), tok_a],
+        [b_tok(0xE2), b_tok(0x82), tok_a],
+        [b_tok(0xF0), b_tok(0x9F), b_tok(0x98), tok_a],
+        [b_tok(0xF0), b_tok(0x9F), b_tok(0x9A), b_tok(0x80), b_tok(0xFF), b_tok(0xF0), b_tok(0x9F)],  # 🚀 + bad + truncated!
+    ]
+    for seq in bad_seqs:
+        ds = phi.decode_stream(skip_special_tokens=False)
+        got = "".join(ds.step(t) for t in seq) + ds.flush()
+        want = phi.decode(seq, skip_special_tokens=False)
+        tot += 1
+        ok += int(got == want)
+
+    # 3. AutoTokenizer with skip_special_tokens=True/False (Qwen2.5) + SentencePiece strip_space (Phi-3.5)
+    for repo in ("Qwen/Qwen2.5-0.5B-Instruct", "microsoft/Phi-3.5-mini-instruct"):
+        at = TTAuto.from_pretrained(repo)
+        for skip in (False, True):
+            for s in ("Hello world!", " Hello 🚀 world", "café 日本語 123", "   spaces"):
+                ids = at.encode(s, add_special_tokens=True)
+                ds = at.decode_stream(skip_special_tokens=skip)
+                got_step = "".join(ds.step(t) for t in ids) + ds.flush()
+                ds.reset()
+                got_many = ds.step_many(np.array(ids, dtype=np.int64)) + ds.flush()
+                want = at.decode(ids, skip_special_tokens=skip)
+                tot += 2
+                ok += int(got_step == want)
+                ok += int(got_many == want)
+    _line("DecodeStream (ASCII/UTF-8/emoji/trunc/SP/Auto)", ok, tot)
+    assert ok == tot, f"DecodeStream: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -1230,6 +1336,7 @@ def main():
         test_bytes_inputs(), test_warmup_and_fast_startup(),
         test_review_regressions(), test_whisper(), test_zero_copy_buffer_decode(),
         test_fast_and_batch_chat_templates(), test_sentencepiece_fast_meta(),
+        test_decode_stream(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

@@ -8981,9 +8981,341 @@ impl Tokenizer {
         }))
     }
 
+    /// Create an incremental UTF-8-aware streaming decoder (`.step(id)`,
+    /// `.step_many(ids)`, `.flush()`, `.reset()`). Holds incomplete trailing
+    /// multi-byte UTF-8 sequences across tokens so split emojis and CJK never
+    /// emit spurious `\u{FFFD}` mid-stream.
+    #[pyo3(signature = (skip_special_tokens = false))]
+    fn decode_stream(slf: Bound<'_, Self>, skip_special_tokens: bool) -> DecodeStream {
+        let _ = slf.borrow().decode_table();
+        DecodeStream {
+            tok: slf.unbind(),
+            skip_special: skip_special_tokens,
+            pending: Vec::with_capacity(16),
+            emitted_any: false,
+        }
+    }
+
     #[getter]
     fn n_vocab(&self) -> usize {
         self.vocab_size
+    }
+}
+
+/// Incremental UTF-8-aware streaming token decoder created by
+/// `Tokenizer.decode_stream()` or `AutoTokenizer.decode_stream()`.
+#[pyclass]
+pub struct DecodeStream {
+    tok: Py<Tokenizer>,
+    skip_special: bool,
+    pending: Vec<u8>,
+    emitted_any: bool,
+}
+
+impl DecodeStream {
+    #[inline]
+    fn append_token_bytes(tok: &Tokenizer, skip_special: bool, pending: &mut Vec<u8>, token_id: u32) -> bool {
+        if token_id >= tok.whisper_ts_begin {
+            return true;
+        }
+        let dt = tok.decode_table();
+        let ti = token_id as usize;
+        if ti >= dt.len() {
+            return true;
+        }
+        let e = unsafe { *dt.get_unchecked(ti) };
+        if skip_special && (e.flags & DEC_FLAG_SPECIAL) != 0 {
+            return true;
+        }
+        if e.len != DEC_OUTLINE_LEN {
+            pending.extend_from_slice(&e.data[..e.len as usize]);
+        } else {
+            let (off, len) = e.outline_span();
+            pending.extend_from_slice(&tok.byte_arena[off..off + len]);
+        }
+        (e.flags & DEC_FLAG_NON_ASCII) == 0
+    }
+
+    #[inline]
+    fn drain_ready<'py>(&mut self, py: Python<'py>, strip_space: bool) -> Bound<'py, PyString> {
+        if !self.emitted_any && !self.pending.is_empty() {
+            self.emitted_any = true;
+            if strip_space && self.pending[0] == b' ' {
+                self.pending.remove(0);
+            }
+        }
+        if self.pending.is_empty() {
+            return PyString::new(py, "");
+        }
+        match std::str::from_utf8(&self.pending) {
+            Ok(s) => {
+                let res = PyString::new(py, s);
+                self.pending.clear();
+                res
+            }
+            Err(err) => {
+                if err.error_len().is_none() {
+                    let vlen = err.valid_up_to();
+                    let res = if vlen == 0 {
+                        PyString::new(py, "")
+                    } else {
+                        // SAFETY: `self.pending[..vlen]` was validated by `from_utf8`.
+                        let s = unsafe { std::str::from_utf8_unchecked(&self.pending[..vlen]) };
+                        PyString::new(py, s)
+                    };
+                    if vlen > 0 {
+                        self.pending.drain(..vlen);
+                    }
+                    return res;
+                }
+                // General case: one or more genuinely ill-formed UTF-8 sequences
+                // (maximal-subpart `\u{FFFD}` substitution, holding any trailing
+                // incomplete 1..3-byte prefix for the next `.step()`).
+                let mut out = String::with_capacity(self.pending.len() + 4);
+                let mut pos = 0usize;
+                while pos < self.pending.len() {
+                    match std::str::from_utf8(&self.pending[pos..]) {
+                        Ok(s) => {
+                            out.push_str(s);
+                            pos = self.pending.len();
+                            break;
+                        }
+                        Err(e) => {
+                            let v = e.valid_up_to();
+                            if v > 0 {
+                                // SAFETY: validated by `from_utf8`.
+                                out.push_str(unsafe {
+                                    std::str::from_utf8_unchecked(&self.pending[pos..pos + v])
+                                });
+                                pos += v;
+                            }
+                            match e.error_len() {
+                                Some(bad_len) => {
+                                    out.push('\u{FFFD}');
+                                    pos += bad_len;
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                if pos == self.pending.len() {
+                    self.pending.clear();
+                } else if pos > 0 {
+                    self.pending.drain(..pos);
+                }
+                PyString::new(py, &out)
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl DecodeStream {
+    /// Feed one token id and return any newly completed UTF-8 text (`""` if the
+    /// token only contributes to an incomplete multi-byte character or is skipped).
+    fn step<'py>(&mut self, py: Python<'py>, token_id: u32) -> Bound<'py, PyString> {
+        let strip_space = {
+            let tok = self.tok.borrow(py);
+            if token_id >= tok.whisper_ts_begin {
+                return PyString::new(py, "");
+            }
+            let dt = tok.decode_table();
+            let ti = token_id as usize;
+            if ti >= dt.len() {
+                return PyString::new(py, "");
+            }
+            let e = unsafe { *dt.get_unchecked(ti) };
+            if self.skip_special && (e.flags & DEC_FLAG_SPECIAL) != 0 {
+                return PyString::new(py, "");
+            }
+            // Zero-alloc pure-ASCII fast path: direct `PyUnicode_New(len, 127)`.
+            if self.pending.is_empty() && (e.flags & DEC_FLAG_NON_ASCII) == 0 && e.len != DEC_OUTLINE_LEN {
+                let mut slice = &e.data[..e.len as usize];
+                if !self.emitted_any && !slice.is_empty() {
+                    self.emitted_any = true;
+                    if tok.decode_strip_space && slice[0] == b' ' {
+                        slice = &slice[1..];
+                    }
+                }
+                return ascii_bytes_to_pystr(py, slice);
+            }
+            if e.len != DEC_OUTLINE_LEN {
+                self.pending.extend_from_slice(&e.data[..e.len as usize]);
+            } else {
+                let (off, len) = e.outline_span();
+                self.pending.extend_from_slice(&tok.byte_arena[off..off + len]);
+            }
+            tok.decode_strip_space
+        };
+        self.drain_ready(py, strip_space)
+    }
+
+    /// Feed a sequence of token ids (`list[int]`, 1D NumPy/torch/array buffer,
+    /// or any iterable of ints) in one Rust call and return newly completed text.
+    fn step_many<'py>(&mut self, py: Python<'py>, tokens: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyString>> {
+        let ptr = tokens.as_ptr();
+        let inline_long = pylong_inline_ok(py);
+        let was_empty = self.pending.is_empty();
+        let skip_special = self.skip_special;
+
+        let (strip_space, all_ascii) = {
+            let tok = self.tok.borrow(py);
+            let strip_space = tok.decode_strip_space;
+            let mut all_ascii = was_empty;
+            let mut handled = false;
+            unsafe {
+                if pyo3::ffi::PyList_Check(ptr) != 0 {
+                    let n = pyo3::ffi::PyList_GET_SIZE(ptr) as usize;
+                    if n == 0 {
+                        return Ok(PyString::new(py, ""));
+                    }
+                    if was_empty {
+                        if let Some(is_ascii) = tok.gather_pylist_fused_into(
+                            ptr,
+                            n,
+                            inline_long,
+                            skip_special,
+                            &mut self.pending,
+                        ) {
+                            all_ascii = is_ascii;
+                            handled = true;
+                        } else {
+                            pyo3::ffi::PyErr_Clear();
+                            self.pending.clear();
+                        }
+                    } else {
+                        let save_len = self.pending.len();
+                        let mut ok = true;
+                        for i in 0..n {
+                            let item = pyo3::ffi::PyList_GET_ITEM(ptr, i as pyo3::ffi::Py_ssize_t);
+                            let val = pyo3::ffi::PyLong_AsLongLong(item);
+                            if val < 0 || val > u32::MAX as i64 || !pyo3::ffi::PyErr_Occurred().is_null() {
+                                pyo3::ffi::PyErr_Clear();
+                                ok = false;
+                                break;
+                            }
+                            Self::append_token_bytes(&tok, skip_special, &mut self.pending, val as u32);
+                        }
+                        if ok {
+                            handled = true;
+                        } else {
+                            self.pending.truncate(save_len);
+                        }
+                    }
+                } else if pyo3::ffi::PyObject_CheckBuffer(ptr) != 0 {
+                    let mut guard = PyBufGuard {
+                        view: std::mem::zeroed(),
+                        active: false,
+                    };
+                    let flags = pyo3::ffi::PyBUF_ND | pyo3::ffi::PyBUF_STRIDES | pyo3::ffi::PyBUF_FORMAT;
+                    if pyo3::ffi::PyObject_GetBuffer(ptr, &mut guard.view, flags) == 0 {
+                        guard.active = true;
+                        if guard.view.ndim == 1
+                            && pyo3::ffi::PyBuffer_IsContiguous(&guard.view, b'C' as std::os::raw::c_char) != 0
+                            && !guard.view.shape.is_null()
+                        {
+                            if let Some(kind) = classify_int_buffer(&guard.view) {
+                                let count = *guard.view.shape as usize;
+                                if count == 0 {
+                                    return Ok(PyString::new(py, ""));
+                                }
+                                if matches!(kind, IntBufKind::U32) {
+                                    let ids = std::slice::from_raw_parts(guard.view.buf as *const u32, count);
+                                    if was_empty {
+                                        all_ascii = tok.gather_bytes_single_pass_into(ids, skip_special, &mut self.pending);
+                                    } else {
+                                        for &t in ids {
+                                            Self::append_token_bytes(&tok, skip_special, &mut self.pending, t);
+                                        }
+                                    }
+                                    handled = true;
+                                } else {
+                                    let mut tmp = Vec::new();
+                                    if copy_int_buf_to_u32(guard.view.buf as *const u8, count, kind, &mut tmp) {
+                                        if was_empty {
+                                            all_ascii = tok.gather_bytes_single_pass_into(&tmp, skip_special, &mut self.pending);
+                                        } else {
+                                            for &t in &tmp {
+                                                Self::append_token_bytes(&tok, skip_special, &mut self.pending, t);
+                                            }
+                                        }
+                                        handled = true;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        pyo3::ffi::PyErr_Clear();
+                    }
+                }
+            }
+            if !handled {
+                let ids: Vec<u32> = tokens.extract()?;
+                if ids.is_empty() {
+                    return Ok(PyString::new(py, ""));
+                }
+                if was_empty {
+                    all_ascii = tok.gather_bytes_single_pass_into(&ids, skip_special, &mut self.pending);
+                } else {
+                    for &t in &ids {
+                        Self::append_token_bytes(&tok, skip_special, &mut self.pending, t);
+                    }
+                }
+            }
+            (strip_space, all_ascii)
+        };
+
+        if all_ascii && !self.pending.is_empty() {
+            let start = if !self.emitted_any {
+                self.emitted_any = true;
+                usize::from(strip_space && self.pending[0] == b' ')
+            } else {
+                0
+            };
+            let res = ascii_bytes_to_pystr(py, &self.pending[start..]);
+            self.pending.clear();
+            return Ok(res);
+        }
+        Ok(self.drain_ready(py, strip_space))
+    }
+
+    /// Flush any remaining incomplete trailing bytes at end-of-stream (replacing
+    /// truncated UTF-8 with `\u{FFFD}` to match `decode()`).
+    fn flush<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyString> {
+        if self.pending.is_empty() {
+            return PyString::new(py, "");
+        }
+        let tok = self.tok.borrow(py);
+        let start = if !self.emitted_any {
+            self.emitted_any = true;
+            usize::from(tok.decode_strip_space && self.pending[0] == b' ')
+        } else {
+            0
+        };
+        let res = bytes_to_pystr(py, &self.pending[start..]);
+        self.pending.clear();
+        res
+    }
+
+    /// Reset internal byte buffer and SentencePiece leading-space state for reuse.
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.emitted_any = false;
+    }
+
+    /// Number of incomplete trailing UTF-8 bytes currently buffered.
+    #[getter]
+    fn pending_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DecodeStream(skip_special_tokens={}, pending_bytes={})",
+            if self.skip_special { "True" } else { "False" },
+            self.pending.len()
+        )
     }
 }
 
@@ -8991,6 +9323,7 @@ impl Tokenizer {
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Tokenizer>()?;
     m.add_class::<TokenBuffer>()?;
+    m.add_class::<DecodeStream>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

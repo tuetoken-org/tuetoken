@@ -604,6 +604,11 @@ class AutoTokenizer:
             ]
         return texts
 
+    def decode_stream(self, skip_special_tokens=False):
+        """Return an incremental UTF-8-aware `DecodeStream` (`.step(id)`,
+        `.step_many(ids)`, `.flush()`, `.reset()`)."""
+        return self._core.decode_stream(bool(skip_special_tokens))
+
     def _post_prefix_suffix(self):
         """Special ids the post-processor adds before/after a single sequence
         (computed once via a sentinel; covers TemplateProcessing/Bert/Roberta/

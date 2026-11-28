@@ -21,7 +21,7 @@ Two entry points:
         ids = tok.apply_chat_template([{"role": "user", "content": "hi"}],
                                       add_generation_prompt=True)
 """
-from ._core import Tokenizer, __version__
+from ._core import DecodeStream, Tokenizer, __version__
 from ._auto import AutoTokenizer
 
 try:
@@ -32,4 +32,4 @@ try:
 except ImportError:  # numpy is optional; only those APIs need it
     pass
 
-__all__ = ["Tokenizer", "AutoTokenizer", "__version__"]
+__all__ = ["Tokenizer", "AutoTokenizer", "DecodeStream", "__version__"]
