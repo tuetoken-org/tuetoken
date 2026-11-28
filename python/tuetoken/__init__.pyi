@@ -75,6 +75,11 @@ class Tokenizer:
         """Encode and return ``(ids, offsets)`` where each offset is the token's
         ``(start, end)`` byte span in ``text``. ByteLevel models only."""
 
+    def encode_with_offsets_buffer(self, text: str) -> dict[str, Any]:
+        """Zero-copy numpy offset encoding returning
+        ``{"input_ids": np.ndarray[uint32, (N,)], "offsets": np.ndarray[int64, (N, 2)]}``
+        with byte spans ``[start, end]`` in ``text``. ByteLevel models only."""
+
     def count_tokens(self, text: str) -> int:
         """Number of ordinary tokens, without building the id list."""
 

@@ -1180,6 +1180,7 @@ fn non_monotonic_chunk_table_matches_bruteforce() {
     let _ = std::fs::remove_file(&tmp);
 
     assert!(!tk.monotonic, "synthetic vocab must be non-monotonic");
+    assert!(tk.byte_len_exact, "all 256 byte singletons + additive merges -> byte_len_exact");
     let mut s = Scratch::default();
     for id in 0..tk.byte_span.len() as u32 {
         let (off, len) = tk.byte_span[id as usize];

@@ -1485,7 +1485,7 @@ def test_truncate_chunk_and_v02_regressions():
     """Verify `truncate`, `chunk_text`, local-dir `AutoTokenizer.from_pretrained`,
     `chat_template.jinja`, Gemma/SP literal `'▁'` multi-thread parity, `gpt-oss-20b`
     `ignore_merges`, `Falcon-H1`/`Falcon3` `PretokPipe`, and `attention_mask`."""
-    import tempfile
+    import tempfile, unicodedata
     from tuetoken import Tokenizer, AutoTokenizer as TTAuto
     from transformers import AutoTokenizer as HFAuto
     from huggingface_hub import hf_hub_download
@@ -1638,6 +1638,18 @@ def test_truncate_chunk_and_v02_regressions():
         tot += 2
         ok += int(g1 == w)
         ok += int(gm == w)
+        # Verify byte-exact encode_with_offsets & zero-copy encode_with_offsets_buffer
+        # on both non-monotonic+ignore_merges (gpt-oss) and Pipe (Falcon-H1) models!
+        if "Falcon3" not in repo:
+            adv_nfc = unicodedata.normalize("NFC", adv_pipe)
+            adv_b = adv_nfc.encode("utf-8")
+            ids_o, offs_o = tt_m.encode_with_offsets(adv_nfc)
+            buf_o = tt_m.encode_with_offsets_buffer(adv_nfc)
+            tot += 4
+            ok += int(ids_o == tt_m.encode_ordinary(adv_nfc))
+            ok += int(all(adv_b[a:b].decode("utf-8", "replace") == tt_m.decode([tid]) for tid, (a, b) in zip(ids_o, offs_o)))
+            ok += int(buf_o["input_ids"].tolist() == ids_o)
+            ok += int([tuple(x) for x in buf_o["offsets"].tolist()] == offs_o)
 
     _line("truncate, chunk_text & v0.2 regressions", ok, tot)
     assert ok == tot, f"v0.2 regressions: {ok}/{tot}"
