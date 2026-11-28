@@ -2998,7 +2998,7 @@ impl Tokenizer {
             let b = &this.byte_arena[off as usize..(off + len) as usize];
             s.out.clear();
             if this.sp_fast_meta != SpFastMeta::None {
-                if memchr::memmem::find(b, "\u{2581}".as_bytes()).is_some() {
+                if b.contains(&0xE2) && memchr::memmem::find(b, "\u{2581}".as_bytes()).is_some() {
                     return None;
                 }
                 this.process_chunk_sp_direct(b, s);
@@ -8026,13 +8026,39 @@ type FillRowItem<'a> = (usize, (&'a mut [std::mem::MaybeUninit<i64>], &'a mut [s
 impl Tokenizer {
     #[new]
     fn new(path: &str) -> PyResult<Self> {
-        let raw_bytes = std::fs::read(path)
+        // Zero-copy mmap from OS page cache (falls back to fs::read for pipes/special files),
+        // eliminating a 12–33 MB heap alloc + memcpy + page reclaim on every load.
+        let file_bytes = FileBytes::open(std::path::Path::new(path))
             .map_err(|e| PyValueError::new_err(format!("cannot read {path}: {e}")))?;
-        let data = simdutf8::basic::from_utf8(&raw_bytes)
-            .map_err(|e| PyValueError::new_err(format!("cannot read {path}: invalid UTF-8: {e}")))?;
+        let raw_bytes = file_bytes.as_slice();
+        let allow_par = parallel_ok();
+        let utf8_ok = if allow_par && raw_bytes.len() >= (1 << 20) {
+            const PIECE: usize = 1 << 20;
+            let mut cuts = Vec::with_capacity(raw_bytes.len() / PIECE + 2);
+            cuts.push(0usize);
+            let mut p = PIECE;
+            while p < raw_bytes.len() {
+                while p < raw_bytes.len() && (raw_bytes[p] & 0xC0) == 0x80 {
+                    p += 1;
+                }
+                cuts.push(p);
+                p += PIECE;
+            }
+            cuts.push(raw_bytes.len());
+            cuts.dedup();
+            cuts.par_windows(2)
+                .all(|w| simdutf8::basic::from_utf8(&raw_bytes[w[0]..w[1]]).is_ok())
+        } else {
+            simdutf8::basic::from_utf8(raw_bytes).is_ok()
+        };
+        if !utf8_ok {
+            simdutf8::basic::from_utf8(raw_bytes)
+                .map_err(|e| PyValueError::new_err(format!("cannot read {path}: invalid UTF-8: {e}")))?;
+        }
+        // SAFETY: UTF-8 validity verified immediately above across the entire buffer.
+        let data = unsafe { std::str::from_utf8_unchecked(raw_bytes) };
 
         let c2b = bytes_to_unicode_table();
-        let allow_par = parallel_ok();
         let detect_meta_cand = |pre: &Value, norm_val: &Value, byte_fallback: bool, ignore_merges: bool, has_eow: bool| -> Option<char> {
             if !byte_fallback || ignore_merges || has_eow {
                 return None;
@@ -8060,7 +8086,7 @@ impl Tokenizer {
         };
 
         if let Some(fl) = fast_load::try_load_fast(
-            raw_bytes.as_slice(),
+            raw_bytes,
             &c2b,
             allow_par,
             decode_bytelevel_into,

@@ -271,14 +271,13 @@ impl MergeMap {
         } else {
             vec![Entry { key: 0, rank: 0 }; cap]
         };
-        let mut hot_vec = Vec::new();
-        let mut cold_vec = Vec::new();
-        let mut hot_bloom;
-        let mut cold_bloom = Vec::new();
+        let mut cold_off = 0usize;
+        let mut buckets = crate::chunk_table::HugeVec::<MergeBucket>::empty();
+        let mut bloom = Vec::new();
 
         if use_packed {
             // Collect overflow dense-range entries (rank >= 65534 with both tokens in dense)
-            // so Pass 2 never needs to touch `dense` again and can run hot/cold in parallel!
+            // so Pass 2 never needs to touch `dense` again and can run in parallel!
             let mut dense_ov: Vec<(u32, u32, u32)> = Vec::new();
             let did_slice = dense_id.as_slice();
             for (i, &(t1, t2, _)) in merges.iter().enumerate() {
@@ -308,112 +307,316 @@ impl MergeMap {
                 }
             }
 
-            let build_part = |want_hot: bool, nb: usize, bshift: u32| -> (Vec<MergeBucket>, Vec<u64>) {
-                let mut vec = vec![MergeBucket([0u64; 8]); nb + 1];
-                let mut bl = vec![0u64; nb];
-                const RING: usize = 32;
-                let mut ring = [(0usize, 0u64, 0u64, 0u32); RING];
-                let mut rlen = 0usize;
-                let flush_one = |vec: &mut Vec<MergeBucket>, bl: &mut Vec<u64>, (b, kh, h, r): (usize, u64, u64, u32)| {
-                    bl[b] |= Self::bloom_mask(h);
-                    insert_no_wrap(vec, b, kh, r);
-                };
-                let mut push_item = |vec: &mut Vec<MergeBucket>, bl: &mut Vec<u64>, t1: u32, t2: u32, r: u32| {
+            // 16-partition parallel in-place `HugeVec<MergeBucket>` + `bloom` builder:
+            // partitions both `hot` and `cold` by top 4 hash bits (`h >> 60`) into
+            // disjoint L2-resident slices built directly in-place across all cores
+            // with zero intermediate `hot_vec`/`cold_vec` copy and exact first-writer-wins
+            // ordering. Falls back to the 2-way serial builder for tiny vocabs or
+            // pathological >32-bucket overflow chains.
+            let mut par_built = false;
+            if allow_par && n_table >= 32_768 && hot_nb >= 256 && (cold_nb == 0 || cold_nb >= 256) {
+                use rayon::prelude::*;
+                const P: usize = 16;
+                const SLACK: usize = 32;
+                type HashItem = (u64, u64, u32); // (kh, h, rank)
+                type PartBuckets = [Vec<HashItem>; P];
+
+                let nt = rayon::current_num_threads().clamp(2, 32);
+                let chunk_sz = merges.len().div_ceil(nt);
+                let est_hot = ((hot_nb * 6) / (nt * P)).max(16);
+                let est_cold = if cold_nb != 0 { ((cold_nb * 6) / (nt * P)).max(16) } else { 0 };
+
+                // Stage 1: hash & partition all table entries in parallel preserving rank order.
+                let mut ov_hot: PartBuckets = std::array::from_fn(|_| Vec::new());
+                let mut ov_cold: PartBuckets = std::array::from_fn(|_| Vec::new());
+                for &(t1, t2, r) in &dense_ov {
                     let kh = Self::pack_key(t1, t2);
                     let h = Self::hash_packed(kh);
-                    let b = (h >> bshift) as usize;
-                    unsafe {
-                        crate::chunk_table::prefetch(bl.as_ptr().add(b) as *const u8);
-                        crate::chunk_table::prefetch(vec.as_ptr().add(b) as *const u8);
+                    let p = (h >> 60) as usize;
+                    if (t1 | t2) < hot_t {
+                        ov_hot[p].push((kh, h, r));
+                    } else {
+                        ov_cold[p].push((kh, h, r));
                     }
-                    let slot = rlen & (RING - 1);
-                    if rlen >= RING {
-                        flush_one(vec, bl, ring[slot]);
-                    }
-                    ring[slot] = (b, kh, h, r);
-                    rlen += 1;
-                };
-                if want_hot {
-                    for &(t1, t2, r) in &dense_ov {
-                        if (t1 | t2) < hot_t {
-                            push_item(&mut vec, &mut bl, t1, t2, r);
-                        }
-                    }
-                    if use_dense_remap {
-                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
-                            if (t1 | t2) < hot_t {
+                }
+                let per_chunk: Vec<(PartBuckets, PartBuckets)> = merges
+                    .par_chunks(chunk_sz)
+                    .enumerate()
+                    .map(|(ci, ch)| {
+                        let base_r = (ci * chunk_sz) as u32;
+                        let mut hb: [Vec<HashItem>; P] =
+                            std::array::from_fn(|_| Vec::with_capacity(est_hot));
+                        let mut cb: [Vec<HashItem>; P] = if cold_nb != 0 {
+                            std::array::from_fn(|_| Vec::with_capacity(est_cold))
+                        } else {
+                            std::array::from_fn(|_| Vec::new())
+                        };
+                        if use_dense_remap {
+                            for (off, &(t1, t2, _)) in ch.iter().enumerate() {
                                 let d1 = unsafe { *did_slice.get_unchecked(t1 as usize) } as u32;
                                 let d2 = unsafe { *did_slice.get_unchecked(t2 as usize) } as u32;
                                 if (d1 | d2) >= DENSE_N {
-                                    push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                                    let kh = Self::pack_key(t1, t2);
+                                    let h = Self::hash_packed(kh);
+                                    let p = (h >> 60) as usize;
+                                    let r = base_r + off as u32;
+                                    if (t1 | t2) < hot_t {
+                                        hb[p].push((kh, h, r));
+                                    } else {
+                                        cb[p].push((kh, h, r));
+                                    }
+                                }
+                            }
+                        } else {
+                            for (off, &(t1, t2, _)) in ch.iter().enumerate() {
+                                let or = t1 | t2;
+                                if or >= DENSE_N {
+                                    let kh = Self::pack_key(t1, t2);
+                                    let h = Self::hash_packed(kh);
+                                    let p = (h >> 60) as usize;
+                                    let r = base_r + off as u32;
+                                    if or < hot_t {
+                                        hb[p].push((kh, h, r));
+                                    } else {
+                                        cb[p].push((kh, h, r));
+                                    }
                                 }
                             }
                         }
-                    } else {
-                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
-                            let or = t1 | t2;
-                            if or >= DENSE_N && or < hot_t {
-                                push_item(&mut vec, &mut bl, t1, t2, i as u32);
-                            }
-                        }
-                    }
-                } else {
-                    for &(t1, t2, r) in &dense_ov {
-                        if (t1 | t2) >= hot_t {
-                            push_item(&mut vec, &mut bl, t1, t2, r);
-                        }
-                    }
-                    if use_dense_remap {
-                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
-                            if (t1 | t2) >= hot_t {
-                                let d1 = unsafe { *did_slice.get_unchecked(t1 as usize) } as u32;
-                                let d2 = unsafe { *did_slice.get_unchecked(t2 as usize) } as u32;
-                                if (d1 | d2) >= DENSE_N {
-                                    push_item(&mut vec, &mut bl, t1, t2, i as u32);
-                                }
-                            }
-                        }
-                    } else {
-                        for (i, &(t1, t2, _)) in merges.iter().enumerate() {
-                            let or = t1 | t2;
-                            if or >= DENSE_N && or >= hot_t {
-                                push_item(&mut vec, &mut bl, t1, t2, i as u32);
-                            }
-                        }
-                    }
-                }
-                let start = rlen.saturating_sub(RING);
-                for k in start..rlen {
-                    flush_one(&mut vec, &mut bl, ring[k & (RING - 1)]);
-                }
-                (vec, bl)
-            };
+                        (hb, cb)
+                    })
+                    .collect();
 
-            if cold_nb != 0 {
-                if allow_par {
-                    let ((hv, hb), (cv, cb)) = rayon::join(
-                        || build_part(true, hot_nb, hot_shift),
-                        || build_part(false, cold_nb, cold_shift),
+                let c_off = if cold_nb != 0 { hot_nb + SLACK } else { 0 };
+                let total_b = if cold_nb != 0 { c_off + cold_nb + SLACK } else { hot_nb + SLACK };
+                let mut bv = crate::chunk_table::HugeVec::<MergeBucket>::zeroed(total_b);
+                let mut bl = vec![0u64; if cold_nb != 0 { c_off + cold_nb } else { hot_nb }];
+
+                let scatter_region = |reg_b: &mut [MergeBucket],
+                                      reg_bl: &mut [u64],
+                                      nb: usize,
+                                      bshift: u32,
+                                      ov_parts: &[Vec<HashItem>; P],
+                                      is_hot: bool|
+                 -> bool {
+                    let part_len = nb / P;
+                    let spills: Vec<Vec<(usize, u64, u32)>> = reg_b[..nb]
+                        .par_chunks_mut(part_len)
+                        .zip(reg_bl[..nb].par_chunks_mut(part_len))
+                        .enumerate()
+                        .map(|(p, (pbuck, pbloom))| {
+                            let base_b = p * part_len;
+                            let mut spill: Vec<(usize, u64, u32)> = Vec::new();
+                            let mut insert_slice = |items: &[HashItem]| {
+                                let n = items.len();
+                                for j in 0..n {
+                                    if j + 16 < n {
+                                        let ph = unsafe { items.get_unchecked(j + 16).1 };
+                                        let plb = ((ph >> bshift) as usize) - base_b;
+                                        unsafe {
+                                            crate::chunk_table::prefetch(pbloom.as_ptr().add(plb) as *const u8);
+                                            crate::chunk_table::prefetch(pbuck.as_ptr().add(plb) as *const u8);
+                                        }
+                                    }
+                                    let (kh, h, r) = unsafe { *items.get_unchecked(j) };
+                                    let mut lb = ((h >> bshift) as usize) - base_b;
+                                    unsafe {
+                                        *pbloom.get_unchecked_mut(lb) |= Self::bloom_mask(h);
+                                    }
+                                    let mut placed = false;
+                                    while lb < part_len {
+                                        let buck = &mut unsafe { pbuck.get_unchecked_mut(lb) }.0;
+                                        for slot in buck.iter_mut() {
+                                            let e = *slot;
+                                            if e == 0 {
+                                                *slot = kh | (r as u64 + 1);
+                                                placed = true;
+                                                break;
+                                            }
+                                            if (e & PACK_KEY_MASK) == kh {
+                                                placed = true;
+                                                break;
+                                            }
+                                        }
+                                        if placed {
+                                            break;
+                                        }
+                                        lb += 1;
+                                    }
+                                    if !placed {
+                                        spill.push((base_b + part_len, kh, r));
+                                    }
+                                }
+                            };
+                            insert_slice(&ov_parts[p]);
+                            for ch in &per_chunk {
+                                let slice = if is_hot { &ch.0[p] } else { &ch.1[p] };
+                                insert_slice(slice);
+                            }
+                            spill
+                        })
+                        .collect();
+
+                    let lim = reg_b.len();
+                    for sp in spills {
+                        for (mut b, kh, r) in sp {
+                            'ins: loop {
+                                if b + 1 >= lim {
+                                    return false;
+                                }
+                                let buck = &mut reg_b[b].0;
+                                for slot in buck.iter_mut() {
+                                    let e = *slot;
+                                    if e == 0 {
+                                        *slot = kh | (r as u64 + 1);
+                                        break 'ins;
+                                    }
+                                    if (e & PACK_KEY_MASK) == kh {
+                                        break 'ins;
+                                    }
+                                }
+                                b += 1;
+                            }
+                        }
+                    }
+                    true
+                };
+
+                let ok = if cold_nb != 0 {
+                    let (b_hot, b_cold) = bv.split_at_mut(c_off);
+                    let (bl_hot, bl_cold) = bl.split_at_mut(c_off);
+                    let (ok_h, ok_c) = rayon::join(
+                        || scatter_region(b_hot, bl_hot, hot_nb, hot_shift, &ov_hot, true),
+                        || scatter_region(b_cold, bl_cold, cold_nb, cold_shift, &ov_cold, false),
                     );
-                    hot_vec = hv;
-                    hot_bloom = hb;
-                    cold_vec = cv;
-                    cold_bloom = cb;
+                    ok_h && ok_c
+                } else {
+                    scatter_region(&mut bv, &mut bl, hot_nb, hot_shift, &ov_hot, true)
+                };
+                if ok {
+                    cold_off = c_off;
+                    buckets = bv;
+                    bloom = bl;
+                    par_built = true;
+                }
+            }
+
+            if !par_built {
+                let build_part = |want_hot: bool, nb: usize, bshift: u32| -> (Vec<MergeBucket>, Vec<u64>) {
+                    let mut vec = vec![MergeBucket([0u64; 8]); nb + 1];
+                    let mut bl = vec![0u64; nb];
+                    const RING: usize = 32;
+                    let mut ring = [(0usize, 0u64, 0u64, 0u32); RING];
+                    let mut rlen = 0usize;
+                    let flush_one = |vec: &mut Vec<MergeBucket>, bl: &mut Vec<u64>, (b, kh, h, r): (usize, u64, u64, u32)| {
+                        bl[b] |= Self::bloom_mask(h);
+                        insert_no_wrap(vec, b, kh, r);
+                    };
+                    let mut push_item = |vec: &mut Vec<MergeBucket>, bl: &mut Vec<u64>, t1: u32, t2: u32, r: u32| {
+                        let kh = Self::pack_key(t1, t2);
+                        let h = Self::hash_packed(kh);
+                        let b = (h >> bshift) as usize;
+                        unsafe {
+                            crate::chunk_table::prefetch(bl.as_ptr().add(b) as *const u8);
+                            crate::chunk_table::prefetch(vec.as_ptr().add(b) as *const u8);
+                        }
+                        let slot = rlen & (RING - 1);
+                        if rlen >= RING {
+                            flush_one(vec, bl, ring[slot]);
+                        }
+                        ring[slot] = (b, kh, h, r);
+                        rlen += 1;
+                    };
+                    if want_hot {
+                        for &(t1, t2, r) in &dense_ov {
+                            if (t1 | t2) < hot_t {
+                                push_item(&mut vec, &mut bl, t1, t2, r);
+                            }
+                        }
+                        if use_dense_remap {
+                            for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                                if (t1 | t2) < hot_t {
+                                    let d1 = unsafe { *did_slice.get_unchecked(t1 as usize) } as u32;
+                                    let d2 = unsafe { *did_slice.get_unchecked(t2 as usize) } as u32;
+                                    if (d1 | d2) >= DENSE_N {
+                                        push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                                    }
+                                }
+                            }
+                        } else {
+                            for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                                let or = t1 | t2;
+                                if or >= DENSE_N && or < hot_t {
+                                    push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                                }
+                            }
+                        }
+                    } else {
+                        for &(t1, t2, r) in &dense_ov {
+                            if (t1 | t2) >= hot_t {
+                                push_item(&mut vec, &mut bl, t1, t2, r);
+                            }
+                        }
+                        if use_dense_remap {
+                            for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                                if (t1 | t2) >= hot_t {
+                                    let d1 = unsafe { *did_slice.get_unchecked(t1 as usize) } as u32;
+                                    let d2 = unsafe { *did_slice.get_unchecked(t2 as usize) } as u32;
+                                    if (d1 | d2) >= DENSE_N {
+                                        push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                                    }
+                                }
+                            }
+                        } else {
+                            for (i, &(t1, t2, _)) in merges.iter().enumerate() {
+                                let or = t1 | t2;
+                                if or >= DENSE_N && or >= hot_t {
+                                    push_item(&mut vec, &mut bl, t1, t2, i as u32);
+                                }
+                            }
+                        }
+                    }
+                    let start = rlen.saturating_sub(RING);
+                    for k in start..rlen {
+                        flush_one(&mut vec, &mut bl, ring[k & (RING - 1)]);
+                    }
+                    (vec, bl)
+                };
+
+                let (hot_vec, hot_bloom, cold_vec, cold_bloom) = if cold_nb != 0 {
+                    if allow_par {
+                        let ((hv, hb), (cv, cb)) = rayon::join(
+                            || build_part(true, hot_nb, hot_shift),
+                            || build_part(false, cold_nb, cold_shift),
+                        );
+                        (hv, hb, cv, cb)
+                    } else {
+                        let (hv, hb) = build_part(true, hot_nb, hot_shift);
+                        let (cv, cb) = build_part(false, cold_nb, cold_shift);
+                        (hv, hb, cv, cb)
+                    }
                 } else {
                     let (hv, hb) = build_part(true, hot_nb, hot_shift);
-                    let (cv, cb) = build_part(false, cold_nb, cold_shift);
-                    hot_vec = hv;
-                    hot_bloom = hb;
-                    cold_vec = cv;
-                    cold_bloom = cb;
+                    (hv, hb, Vec::new(), Vec::new())
+                };
+                cold_off = if cold_nb != 0 { hot_vec.len() } else { 0 };
+                let mut bv = crate::chunk_table::HugeVec::<MergeBucket>::zeroed(hot_vec.len() + cold_vec.len());
+                bv[..hot_vec.len()].copy_from_slice(&hot_vec);
+                if !cold_vec.is_empty() {
+                    bv[cold_off..].copy_from_slice(&cold_vec);
                 }
-            } else {
-                let (hv, hb) = build_part(true, hot_nb, hot_shift);
-                hot_vec = hv;
-                hot_bloom = hb;
+                buckets = bv;
+                bloom = if cold_nb != 0 {
+                    let mut bl = vec![0u64; cold_off + cold_nb];
+                    bl[..hot_nb].copy_from_slice(&hot_bloom);
+                    bl[cold_off..cold_off + cold_nb].copy_from_slice(&cold_bloom);
+                    bl
+                } else {
+                    hot_bloom
+                };
             }
         } else {
-            hot_bloom = vec![0u64; total_nb];
+            let mut hot_bloom = vec![0u64; total_nb];
             for (i, &(t1, t2, _tg)) in merges.iter().enumerate() {
                 let r = i as u32;
                 can_lr[(t1 as usize) >> 2] |= 1u8 << (((t1 as usize) & 3) * 2);
@@ -443,6 +646,7 @@ impl MergeMap {
                     entries[idx] = Entry { key, rank: r };
                 }
             }
+            bloom = hot_bloom;
         }
         let target_mask = if use_dense_remap {
             for slot in &mut targets {
@@ -473,33 +677,6 @@ impl MergeMap {
             TARGET_ID_MASK
         } else {
             u32::MAX
-        };
-        let cold_off = if use_packed && cold_nb != 0 { hot_vec.len() } else { 0 };
-        let buckets = if use_packed {
-            let mut bv = crate::chunk_table::HugeVec::<MergeBucket>::zeroed(hot_vec.len() + cold_vec.len());
-            if allow_par && !cold_vec.is_empty() {
-                let (dst_h, dst_c) = bv.split_at_mut(cold_off);
-                rayon::join(
-                    || dst_h.copy_from_slice(&hot_vec),
-                    || dst_c.copy_from_slice(&cold_vec),
-                );
-            } else {
-                bv[..hot_vec.len()].copy_from_slice(&hot_vec);
-                if !cold_vec.is_empty() {
-                    bv[cold_off..].copy_from_slice(&cold_vec);
-                }
-            }
-            bv
-        } else {
-            crate::chunk_table::HugeVec::empty()
-        };
-        let bloom = if use_packed && cold_nb != 0 {
-            let mut bl = vec![0u64; cold_off + cold_nb];
-            bl[..hot_nb].copy_from_slice(&hot_bloom);
-            bl[cold_off..cold_off + cold_nb].copy_from_slice(&cold_bloom);
-            bl
-        } else {
-            hot_bloom
         };
         MergeMap {
             buckets,
@@ -3065,5 +3242,45 @@ mod tests {
         // 1000 a's -> 500 X's (one pass merges all non-overlapping pairs)
         assert!(out.iter().all(|&x| x == 256));
         assert_eq!(out.len(), 500);
+    }
+
+    #[test]
+    fn parallel_mergemap_matches_serial() {
+        let mut seed = 0x9E37_79B9_1234_5678u64;
+        // > 65,536 merges so both `dense_ov` and 16-partition parallel scatter fire!
+        let mut merges: Vec<(u32, u32, u32)> = Vec::with_capacity(70_000);
+        for i in 0..70_000u32 {
+            let (t1, t2) = if i % 1000 == 7 && i > 100 {
+                // Inject intentional duplicate pairs (must keep earliest rank).
+                (merges[50].0, merges[50].1)
+            } else if i >= 66_000 && i < 66_200 {
+                // Force `dense_ov` (rank >= 65534 with both IDs < 1024).
+                ((i - 66_000) % 50 + 10, ((i - 66_000) / 50) + 60)
+            } else {
+                let a = (lcg(&mut seed) as u32) % 90_000;
+                let b = (lcg(&mut seed) as u32) % 90_000;
+                (a, b)
+            };
+            // Non-linear target so both `allow_dense_remap = false` and `true` are tested.
+            let tg = 256 + ((i.wrapping_mul(2654435761)) % 89_000);
+            merges.push((t1, t2, tg));
+        }
+        for remap in [false, true] {
+            let ser = MergeMap::new_with_opts(&merges, false, remap);
+            let par = MergeMap::new_with_opts(&merges, true, remap);
+            for &(t1, t2, _) in merges.iter().step_by(3) {
+                assert_eq!(par.lookup_rank(t1, t2), ser.lookup_rank(t1, t2), "remap={remap} pair=({t1},{t2})");
+            }
+            for i in 66_000..66_200 {
+                let (t1, t2, _) = merges[i];
+                assert_eq!(par.lookup_rank(t1, t2), ser.lookup_rank(t1, t2), "dense_ov remap={remap}");
+            }
+            // Random negative lookups
+            for _ in 0..5_000 {
+                let a = (lcg(&mut seed) as u32) % 95_000;
+                let b = (lcg(&mut seed) as u32) % 95_000;
+                assert_eq!(par.lookup_rank(a, b), ser.lookup_rank(a, b), "neg remap={remap}");
+            }
+        }
     }
 }
