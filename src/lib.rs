@@ -32,6 +32,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use pretok::Pretok;
 
+#[cfg(target_arch = "x86_64")]
+const X86_PF_DIST: usize = 24;
+#[cfg(not(target_arch = "x86_64"))]
+const X86_PF_DIST: usize = 0;
+
 /// Fork safety: rayon pools (global or cached) are threads of the process that
 /// created them; after `fork()` the child inherits the pool's state but not its
 /// threads, so submitting work there deadlocks. We remember the pid of the
@@ -4041,13 +4046,13 @@ impl Tokenizer {
         &self,
         bytes: &[u8],
         buf: &[PipeRec],
+        len: usize,
         ends: &[u32],
         first_a: usize,
         s: &mut Scratch,
         view: chunk_table::View<'_, 3>,
         lview: chunk_table::LongView<'_>,
     ) {
-        let len = buf.len();
         s.out.reserve(6 * len + 16);
         let mut base_out = s.out.as_mut_ptr();
         let mut wp = unsafe { base_out.add(s.out.len()) };
@@ -4055,6 +4060,11 @@ impl Tokenizer {
         let mut rp = base_rp;
         let end_rp = unsafe { base_rp.add(len) };
         while rp < end_rp {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let pf = unsafe { (*rp.add(X86_PF_DIST)).p };
+                chunk_table::prefetch(pf as *const u8);
+            }
             let r = unsafe { *rp };
             let empty_slot = if r.p != 0 {
                 match unsafe { view.emit_inline_at(r.lo, r.hi, r.p, wp) } {
@@ -4283,7 +4293,7 @@ impl Tokenizer {
         if n - pos >= 1024 && n <= u32::MAX as usize {
             const CAP: usize = 256;
             let mut ends = [0u32; CAP];
-            let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP];
+            let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + X86_PF_DIST];
             while pos < n {
                 let first_a = pos;
                 let mut k = 0usize;
@@ -4296,9 +4306,10 @@ impl Tokenizer {
                 let view = self.learned.view();
                 let lview = self.long_table.view();
                 Self::fill_recs(bytes, &ends, 0, k, first_a, buf.as_mut_ptr(), view, lview);
-                // SAFETY: `fill_recs` initialized `buf[..k]`.
-                let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
-                self.flush_recs_sp(bytes, sl, &ends[..k], first_a, s, view, lview);
+                Self::prime_pipe_prefetch(&mut buf, k);
+                // SAFETY: `fill_recs` + `prime_pipe_prefetch` initialized `buf[..k + X86_PF_DIST]`.
+                let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+                self.flush_recs_sp(bytes, sl, k, &ends[..k], first_a, s, view, lview);
             }
         } else {
             while pos < n {
@@ -4396,7 +4407,7 @@ impl Tokenizer {
             let batched = true;
             if batched && n <= u32::MAX as usize {
                 let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
-                let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+                let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK + X86_PF_DIST];
                 let mut scan = blockscan::Scan::new(start);
                 let mut a = start;
                 loop {
@@ -4409,9 +4420,10 @@ impl Tokenizer {
                     let bufp = buf.as_mut_ptr();
                     let first_a = a;
                     a = Self::fill_recs(bytes, &ends, 0, k, a, bufp, view, lview);
-                    // SAFETY: fill_recs wrote buf[..k].
-                    let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
-                    self.flush_recs(bytes, n, sl, &ends[..k], first_a, s, view, lview);
+                    Self::prime_pipe_prefetch(&mut buf, k);
+                    // SAFETY: fill_recs + prime_pipe_prefetch initialized buf[..k + X86_PF_DIST].
+                    let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+                    self.flush_recs(bytes, n, sl, k, &ends[..k], first_a, s, view, lview);
                 }
                 return;
             }
@@ -4487,6 +4499,35 @@ impl Tokenizer {
         }
     }
 
+    /// On x86_64 (32 KiB L1d / 24 LFBs), issuing 256 back-to-back `prefetcht0`s in
+    /// `fill_recs` saturates LFBs and evicts earlier prefetched lines before Phase 2
+    /// consumes them. Instead, pad `buf[total..total + X86_PF_DIST]` with an L1-hot
+    /// dummy address, prime the first `X86_PF_DIST` slots, and prefetch `rp + X86_PF_DIST`
+    /// in steady state during Phase 2. On ARM64 (Apple M4 Max 128 KiB L1d), `fill_recs`
+    /// batch prefetching fits in L1d without eviction, so `X86_PF_DIST = 0`.
+    #[inline(always)]
+    fn prime_pipe_prefetch(buf: &mut [std::mem::MaybeUninit<PipeRec>], total: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            debug_assert!(total + X86_PF_DIST <= buf.len());
+            let dummy = PipeRec { lo: 0, hi: 0, p: buf.as_ptr() as u64 };
+            for j in 0..X86_PF_DIST {
+                unsafe { (*buf.as_mut_ptr().add(total + j)).write(dummy) };
+            }
+            let p0 = buf.as_ptr() as *const PipeRec;
+            for j in 0..total.min(X86_PF_DIST) {
+                let p = unsafe { (*p0.add(j)).p };
+                if p != 0 {
+                    chunk_table::prefetch(p as *const u8);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (buf, total);
+        }
+    }
+
     /// Cold tail loop of `fill_recs` for the last 16 bytes of a document.
     #[inline(never)]
     fn fill_recs_tail(
@@ -4503,6 +4544,7 @@ impl Tokenizer {
             let v = if len.wrapping_sub(1) < chunk_table::MAX_KEY {
                 let (klo, khi) = chunk_table::pack_at(bytes, a, len);
                 let p = view.slot_addr(chunk_table::hash(klo, khi));
+                #[cfg(not(target_arch = "x86_64"))]
                 chunk_table::prefetch(p as *const u8);
                 PipeRec { lo: klo, hi: khi, p }
             } else {
@@ -4532,7 +4574,6 @@ impl Tokenizer {
             if len.wrapping_sub(1) < chunk_table::MAX_KEY {
                 let (klo, khi) = chunk_table::pack_wide_bmi2(bp.add(a), len);
                 let p = view.slot_addr(chunk_table::hash(klo, khi));
-                chunk_table::prefetch(p as *const u8);
                 (*out).write(PipeRec { lo: klo, hi: khi, p });
             } else {
                 let v = Self::fill_rec_long(bytes, a, len, *lview);
@@ -4607,6 +4648,7 @@ impl Tokenizer {
             if len.wrapping_sub(1) < chunk_table::MAX_KEY {
                 let (klo, khi) = unsafe { chunk_table::pack_wide(bp.add(a), len) };
                 let p = view.slot_addr(chunk_table::hash(klo, khi));
+                #[cfg(not(target_arch = "x86_64"))]
                 chunk_table::prefetch(p as *const u8);
                 unsafe { (*out).write(PipeRec { lo: klo, hi: khi, p }) };
             } else {
@@ -4644,13 +4686,13 @@ impl Tokenizer {
         bytes: &[u8],
         n: usize,
         buf: &[PipeRec],
+        len: usize,
         ends: &[u32],
         first_a: usize,
         s: &mut Scratch,
         view: chunk_table::View<'_, 3>,
         lview: chunk_table::LongView<'_>,
     ) {
-        let len = buf.len();
         s.out.reserve(6 * len + 16);
         let mut base_out = s.out.as_mut_ptr();
         let mut wp = unsafe { base_out.add(s.out.len()) };
@@ -4658,6 +4700,11 @@ impl Tokenizer {
         let mut rp = base_rp;
         let end_rp = unsafe { base_rp.add(len) };
         while rp < end_rp {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let pf = unsafe { (*rp.add(X86_PF_DIST)).p };
+                chunk_table::prefetch(pf as *const u8);
+            }
             let r = unsafe { *rp };
             let empty_slot = if r.p != 0 {
                 // SAFETY: capacity >= current_len + 6 * remaining entries (reserved).
@@ -4704,6 +4751,7 @@ impl Tokenizer {
         bytes: &[u8],
         n: usize,
         buf: &[PipeRec],
+        len: usize,
         ends: &[u32],
         first_a: usize,
         s: &mut Scratch,
@@ -4713,8 +4761,13 @@ impl Tokenizer {
         let mut total = 0usize;
         let base_rp = buf.as_ptr();
         let mut rp = base_rp;
-        let end_rp = unsafe { base_rp.add(buf.len()) };
+        let end_rp = unsafe { base_rp.add(len) };
         while rp < end_rp {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let pf = unsafe { (*rp.add(X86_PF_DIST)).p };
+                chunk_table::prefetch(pf as *const u8);
+            }
             let r = unsafe { *rp };
             let empty_slot = if r.p != 0 {
                 match unsafe { view.count_inline_at(r.lo, r.hi, r.p) } {
@@ -4767,6 +4820,11 @@ impl Tokenizer {
         let mut rp = base_rp;
         let end_rp = unsafe { buf.as_ptr().add(shi) };
         while rp < end_rp {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let pf = unsafe { (*rp.add(X86_PF_DIST)).p };
+                chunk_table::prefetch(pf as *const u8);
+            }
             let r = unsafe { *rp };
             let empty_slot = if r.p != 0 {
                 match unsafe { view.count_inline_at(r.lo, r.hi, r.p) } {
@@ -4866,6 +4924,11 @@ impl Tokenizer {
         let mut rp = base_rp;
         let end_rp = unsafe { buf.as_ptr().add(shi) };
         while rp < end_rp {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let pf = unsafe { (*rp.add(X86_PF_DIST)).p };
+                chunk_table::prefetch(pf as *const u8);
+            }
             let r = unsafe { *rp };
             let empty_slot = if r.p != 0 {
                 // SAFETY: caller reserved `6 * remaining_batch + 16` slots.
@@ -4923,7 +4986,7 @@ impl Tokenizer {
         bad_wide: &mut dyn FnMut(usize),
     ) {
         const CAP: usize = 256;
-        let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+        let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK + X86_PF_DIST];
         let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
         // (slo, shi, local_di, first_a, uoff, ulen) — ulen == 0 => raw/utf8 FastItem
         let mut segs: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::with_capacity(64);
@@ -4933,7 +4996,8 @@ impl Tokenizer {
         let mut ubuf = std::mem::take(&mut s.utf8);
         let need_norm = !self.normalizer.is_identity();
         let has_special = SPECIAL && self.special_ac.is_some();
-        let flush = |buf: &[std::mem::MaybeUninit<PipeRec>],
+        let flush = |buf: &mut [std::mem::MaybeUninit<PipeRec>],
+                     total: usize,
                      ends: &[u32],
                      segs: &[(usize, usize, usize, usize, usize, usize)],
                      ubuf: &[u8],
@@ -4944,8 +5008,8 @@ impl Tokenizer {
             if segs.is_empty() {
                 return;
             }
-            let total = buf.len();
-            let buf: &[PipeRec] = unsafe { &*(buf as *const _ as *const [PipeRec]) };
+            Self::prime_pipe_prefetch(buf, total);
+            let buf: &[PipeRec] = unsafe { &*(&buf[..total + X86_PF_DIST] as *const _ as *const [PipeRec]) };
             if !WANT_OUTPUT {
                 for &(slo, shi, ldi, first_a, uoff, ulen) in segs {
                     let n = self.flush_seg_count(
@@ -5010,7 +5074,7 @@ impl Tokenizer {
                 if cnt == 0 {
                     ubuf.clear();
                 } else if raw_len > 16384 {
-                    flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                    flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
                     cnt = 0;
                     segs.clear();
                     ubuf.clear();
@@ -5023,7 +5087,7 @@ impl Tokenizer {
                 }
                 if has_special && self.special_prefilter.find_first(&ubuf[uoff..]).is_some() {
                     if cnt > 0 {
-                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
                         cnt = 0;
                         segs.clear();
                     }
@@ -5072,7 +5136,7 @@ impl Tokenizer {
                     segs.push((cnt, k1, ldi, first_a, uoff, ulen));
                     cnt = k1;
                     if cnt >= CAP {
-                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
                         cnt = 0;
                         segs.clear();
                     }
@@ -5085,7 +5149,7 @@ impl Tokenizer {
             let d = unsafe { std::slice::from_raw_parts(it.ptr, raw_len) };
             if has_special && tag != FAST_RAW && self.special_prefilter.find_first(d).is_some() {
                 if cnt > 0 {
-                    flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                    flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
                     cnt = 0;
                     segs.clear();
                 }
@@ -5117,7 +5181,7 @@ impl Tokenizer {
                     if cnt == 0 {
                         ubuf.clear();
                     } else if ns.len() > 16384 {
-                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
                         cnt = 0;
                         segs.clear();
                         ubuf.clear();
@@ -5145,7 +5209,7 @@ impl Tokenizer {
                         segs.push((cnt, k1, ldi, first_a, uoff, ulen));
                         cnt = k1;
                         if cnt >= CAP {
-                            flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                            flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
                             cnt = 0;
                             segs.clear();
                         }
@@ -5172,7 +5236,7 @@ impl Tokenizer {
                 segs.push((cnt, k1, ldi, first_a, 0, 0));
                 cnt = k1;
                 if cnt >= CAP {
-                    flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+                    flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
                     cnt = 0;
                     segs.clear();
                 }
@@ -5184,7 +5248,7 @@ impl Tokenizer {
                 bad_bytes(base_doc + ldi);
             }
         }
-        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
+        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, doc_counts, view, lview);
         ubuf.clear();
         s.utf8 = ubuf;
     }
@@ -5518,7 +5582,7 @@ impl Tokenizer {
         bad_wide: &mut dyn FnMut(u32),
     ) {
         const CAP: usize = 256;
-        let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+        let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK + X86_PF_DIST];
         let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
         // (seg_lo, seg_hi, item_idx, first_a, ubuf_off, ubuf_len) — ubuf_len == 0 => norm[doc]
         let mut segs: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::with_capacity(64);
@@ -5526,7 +5590,8 @@ impl Tokenizer {
         let mut view = self.learned.view();
         let mut lview = self.long_table.view();
         let mut ubuf = std::mem::take(&mut s.utf8);
-        let flush = |buf: &[std::mem::MaybeUninit<PipeRec>],
+        let flush = |buf: &mut [std::mem::MaybeUninit<PipeRec>],
+                     total: usize,
                      ends: &[u32],
                      segs: &[(usize, usize, usize, usize, usize, usize)],
                      ubuf: &[u8],
@@ -5534,30 +5599,61 @@ impl Tokenizer {
                      counts: &mut [u32],
                      view: chunk_table::View<'_, 3>,
                      lview: chunk_table::LongView<'_>| {
-            let buf: &[PipeRec] = unsafe { &*(buf as *const _ as *const [PipeRec]) };
-            for &(slo, shi, ii, first_a, uoff, ulen) in segs {
-                let d: &[u8] = if ulen != 0 {
-                    &ubuf[uoff..uoff + ulen]
-                } else {
-                    &norm[items[ii].0 as usize]
-                };
-                if WANT_OUTPUT {
-                    let before = s.out.len();
-                    self.flush_recs(d, d.len(), &buf[slo..shi], &ends[slo..shi], first_a, s, view, lview);
-                    counts[ii] += (s.out.len() - before) as u32;
-                } else {
-                    counts[ii] += self.flush_recs_count(
-                        d,
-                        d.len(),
-                        &buf[slo..shi],
-                        &ends[slo..shi],
+            if segs.is_empty() {
+                return;
+            }
+            Self::prime_pipe_prefetch(buf, total);
+            let buf: &[PipeRec] = unsafe { &*(&buf[..total + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+            if !WANT_OUTPUT {
+                for &(slo, shi, ii, first_a, uoff, ulen) in segs {
+                    let n = self.flush_seg_count(
+                        buf,
+                        ends,
+                        slo,
+                        shi,
                         first_a,
+                        || {
+                            if ulen != 0 {
+                                &ubuf[uoff..uoff + ulen]
+                            } else {
+                                &norm[items[ii].0 as usize]
+                            }
+                        },
                         s,
                         view,
                         lview,
-                    ) as u32;
+                    );
+                    counts[ii] += n as u32;
                 }
+                return;
             }
+            s.out.reserve(6 * total + 16);
+            let mut base_out = s.out.as_mut_ptr();
+            let mut wp = unsafe { base_out.add(s.out.len()) };
+            for &(slo, shi, ii, first_a, uoff, ulen) in segs {
+                let n = self.flush_seg_into(
+                    buf,
+                    ends,
+                    slo,
+                    shi,
+                    total,
+                    first_a,
+                    || {
+                        if ulen != 0 {
+                            &ubuf[uoff..uoff + ulen]
+                        } else {
+                            &norm[items[ii].0 as usize]
+                        }
+                    },
+                    s,
+                    &mut base_out,
+                    &mut wp,
+                    view,
+                    lview,
+                );
+                counts[ii] += n as u32;
+            }
+            unsafe { s.out.set_len(wp.offset_from(base_out) as usize) };
         };
         let defer_norm = self.parallel_unicode_norm();
         for (ii, &(doc, a0, b0, seg)) in items.iter().enumerate() {
@@ -5565,7 +5661,7 @@ impl Tokenizer {
                 if cnt == 0 {
                     ubuf.clear();
                 } else if b0 - a0 > 16384 {
-                    flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                    flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                     cnt = 0;
                     segs.clear();
                     ubuf.clear();
@@ -5587,7 +5683,7 @@ impl Tokenizer {
                 }
                 let ulen = ubuf.len() - uoff;
                 if ulen > u32::MAX as usize {
-                    flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                    flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                     cnt = 0;
                     segs.clear();
                     let before = s.out.len();
@@ -5613,7 +5709,7 @@ impl Tokenizer {
                     segs.push((cnt, k1, ii, first_a, uoff, ulen));
                     cnt = k1;
                     if cnt >= CAP {
-                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                         cnt = 0;
                         segs.clear();
                     }
@@ -5640,7 +5736,7 @@ impl Tokenizer {
                     if cnt == 0 {
                         ubuf.clear();
                     } else if norm_s.len() > 16384 {
-                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                         cnt = 0;
                         segs.clear();
                         ubuf.clear();
@@ -5656,7 +5752,7 @@ impl Tokenizer {
                     }
                     let ulen = ubuf.len() - uoff;
                     if ulen > u32::MAX as usize {
-                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                         cnt = 0;
                         segs.clear();
                         let before = s.out.len();
@@ -5682,7 +5778,7 @@ impl Tokenizer {
                         segs.push((cnt, k1, ii, first_a, uoff, ulen));
                         cnt = k1;
                         if cnt >= CAP {
-                            flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                            flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                             cnt = 0;
                             segs.clear();
                         }
@@ -5698,7 +5794,7 @@ impl Tokenizer {
                     bad_bytes(doc);
                     continue;
                 }
-                flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                 cnt = 0;
                 segs.clear();
                 let before = s.out.len();
@@ -5722,7 +5818,7 @@ impl Tokenizer {
                 segs.push((cnt, k1, ii, first_a, 0, 0));
                 cnt = k1;
                 if cnt >= CAP {
-                    flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                    flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
                     cnt = 0;
                     segs.clear();
                 }
@@ -5734,7 +5830,7 @@ impl Tokenizer {
                 bad_bytes(doc);
             }
         }
-        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+        flush(&mut buf, cnt, &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
         ubuf.clear();
         s.utf8 = ubuf;
     }
@@ -6371,13 +6467,14 @@ impl Tokenizer {
         doc_counts: &mut Vec<usize>,
     ) -> Option<usize> {
         const CAP: usize = 256;
-        let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+        let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK + X86_PF_DIST];
         let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
         segs.clear();
         let mut cnt = 0usize;
         let mut view = self.learned.view();
         let mut lview = self.long_table.view();
-        let flush = |buf: &[std::mem::MaybeUninit<PipeRec>],
+        let flush = |buf: &mut [std::mem::MaybeUninit<PipeRec>],
+                     total: usize,
                      ends: &[u32],
                      segs: &[(usize, usize, usize, usize, usize, usize)],
                      s: &mut Scratch,
@@ -6387,8 +6484,8 @@ impl Tokenizer {
             if segs.is_empty() {
                 return;
             }
-            let total = buf.len();
-            let buf: &[PipeRec] = unsafe { &*(buf as *const _ as *const [PipeRec]) };
+            Self::prime_pipe_prefetch(buf, total);
+            let buf: &[PipeRec] = unsafe { &*(&buf[..total + X86_PF_DIST] as *const _ as *const [PipeRec]) };
             if !WANT_OUTPUT {
                 for &(slo, shi, di, first_a, ds, de) in segs {
                     let n = self.flush_seg_count(
@@ -6454,7 +6551,7 @@ impl Tokenizer {
                             bad_local = Some(di);
                         }
                     } else {
-                        flush(&buf[..cnt], &ends[..cnt], segs, s, doc_counts, view, lview);
+                        flush(&mut buf, cnt, &ends[..cnt], segs, s, doc_counts, view, lview);
                         cnt = 0;
                         segs.clear();
                         let before = s.out.len();
@@ -6481,7 +6578,7 @@ impl Tokenizer {
                         segs.push((cnt, k1, di, first_a, p, doc_end));
                         cnt = k1;
                         if cnt >= CAP {
-                            flush(&buf[..cnt], &ends[..cnt], segs, s, doc_counts, view, lview);
+                            flush(&mut buf, cnt, &ends[..cnt], segs, s, doc_counts, view, lview);
                             cnt = 0;
                             segs.clear();
                         }
@@ -6502,7 +6599,7 @@ impl Tokenizer {
                 None => break,
             }
         }
-        flush(&buf[..cnt], &ends[..cnt], segs, s, doc_counts, view, lview);
+        flush(&mut buf, cnt, &ends[..cnt], segs, s, doc_counts, view, lview);
         bad_local
     }
 
@@ -6889,7 +6986,7 @@ impl Tokenizer {
         if stop - start >= 512 && n <= u32::MAX as usize {
             const CAP: usize = 256;
             let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
-            let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+            let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK + X86_PF_DIST];
             let mut scan = cjk::CjkScan::new(start);
             let mut a = start;
             loop {
@@ -6901,9 +6998,10 @@ impl Tokenizer {
                 let lview = self.long_table.view();
                 let first_a = a;
                 a = Self::fill_recs(bytes, &ends, 0, k, a, buf.as_mut_ptr(), view, lview);
-                // SAFETY: fill_recs initialized buf[..k].
-                let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
-                self.flush_recs(bytes, n, sl, &ends[..k], first_a, s, view, lview);
+                Self::prime_pipe_prefetch(&mut buf, k);
+                // SAFETY: fill_recs + prime_pipe_prefetch initialized buf[..k + X86_PF_DIST].
+                let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+                self.flush_recs(bytes, n, sl, k, &ends[..k], first_a, s, view, lview);
             }
             return;
         }
@@ -7540,7 +7638,7 @@ impl Tokenizer {
             return self.with_scratch(|s| {
                 const CAP: usize = 256;
                 let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
-                let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+                let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK + X86_PF_DIST];
                 let mut scan = blockscan::Scan::new(0);
                 let mut a = 0usize;
                 let mut total = 0usize;
@@ -7553,8 +7651,9 @@ impl Tokenizer {
                     let lview = self.long_table.view();
                     let first_a = a;
                     a = Self::fill_recs(bytes, &ends, 0, k, a, buf.as_mut_ptr(), view, lview);
-                    let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
-                    total += self.flush_recs_count(bytes, n, sl, &ends[..k], first_a, s, view, lview);
+                    Self::prime_pipe_prefetch(&mut buf, k);
+                    let sl = unsafe { &*(&buf[..k + X86_PF_DIST] as *const _ as *const [PipeRec]) };
+                    total += self.flush_recs_count(bytes, n, sl, k, &ends[..k], first_a, s, view, lview);
                 }
                 total
             });
