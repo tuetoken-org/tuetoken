@@ -1039,11 +1039,41 @@ fn special_prefilter_classification_and_scan() {
     assert_eq!(p_three.find_first(b"plain text"), None);
     assert_eq!(p_three.find_first(b"a {X}"), Some(2));
 
+    // 4..=8 distinct first bytes use the exact SIMD nibble-table set prefilter
+    // with per-slot required second-byte filtering (like Gemma-2/3).
+    let p_gemma = SpecialPrefilter::from_patterns(&[
+        "\t\t".to_string(),
+        "\n".to_string(),
+        "<bos>".to_string(),
+        "<eos>".to_string(),
+        "[multimodal]".to_string(),
+        "▁▁".to_string(),
+    ]);
+    assert!(matches!(p_gemma, SpecialPrefilter::SimdSet { .. }));
+    // Skips plain ASCII, em-dash (0xe2 0x80 != 0xe2 0x96), single tab, and `[1]` across SIMD lanes
+    let clean = format!(
+        "{} — hello [1] \t world {} — end",
+        "x".repeat(40),
+        "y".repeat(40)
+    );
+    assert_eq!(p_gemma.find_first(clean.as_bytes()), None);
+    let with_sp = format!("{} — [1] [multimodal] tail", "z".repeat(35));
+    assert_eq!(p_gemma.find_first(with_sp.as_bytes()), Some(with_sp.find("[multimodal]").unwrap()));
+    let with_meta = format!("{} — ▁▁ tail", "a".repeat(33));
+    assert_eq!(p_gemma.find_first(with_meta.as_bytes()), Some(with_meta.find("▁▁").unwrap()));
+    let with_nl = format!("{}a\nb", "q".repeat(31));
+    assert_eq!(p_gemma.find_first(with_nl.as_bytes()), Some(32));
+
     let p_many = SpecialPrefilter::from_patterns(&[
         "a".to_string(),
         "b".to_string(),
         "c".to_string(),
         "d".to_string(),
+        "e".to_string(),
+        "f".to_string(),
+        "g".to_string(),
+        "h".to_string(),
+        "i".to_string(),
     ]);
     assert_eq!(p_many, SpecialPrefilter::None);
     assert_eq!(p_many.find_first(b"xyz"), Some(0));
