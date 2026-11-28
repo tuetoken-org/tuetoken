@@ -18,6 +18,11 @@ mod pretok;
 mod pretok_pipe;
 mod unicode;
 mod unicode_tables;
+mod utf8_simd;
+
+use utf8_simd::{latin1_to_utf8_append, ucs2_to_utf8_append, ucs4_to_utf8_append, ucs4_to_utf8_ptr, units_to_utf8, utf8_len};
+#[cfg(target_arch = "x86_64")]
+use utf8_simd::has_avx2_bmi1;
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
@@ -1667,367 +1672,6 @@ impl PyText {
     }
 }
 
-/// Exact UTF-8 length of `units` (a surrogate counts 3, like the 3 bytes it
-/// would take; `units_to_utf8` rejects it). Branch-free, vectorizes.
-fn utf8_len<T: Copy + Into<u32>>(units: &[T]) -> usize {
-    units
-        .iter()
-        .map(|&u| {
-            let c: u32 = u.into();
-            1 + (c >= 0x80) as usize + (c >= 0x800) as usize + (c >= 0x10000) as usize
-        })
-        .sum()
-}
-
-/// Write the UTF-8 of `units` to `dst`; Ok(bytes written) — exactly
-/// `utf8_len(units)` — or Err(i) at the first surrogate (which UTF-8 cannot
-/// encode, exactly as CPython's `str.encode` refuses). Runs of ASCII are
-/// copied a word at a time.
-/// SAFETY: `dst` must be valid for `utf8_len(units)` writes.
-unsafe fn units_to_utf8<T: Copy + Into<u32>>(units: &[T], dst: *mut u8) -> Result<usize, usize> {
-    let w = std::mem::size_of::<T>();
-    let n = units.len();
-    let mut i = 0usize;
-    let mut o = dst;
-    let src = units.as_ptr() as *const u8;
-    // ASCII fast path: 8 bytes of input per step
-    let per = 8 / w;
-    let hi: u64 = match w {
-        1 => 0x8080_8080_8080_8080,
-        2 => 0xFF80_FF80_FF80_FF80,
-        _ => 0xFFFF_FF80_FFFF_FF80,
-    };
-    while i < n {
-        if i + per <= n {
-            let x = std::ptr::read_unaligned(src.add(i * w) as *const u64);
-            if x & hi == 0 {
-                for k in 0..per {
-                    *o.add(k) = (x >> (8 * w * k)) as u8;
-                }
-                o = o.add(per);
-                i += per;
-                continue;
-            }
-        }
-        let c: u32 = units[i].into();
-        if c < 0x80 {
-            *o = c as u8;
-            o = o.add(1);
-        } else if c < 0x800 {
-            *o = 0xC0 | (c >> 6) as u8;
-            *o.add(1) = 0x80 | (c & 0x3F) as u8;
-            o = o.add(2);
-        } else if c < 0x10000 {
-            if (0xD800..0xE000).contains(&c) {
-                return Err(i);
-            }
-            *o = 0xE0 | (c >> 12) as u8;
-            *o.add(1) = 0x80 | ((c >> 6) & 0x3F) as u8;
-            *o.add(2) = 0x80 | (c & 0x3F) as u8;
-            o = o.add(3);
-        } else {
-            *o = 0xF0 | (c >> 18) as u8;
-            *o.add(1) = 0x80 | ((c >> 12) & 0x3F) as u8;
-            *o.add(2) = 0x80 | ((c >> 6) & 0x3F) as u8;
-            *o.add(3) = 0x80 | (c & 0x3F) as u8;
-            o = o.add(4);
-        }
-        i += 1;
-    }
-    Ok(o.offset_from(dst) as usize)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn has_avx2_bmi1() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
-    static T: AtomicU8 = AtomicU8::new(0);
-    let mut v = T.load(Relaxed);
-    if v == 0 {
-        v = if std::is_x86_feature_detected!("avx2")
-            && std::is_x86_feature_detected!("bmi1")
-            && std::is_x86_feature_detected!("bmi2")
-        {
-            2
-        } else {
-            1
-        };
-        T.store(v, Relaxed);
-    }
-    v == 2
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi1")]
-unsafe fn latin1_to_utf8_avx2(sp: *const u8, n: usize, o: &mut *mut u8, i: &mut usize) {
-    use std::arch::x86_64::*;
-    let mut op = *o;
-    let mut idx = *i;
-    while idx + 32 <= n {
-        let v = _mm256_loadu_si256(sp.add(idx) as *const __m256i);
-        _mm256_storeu_si256(op as *mut __m256i, v);
-        let m = _mm256_movemask_epi8(v) as u32;
-        if m == 0 {
-            op = op.add(32);
-            idx += 32;
-        } else {
-            let tz = m.trailing_zeros() as usize;
-            let c = *sp.add(idx + tz);
-            *op.add(tz) = 0xC0 | (c >> 6);
-            *op.add(tz + 1) = 0x80 | (c & 0x3F);
-            op = op.add(tz + 2);
-            idx += tz + 1;
-        }
-    }
-    *o = op;
-    *i = idx;
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi1")]
-unsafe fn ucs2_to_utf8_avx2(sp: *const u16, n: usize, o: &mut *mut u8, i: &mut usize) -> Result<(), usize> {
-    use std::arch::x86_64::*;
-    let k_hi = _mm256_set1_epi16(0xFF80u16 as i16);
-    let zero = _mm256_setzero_si256();
-    let mut op = *o;
-    let mut idx = *i;
-    while idx + 32 <= n {
-        let v0 = _mm256_loadu_si256(sp.add(idx) as *const __m256i);
-        let v1 = _mm256_loadu_si256(sp.add(idx + 16) as *const __m256i);
-        let packed = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi16(v0, v1));
-        _mm256_storeu_si256(op as *mut __m256i, packed);
-        if _mm256_testz_si256(_mm256_or_si256(v0, v1), k_hi) != 0 {
-            op = op.add(32);
-            idx += 32;
-        } else {
-            let c0 = _mm256_cmpeq_epi16(_mm256_and_si256(v0, k_hi), zero);
-            let m0 = _mm256_movemask_epi8(c0) as u32;
-            let tz = if m0 != u32::MAX {
-                ((!m0).trailing_zeros() >> 1) as usize
-            } else {
-                let c1 = _mm256_cmpeq_epi16(_mm256_and_si256(v1, k_hi), zero);
-                let m1 = _mm256_movemask_epi8(c1) as u32;
-                16 + ((!m1).trailing_zeros() >> 1) as usize
-            };
-            let c = *sp.add(idx + tz) as u32;
-            if c < 0x800 {
-                *op.add(tz) = 0xC0 | (c >> 6) as u8;
-                *op.add(tz + 1) = 0x80 | (c & 0x3F) as u8;
-                op = op.add(tz + 2);
-            } else {
-                if (0xD800..0xE000).contains(&c) {
-                    return Err(idx + tz);
-                }
-                *op.add(tz) = 0xE0 | (c >> 12) as u8;
-                *op.add(tz + 1) = 0x80 | ((c >> 6) & 0x3F) as u8;
-                *op.add(tz + 2) = 0x80 | (c & 0x3F) as u8;
-                op = op.add(tz + 3);
-            }
-            idx += tz + 1;
-        }
-    }
-    *o = op;
-    *i = idx;
-    Ok(())
-}
-
-/// SIMD-accelerated branch-free store-and-skip Latin-1 (`u8`) -> UTF-8 append
-/// into a reusable L1/L2 Vec. Pure-ASCII 32B (AVX2) / 16B (NEON/SSE2) spans
-/// copy in one vector store; spans with a non-ASCII byte keep the ASCII prefix
-/// already written, emit the 2-byte UTF-8 sequence at `tz`, and resume at `tz + 1`.
-#[inline]
-fn latin1_to_utf8_append(src: &[u8], dst: &mut Vec<u8>) {
-    let n = src.len();
-    dst.reserve(n * 2 + 32);
-    let base = dst.len();
-    let sp = src.as_ptr();
-    let mut o = unsafe { dst.as_mut_ptr().add(base) };
-    let mut i = 0usize;
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let k80 = vdupq_n_u8(0x80);
-        while i + 16 <= n {
-            let v = vld1q_u8(sp.add(i));
-            vst1q_u8(o, v);
-            let msb = vandq_u8(v, k80);
-            let lo = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(msb));
-            let hi = vgetq_lane_u64::<1>(vreinterpretq_u64_u8(msb));
-            if (lo | hi) == 0 {
-                o = o.add(16);
-                i += 16;
-            } else {
-                let tz = if lo != 0 {
-                    (lo.trailing_zeros() >> 3) as usize
-                } else {
-                    8 + (hi.trailing_zeros() >> 3) as usize
-                };
-                let c = *sp.add(i + tz);
-                *o.add(tz) = 0xC0 | (c >> 6);
-                *o.add(tz + 1) = 0x80 | (c & 0x3F);
-                o = o.add(tz + 2);
-                i += tz + 1;
-            }
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if n >= 32 && has_avx2_bmi1() {
-            latin1_to_utf8_avx2(sp, n, &mut o, &mut i);
-        }
-        use std::arch::x86_64::*;
-        while i + 16 <= n {
-            let v = _mm_loadu_si128(sp.add(i) as *const __m128i);
-            _mm_storeu_si128(o as *mut __m128i, v);
-            let m = _mm_movemask_epi8(v) as u32;
-            if m == 0 {
-                o = o.add(16);
-                i += 16;
-            } else {
-                let tz = m.trailing_zeros() as usize;
-                let c = *sp.add(i + tz);
-                *o.add(tz) = 0xC0 | (c >> 6);
-                *o.add(tz + 1) = 0x80 | (c & 0x3F);
-                o = o.add(tz + 2);
-                i += tz + 1;
-            }
-        }
-    }
-    unsafe {
-        while i < n {
-            let c = *sp.add(i);
-            if c < 0x80 {
-                *o = c;
-                o = o.add(1);
-            } else {
-                *o = 0xC0 | (c >> 6);
-                *o.add(1) = 0x80 | (c & 0x3F);
-                o = o.add(2);
-            }
-            i += 1;
-        }
-        let written = o.offset_from(dst.as_ptr().add(base)) as usize;
-        dst.set_len(base + written);
-    }
-}
-
-/// SIMD-accelerated store-and-skip UCS-2 (`u16`) -> UTF-8 append into a
-/// reusable L1/L2 Vec. Packs 32 (AVX2) / 16 (NEON/SSE2) code units per step;
-/// rejects lone surrogates (`0xD800..0xE000`) with `Err(code_unit_index)`.
-#[inline]
-fn ucs2_to_utf8_append(src: &[u16], dst: &mut Vec<u8>) -> Result<(), usize> {
-    let n = src.len();
-    dst.reserve(n * 3 + 32);
-    let base = dst.len();
-    let sp = src.as_ptr();
-    let mut o = unsafe { dst.as_mut_ptr().add(base) };
-    let mut i = 0usize;
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let k_hi = vdupq_n_u16(0xFF80);
-        while i + 16 <= n {
-            let v0 = vld1q_u16(sp.add(i));
-            let v1 = vld1q_u16(sp.add(i + 8));
-            let packed = vcombine_u8(vmovn_u16(v0), vmovn_u16(v1));
-            vst1q_u8(o, packed);
-            let m0 = vtstq_u16(v0, k_hi);
-            let m1 = vtstq_u16(v1, k_hi);
-            let mm = vcombine_u8(vmovn_u16(m0), vmovn_u16(m1));
-            let lo = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(mm));
-            let hi = vgetq_lane_u64::<1>(vreinterpretq_u64_u8(mm));
-            if (lo | hi) == 0 {
-                o = o.add(16);
-                i += 16;
-            } else {
-                let tz = if lo != 0 {
-                    (lo.trailing_zeros() >> 3) as usize
-                } else {
-                    8 + (hi.trailing_zeros() >> 3) as usize
-                };
-                let c = *sp.add(i + tz) as u32;
-                if c < 0x800 {
-                    *o.add(tz) = 0xC0 | (c >> 6) as u8;
-                    *o.add(tz + 1) = 0x80 | (c & 0x3F) as u8;
-                    o = o.add(tz + 2);
-                } else {
-                    if (0xD800..0xE000).contains(&c) {
-                        return Err(i + tz);
-                    }
-                    *o.add(tz) = 0xE0 | (c >> 12) as u8;
-                    *o.add(tz + 1) = 0x80 | ((c >> 6) & 0x3F) as u8;
-                    *o.add(tz + 2) = 0x80 | (c & 0x3F) as u8;
-                    o = o.add(tz + 3);
-                }
-                i += tz + 1;
-            }
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if n >= 32 && has_avx2_bmi1() {
-            ucs2_to_utf8_avx2(sp, n, &mut o, &mut i)?;
-        }
-        use std::arch::x86_64::*;
-        let k_hi = _mm_set1_epi16(0xFF80u16 as i16);
-        let zero = _mm_setzero_si128();
-        while i + 16 <= n {
-            let v0 = _mm_loadu_si128(sp.add(i) as *const __m128i);
-            let v1 = _mm_loadu_si128(sp.add(i + 8) as *const __m128i);
-            _mm_storeu_si128(o as *mut __m128i, _mm_packus_epi16(v0, v1));
-            let m0 = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_and_si128(v0, k_hi), zero)) as u32;
-            let m1 = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_and_si128(v1, k_hi), zero)) as u32;
-            let bad = !(m0 | (m1 << 16));
-            if bad == 0 {
-                o = o.add(16);
-                i += 16;
-            } else {
-                let tz = (bad.trailing_zeros() >> 1) as usize;
-                let c = *sp.add(i + tz) as u32;
-                if c < 0x800 {
-                    *o.add(tz) = 0xC0 | (c >> 6) as u8;
-                    *o.add(tz + 1) = 0x80 | (c & 0x3F) as u8;
-                    o = o.add(tz + 2);
-                } else {
-                    if (0xD800..0xE000).contains(&c) {
-                        return Err(i + tz);
-                    }
-                    *o.add(tz) = 0xE0 | (c >> 12) as u8;
-                    *o.add(tz + 1) = 0x80 | ((c >> 6) & 0x3F) as u8;
-                    *o.add(tz + 2) = 0x80 | (c & 0x3F) as u8;
-                    o = o.add(tz + 3);
-                }
-                i += tz + 1;
-            }
-        }
-    }
-    unsafe {
-        while i < n {
-            let c = *sp.add(i) as u32;
-            if c < 0x80 {
-                *o = c as u8;
-                o = o.add(1);
-            } else if c < 0x800 {
-                *o = 0xC0 | (c >> 6) as u8;
-                *o.add(1) = 0x80 | (c & 0x3F) as u8;
-                o = o.add(2);
-            } else {
-                if (0xD800..0xE000).contains(&c) {
-                    return Err(i);
-                }
-                *o = 0xE0 | (c >> 12) as u8;
-                *o.add(1) = 0x80 | ((c >> 6) & 0x3F) as u8;
-                *o.add(2) = 0x80 | (c & 0x3F) as u8;
-                o = o.add(3);
-            }
-            i += 1;
-        }
-        let written = o.offset_from(dst.as_ptr().add(base)) as usize;
-        dst.set_len(base + written);
-    }
-    Ok(())
-}
-
 impl WideStr {
     /// Exact UTF-8 length of code units [lo, hi).
     fn utf8_len(&self, lo: usize, hi: usize) -> usize {
@@ -2047,7 +1691,7 @@ impl WideStr {
         match self.kind {
             1 => units_to_utf8(&std::slice::from_raw_parts(self.data, self.len)[lo..hi], dst),
             2 => units_to_utf8(&std::slice::from_raw_parts(self.data as *const u16, self.len)[lo..hi], dst),
-            _ => units_to_utf8(&std::slice::from_raw_parts(self.data as *const u32, self.len)[lo..hi], dst),
+            _ => ucs4_to_utf8_ptr(&std::slice::from_raw_parts(self.data as *const u32, self.len)[lo..hi], dst),
         }
         .map_err(|i| lo + i)
     }
@@ -2071,12 +1715,8 @@ impl WideStr {
                     ucs2_to_utf8_append(sl, dst).map_err(|i| lo + i)
                 }
                 _ => {
-                    dst.reserve(count * 4);
-                    let base = dst.len();
                     let sl = &std::slice::from_raw_parts(self.data as *const u32, self.len)[lo..hi];
-                    let w = units_to_utf8(sl, dst.as_mut_ptr().add(base)).map_err(|i| lo + i)?;
-                    dst.set_len(base + w);
-                    Ok(())
+                    ucs4_to_utf8_append(sl, dst).map_err(|i| lo + i)
                 }
             }
         }
@@ -2494,12 +2134,7 @@ impl FastItem {
                     ucs2_to_utf8_append(std::slice::from_raw_parts(self.ptr as *const u16, count), dst)
                 }
                 _ => {
-                    dst.reserve(count * 4);
-                    let base = dst.len();
-                    let sl = std::slice::from_raw_parts(self.ptr as *const u32, count);
-                    let w = units_to_utf8(sl, dst.as_mut_ptr().add(base))?;
-                    dst.set_len(base + w);
-                    Ok(())
+                    ucs4_to_utf8_append(std::slice::from_raw_parts(self.ptr as *const u32, count), dst)
                 }
             }
         }
