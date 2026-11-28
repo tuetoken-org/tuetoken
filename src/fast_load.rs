@@ -800,16 +800,40 @@ fn align_entry_start(b: &[u8], mut i: usize, mut in_str: bool, limit: usize, is_
 /// 16-shard parallel open-addressing vocab lookup table (`raw_utf8_bytes -> id`).
 /// Pre-bucketed during parallel vocab parsing so each shard builder touches only
 /// its own 1/16 slice with 16-ahead prefetching (< 0.5 ms for 200K tokens).
+///
+/// Compact 16-byte `VSlot` inlines all keys `<= 8` bytes (~90%+ of merge inputs)
+/// directly inside `payload: u64`, eliminating the second unprefetched L3 cache
+/// miss into `raw_arenas` on >90% of `VocabIndex::get_h_padded` probes.
 const VSHARDS: usize = 16;
 const VSHARD_SHIFT: u32 = 64 - 4; // top 4 bits select shard 0..16
+const INLINE_CHUNK: u16 = u16::MAX;
+
+/// Branchless 2-instruction pack of `base[off..off+len]` (`len <= 8`) into `u64`.
+/// Caller ensures `off + 8 <= base.len()` (via 8-byte arena tail slack).
+#[inline(always)]
+fn pack_inline_u64_padded(base: &[u8], off: usize, len: usize) -> u64 {
+    debug_assert!(len <= 8 && off + 8 <= base.len());
+    if len == 0 {
+        return 0;
+    }
+    let w = u64::from_le(unsafe { (base.as_ptr().add(off) as *const u64).read_unaligned() });
+    w & (u64::MAX >> ((8 - len) << 3))
+}
+
+#[inline(always)]
+fn pack_inline_u64_exact(b: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for (i, &c) in b.iter().enumerate() {
+        v |= (c as u64) << (i << 3);
+    }
+    v
+}
 
 #[derive(Clone, Copy)]
 struct VSlot {
-    h32: u32,
-    id: u32,
-    off: u32,
-    len: u16,
-    chunk: u16,
+    id: u32,        // u32::MAX = empty
+    len_chunk: u32, // low 16 bits = len; high 16 bits = chunk (INLINE_CHUNK if len <= 8)
+    payload: u64,   // inline: exact zero-padded bytes; out-of-line: (h32 as u64) | ((off as u64) << 32)
 }
 
 struct VocabIndex<'a> {
@@ -836,18 +860,38 @@ impl<'a> VocabIndex<'a> {
     }
 
     #[inline(always)]
-    fn get_h(&self, key: &[u8], h: u64) -> Option<u32> {
+    fn get_h_padded(&self, arena: &[u8], off: usize, len: usize, h: u64) -> Option<u32> {
         let s = (h >> VSHARD_SHIFT) as usize;
         let (slots, mask) = unsafe { self.shards.get_unchecked(s) };
-        let h32 = h as u32;
         let mut idx = ((h >> 27) as usize) & *mask;
+        if len <= 8 {
+            let tag = (len as u32) | ((INLINE_CHUNK as u32) << 16);
+            let kv = pack_inline_u64_padded(arena, off, len);
+            loop {
+                let sl = unsafe { *slots.get_unchecked(idx) };
+                if sl.id == u32::MAX {
+                    return None;
+                }
+                if sl.len_chunk == tag && sl.payload == kv {
+                    return Some(sl.id);
+                }
+                idx = (idx + 1) & *mask;
+            }
+        }
+        let key = unsafe { arena.get_unchecked(off..off + len) };
+        let h32 = h as u32;
+        let klen = len as u32;
         loop {
             let sl = unsafe { *slots.get_unchecked(idx) };
             if sl.id == u32::MAX {
                 return None;
             }
-            if sl.h32 == h32 && sl.len as usize == key.len() && fast_eq(self.slice_of(sl.chunk, sl.off, sl.len), key) {
-                return Some(sl.id);
+            if (sl.len_chunk & 0xFFFF) == klen && (sl.payload as u32) == h32 {
+                let chunk = (sl.len_chunk >> 16) as u16;
+                let soff = (sl.payload >> 32) as u32;
+                if fast_eq(self.slice_of(chunk, soff, klen as u16), key) {
+                    return Some(sl.id);
+                }
             }
             idx = (idx + 1) & *mask;
         }
@@ -855,7 +899,40 @@ impl<'a> VocabIndex<'a> {
 
     #[inline(always)]
     fn get(&self, key: &[u8]) -> Option<u32> {
-        self.get_h(key, fx_hash_bytes(key))
+        let h = fx_hash_bytes(key);
+        let s = (h >> VSHARD_SHIFT) as usize;
+        let (slots, mask) = unsafe { self.shards.get_unchecked(s) };
+        let mut idx = ((h >> 27) as usize) & *mask;
+        if key.len() <= 8 {
+            let tag = (key.len() as u32) | ((INLINE_CHUNK as u32) << 16);
+            let kv = pack_inline_u64_exact(key);
+            loop {
+                let sl = unsafe { *slots.get_unchecked(idx) };
+                if sl.id == u32::MAX {
+                    return None;
+                }
+                if sl.len_chunk == tag && sl.payload == kv {
+                    return Some(sl.id);
+                }
+                idx = (idx + 1) & *mask;
+            }
+        }
+        let h32 = h as u32;
+        let klen = key.len() as u32;
+        loop {
+            let sl = unsafe { *slots.get_unchecked(idx) };
+            if sl.id == u32::MAX {
+                return None;
+            }
+            if (sl.len_chunk & 0xFFFF) == klen && (sl.payload as u32) == h32 {
+                let chunk = (sl.len_chunk >> 16) as u16;
+                let soff = (sl.payload >> 32) as u32;
+                if fast_eq(self.slice_of(chunk, soff, klen as u16), key) {
+                    return Some(sl.id);
+                }
+            }
+            idx = (idx + 1) & *mask;
+        }
     }
 }
 
@@ -1154,6 +1231,8 @@ pub fn try_load_fast(
                 p = skip_ws(bytes, p + 1);
             }
         }
+        // 8-byte slack so branchless u64 inline-key loads never read past end.
+        raw_arena.extend_from_slice(&[0u8; 8]);
         Some(VocabChunkOut { raw_arena, items, shards, dec_arena, char_entries, max_id })
     };
 
@@ -1240,6 +1319,10 @@ pub fn try_load_fast(
         }
     }
 
+    if n_vchunks >= INLINE_CHUNK as usize {
+        return None;
+    }
+
     // Build all 16 pre-bucketed open-addressing shards IN PARALLEL across cores!
     let build_shard = |s: usize| -> (Vec<VSlot>, usize) {
         let cnt = shard_counts[s];
@@ -1249,7 +1332,7 @@ pub fn try_load_fast(
         }
         let mask = cap - 1;
         let mut slots = vec![
-            VSlot { h32: 0, id: u32::MAX, off: 0, len: 0, chunk: 0 };
+            VSlot { id: u32::MAX, len_chunk: 0, payload: 0 };
             cap
         ];
         for (ci, spc) in shards_per_chunk.iter().enumerate() {
@@ -1265,27 +1348,48 @@ pub fn try_load_fast(
                     }
                 }
                 let (ro, rl, id, h) = unsafe { *entries.get_unchecked(j) };
-                let h32 = h as u32;
-                let key = unsafe { arena_ci.get_unchecked(ro as usize..ro as usize + rl as usize) };
                 let mut idx = ((h >> 27) as usize) & mask;
-                loop {
-                    let sl = unsafe { slots.get_unchecked_mut(idx) };
-                    if sl.id == u32::MAX {
-                        *sl = VSlot { h32, id, off: ro, len: rl, chunk: ci as u16 };
-                        break;
-                    }
-                    if sl.h32 == h32 && sl.len == rl {
-                        let cand = unsafe {
-                            raw_arenas
-                                .get_unchecked(sl.chunk as usize)
-                                .get_unchecked(sl.off as usize..sl.off as usize + sl.len as usize)
-                        };
-                        if fast_eq(cand, key) {
+                if rl <= 8 {
+                    let tag = (rl as u32) | ((INLINE_CHUNK as u32) << 16);
+                    let kv = pack_inline_u64_padded(arena_ci, ro as usize, rl as usize);
+                    loop {
+                        let sl = unsafe { slots.get_unchecked_mut(idx) };
+                        if sl.id == u32::MAX {
+                            *sl = VSlot { id, len_chunk: tag, payload: kv };
+                            break;
+                        }
+                        if sl.len_chunk == tag && sl.payload == kv {
                             sl.id = id;
                             break;
                         }
+                        idx = (idx + 1) & mask;
                     }
-                    idx = (idx + 1) & mask;
+                } else {
+                    let h32 = h as u32;
+                    let key = unsafe { arena_ci.get_unchecked(ro as usize..ro as usize + rl as usize) };
+                    let tag = (rl as u32) | ((ci as u32) << 16);
+                    let pay = (h32 as u64) | ((ro as u64) << 32);
+                    loop {
+                        let sl = unsafe { slots.get_unchecked_mut(idx) };
+                        if sl.id == u32::MAX {
+                            *sl = VSlot { id, len_chunk: tag, payload: pay };
+                            break;
+                        }
+                        if (sl.len_chunk & 0xFFFF) == rl as u32 && (sl.payload as u32) == h32 {
+                            let sc = (sl.len_chunk >> 16) as usize;
+                            let so = (sl.payload >> 32) as usize;
+                            let cand = unsafe {
+                                raw_arenas
+                                    .get_unchecked(sc)
+                                    .get_unchecked(so..so + rl as usize)
+                            };
+                            if fast_eq(cand, key) {
+                                sl.id = id;
+                                break;
+                            }
+                        }
+                        idx = (idx + 1) & mask;
+                    }
                 }
             }
         }
@@ -1418,6 +1522,8 @@ pub fn try_load_fast(
                         }
                     }
 
+                    // 8-byte slack so branchless u64 inline-key loads never read past end.
+                    m_arena.extend_from_slice(&[0u8; 8]);
                     // Pipeline VocabIndex lookups with 12-pair-ahead L3 prefetching!
                     let init_pf = cnt.min(PF);
                     for item in mbuf.iter().take(init_pf) {
@@ -1431,9 +1537,12 @@ pub fn try_load_fast(
                             vindex.prefetch_h(nxt.5);
                         }
                         let (ao, al, bo, bl, h_a, h_b) = mbuf[k];
-                        let a_sl = &m_arena[ao as usize..(ao + al) as usize];
-                        let b_sl = &m_arena[bo as usize..(bo + bl) as usize];
-                        if let (Some(t1), Some(t2)) = (vindex.get_h(a_sl, h_a), vindex.get_h(b_sl, h_b)) {
+                        if let (Some(t1), Some(t2)) = (
+                            vindex.get_h_padded(&m_arena, ao as usize, al as usize, h_a),
+                            vindex.get_h_padded(&m_arena, bo as usize, bl as usize, h_b),
+                        ) {
+                            let a_sl = &m_arena[ao as usize..(ao + al) as usize];
+                            let b_sl = &m_arena[bo as usize..(bo + bl) as usize];
                             let mut tg_opt = None;
                             let pi = pred_tg as usize;
                             if pi < id_to_raw.len() {
