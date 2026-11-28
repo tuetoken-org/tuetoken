@@ -1209,6 +1209,50 @@ impl View<'_, 3> {
         }
         InlineHit::Spilled
     }
+
+    /// Zero-write, zero-payload-load token-count probe for `count_tokens*` APIs.
+    /// Reads only `(meta, lo, hi)` and returns the exact token count `1..=6` on
+    /// inline or bit-packed hits without loading `s.toks` or writing to `s.out`.
+    #[inline(always)]
+    pub unsafe fn count_inline_at(&self, lo: u64, hi: u64, addr: u64) -> InlineHit {
+        let mut p = addr as *const SSlot<3>;
+        {
+            let s = &*p;
+            let m = Self::load_meta(s);
+            let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+            if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
+                return InlineHit::Hit((m >> 2) as usize);
+            }
+            if m == 0 {
+                return InlineHit::Empty;
+            }
+            if l == lo && g == hi {
+                if (m & 3) == 3 {
+                    return InlineHit::Hit(4 + ((m >> 2) & 3) as usize);
+                }
+                return InlineHit::Spilled;
+            }
+        }
+        for _ in 1..PROBE_MAX {
+            p = p.add(1);
+            let s = &*p;
+            let m = Self::load_meta(s);
+            let (l, g) = (s.lo.load(Ordering::Relaxed), s.hi.load(Ordering::Relaxed));
+            if (l ^ lo) | (g ^ hi) | (m.wrapping_sub(6) & !0b1100) as u64 == 0 {
+                return InlineHit::Hit((m >> 2) as usize);
+            }
+            if m == 0 {
+                return InlineHit::Empty;
+            }
+            if l == lo && g == hi {
+                if (m & 3) == 3 {
+                    return InlineHit::Hit(4 + ((m >> 2) & 3) as usize);
+                }
+                return InlineHit::Spilled;
+            }
+        }
+        InlineHit::Spilled
+    }
 }
 
 #[inline(always)]

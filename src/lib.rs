@@ -4566,6 +4566,110 @@ impl Tokenizer {
         unsafe { s.out.set_len(wp.offset_from(base_out) as usize) };
     }
 
+    /// Zero-write Phase 2 token counter for `count_tokens*` paths: probes
+    /// `view.count_inline_at` in registers with zero writes to `s.out` on hits.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn flush_recs_count(
+        &self,
+        bytes: &[u8],
+        n: usize,
+        buf: &[PipeRec],
+        ends: &[u32],
+        first_a: usize,
+        s: &mut Scratch,
+        view: chunk_table::View<'_, 3>,
+        lview: chunk_table::LongView<'_>,
+    ) -> usize {
+        let mut total = 0usize;
+        let base_rp = buf.as_ptr();
+        let mut rp = base_rp;
+        let end_rp = unsafe { base_rp.add(buf.len()) };
+        while rp < end_rp {
+            let r = unsafe { *rp };
+            let empty_slot = if r.p != 0 {
+                match unsafe { view.count_inline_at(r.lo, r.hi, r.p) } {
+                    chunk_table::InlineHit::Hit(c) => {
+                        total += c;
+                        rp = unsafe { rp.add(1) };
+                        continue;
+                    }
+                    chunk_table::InlineHit::Empty => true,
+                    chunk_table::InlineHit::Spilled => false,
+                }
+            } else {
+                false
+            };
+            let k = unsafe { rp.offset_from(base_rp) as usize };
+            let a = if k == 0 { first_a } else { ends[k - 1] as usize };
+            let e = ends[k] as usize;
+            s.out.clear();
+            if empty_slot {
+                self.emit_chunk_fresh(&bytes[a..e], r.lo, r.hi, s);
+            } else if r.p == 0 && r.lo != 0 {
+                self.emit_long_at(bytes, a, e, n, r.lo, r.hi, lview, s);
+            } else {
+                self.emit_chunk_cold(bytes, a, e, n, s);
+            }
+            total += s.out.len();
+            rp = unsafe { rp.add(1) };
+        }
+        total
+    }
+
+    /// Zero-write Phase 2 segment counter for `encode_sep_macro` and
+    /// `encode_fast_slice_piped` when `want_output == false`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn flush_seg_count<'a>(
+        &self,
+        buf: &[PipeRec],
+        ends: &[u32],
+        slo: usize,
+        shi: usize,
+        first_a: usize,
+        get_doc: impl Fn() -> &'a [u8],
+        s: &mut Scratch,
+        view: chunk_table::View<'_, 3>,
+        lview: chunk_table::LongView<'_>,
+    ) -> usize {
+        let mut total = 0usize;
+        let base_rp = unsafe { buf.as_ptr().add(slo) };
+        let mut rp = base_rp;
+        let end_rp = unsafe { buf.as_ptr().add(shi) };
+        while rp < end_rp {
+            let r = unsafe { *rp };
+            let empty_slot = if r.p != 0 {
+                match unsafe { view.count_inline_at(r.lo, r.hi, r.p) } {
+                    chunk_table::InlineHit::Hit(c) => {
+                        total += c;
+                        rp = unsafe { rp.add(1) };
+                        continue;
+                    }
+                    chunk_table::InlineHit::Empty => true,
+                    chunk_table::InlineHit::Spilled => false,
+                }
+            } else {
+                false
+            };
+            let k = unsafe { rp.offset_from(base_rp) as usize };
+            let d = get_doc();
+            let a = if k == 0 { first_a } else { ends[slo + k - 1] as usize };
+            let e = ends[slo + k] as usize;
+            s.out.clear();
+            if empty_slot {
+                self.emit_chunk_fresh(&d[a..e], r.lo, r.hi, s);
+            } else if r.p == 0 && r.lo != 0 {
+                self.emit_long_at(d, a, e, d.len(), r.lo, r.hi, lview, s);
+            } else {
+                self.emit_chunk_cold(d, a, e, d.len(), s);
+            }
+            total += s.out.len();
+            rp = unsafe { rp.add(1) };
+        }
+        total
+    }
+
     /// Phase 2 fallback for buffers > 4 GiB (explicit 64-bit spans).
     #[cold]
     fn flush_recs_spans(
@@ -4681,11 +4785,10 @@ impl Tokenizer {
     /// completely even on NFC/NFD/NFKC/NFKD models (Qwen2.5/3, MiniMax, EXAONE);
     /// non-ASCII items normalize per-worker in `s.utf8` with zero upfront copy.
     #[allow(clippy::too_many_arguments)]
-    fn encode_fast_slice_piped<const SPECIAL: bool>(
+    fn encode_fast_slice_piped<const SPECIAL: bool, const WANT_OUTPUT: bool>(
         &self,
         items: &[FastItem],
         base_doc: usize,
-        want_output: bool,
         s: &mut Scratch,
         doc_counts: &mut [usize],
         bad_bytes: &mut dyn FnMut(usize),
@@ -4715,6 +4818,30 @@ impl Tokenizer {
             }
             let total = buf.len();
             let buf: &[PipeRec] = unsafe { &*(buf as *const _ as *const [PipeRec]) };
+            if !WANT_OUTPUT {
+                for &(slo, shi, ldi, first_a, uoff, ulen) in segs {
+                    let n = self.flush_seg_count(
+                        buf,
+                        ends,
+                        slo,
+                        shi,
+                        first_a,
+                        || {
+                            if ulen != 0 {
+                                &ubuf[uoff..uoff + ulen]
+                            } else {
+                                let it = items[ldi];
+                                unsafe { std::slice::from_raw_parts(it.ptr, it.len()) }
+                            }
+                        },
+                        s,
+                        view,
+                        lview,
+                    );
+                    doc_counts[ldi] += n;
+                }
+                return;
+            }
             s.out.reserve(6 * total + 16);
             let mut base_out = s.out.as_mut_ptr();
             let mut wp = unsafe { base_out.add(s.out.len()) };
@@ -4743,9 +4870,6 @@ impl Tokenizer {
                 doc_counts[ldi] += n;
             }
             unsafe { s.out.set_len(wp.offset_from(base_out) as usize) };
-            if !want_output {
-                s.out.clear();
-            }
         };
 
         for (ldi, &it) in items.iter().enumerate() {
@@ -4779,7 +4903,7 @@ impl Tokenizer {
                     let before = s.out.len();
                     self.encode_special_into(txt, s);
                     doc_counts[ldi] += s.out.len() - before;
-                    if !want_output {
+                    if !WANT_OUTPUT {
                         s.out.clear();
                     }
                     ubuf.truncate(uoff);
@@ -4841,7 +4965,7 @@ impl Tokenizer {
                 let before = s.out.len();
                 self.encode_special_into(txt, s);
                 doc_counts[ldi] += s.out.len() - before;
-                if !want_output {
+                if !WANT_OUTPUT {
                     s.out.clear();
                 }
                 continue;
@@ -5180,15 +5304,25 @@ impl Tokenizer {
                     s.out.reserve(cap);
                     chunk_table::advise_hugepage(s.out.as_mut_ptr() as *mut u8, cap * 4);
                 }
-                self.encode_fast_slice_piped::<SPECIAL>(
-                    items,
-                    0,
-                    want_output,
-                    s,
-                    &mut doc_counts,
-                    &mut |d| { bad_doc.fetch_min(d, Relaxed); },
-                    &mut |d| { bad_wide.fetch_min(d, Relaxed); },
-                );
+                if want_output {
+                    self.encode_fast_slice_piped::<SPECIAL, true>(
+                        items,
+                        0,
+                        s,
+                        &mut doc_counts,
+                        &mut |d| { bad_doc.fetch_min(d, Relaxed); },
+                        &mut |d| { bad_wide.fetch_min(d, Relaxed); },
+                    );
+                } else {
+                    self.encode_fast_slice_piped::<SPECIAL, false>(
+                        items,
+                        0,
+                        s,
+                        &mut doc_counts,
+                        &mut |d| { bad_doc.fetch_min(d, Relaxed); },
+                        &mut |d| { bad_wide.fetch_min(d, Relaxed); },
+                    );
+                }
                 std::mem::replace(&mut s.out, saved)
             });
             if want_output { O::from_u32(raw) } else { Vec::new() }
@@ -5210,15 +5344,25 @@ impl Tokenizer {
                     let (lo, hi) = tasks[k];
                     // SAFETY: tasks partition `0..n` into disjoint `[lo..hi)` slices.
                     let dc_slice = unsafe { std::slice::from_raw_parts_mut(dc_ptr.get().add(lo), hi - lo) };
-                    self.encode_fast_slice_piped::<SPECIAL>(
-                        &items[lo..hi],
-                        lo,
-                        want_output,
-                        s,
-                        dc_slice,
-                        &mut |d| { bad_doc.fetch_min(d, Relaxed); },
-                        &mut |d| { bad_wide.fetch_min(d, Relaxed); },
-                    );
+                    if want_output {
+                        self.encode_fast_slice_piped::<SPECIAL, true>(
+                            &items[lo..hi],
+                            lo,
+                            s,
+                            dc_slice,
+                            &mut |d| { bad_doc.fetch_min(d, Relaxed); },
+                            &mut |d| { bad_wide.fetch_min(d, Relaxed); },
+                        );
+                    } else {
+                        self.encode_fast_slice_piped::<SPECIAL, false>(
+                            &items[lo..hi],
+                            lo,
+                            s,
+                            dc_slice,
+                            &mut |d| { bad_doc.fetch_min(d, Relaxed); },
+                            &mut |d| { bad_wide.fetch_min(d, Relaxed); },
+                        );
+                    }
                 },
             )
         };
@@ -5234,7 +5378,7 @@ impl Tokenizer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_items_piped(
+    fn encode_items_piped<const WANT_OUTPUT: bool>(
         &self,
         texts: &[Src<'_>],
         norm: &[std::borrow::Cow<'_, [u8]>],
@@ -5269,9 +5413,22 @@ impl Tokenizer {
                 } else {
                     &norm[items[ii].0 as usize]
                 };
-                let before = s.out.len();
-                self.flush_recs(d, d.len(), &buf[slo..shi], &ends[slo..shi], first_a, s, view, lview);
-                counts[ii] += (s.out.len() - before) as u32;
+                if WANT_OUTPUT {
+                    let before = s.out.len();
+                    self.flush_recs(d, d.len(), &buf[slo..shi], &ends[slo..shi], first_a, s, view, lview);
+                    counts[ii] += (s.out.len() - before) as u32;
+                } else {
+                    counts[ii] += self.flush_recs_count(
+                        d,
+                        d.len(),
+                        &buf[slo..shi],
+                        &ends[slo..shi],
+                        first_a,
+                        s,
+                        view,
+                        lview,
+                    ) as u32;
+                }
             }
         };
         let defer_norm = self.parallel_unicode_norm();
@@ -6058,7 +6215,7 @@ impl Tokenizer {
     /// Appends tokens to `s.out`, pushes one token count per doc to `doc_counts`,
     /// and returns `Some(first_bad_local_doc)` if any unvalidated doc is not UTF-8.
     #[allow(clippy::too_many_arguments)]
-    fn encode_sep_macro(
+    fn encode_sep_macro<const WANT_OUTPUT: bool>(
         &self,
         chunk: &[u8],
         sep: &[u8],
@@ -6087,6 +6244,23 @@ impl Tokenizer {
             }
             let total = buf.len();
             let buf: &[PipeRec] = unsafe { &*(buf as *const _ as *const [PipeRec]) };
+            if !WANT_OUTPUT {
+                for &(slo, shi, di, first_a, ds, de) in segs {
+                    let n = self.flush_seg_count(
+                        buf,
+                        ends,
+                        slo,
+                        shi,
+                        first_a,
+                        || &chunk[ds..de],
+                        s,
+                        view,
+                        lview,
+                    );
+                    doc_counts[di] += n;
+                }
+                return;
+            }
             s.out.reserve(6 * total + 16);
             let mut base_out = s.out.as_mut_ptr();
             let mut wp = unsafe { base_out.add(s.out.len()) };
@@ -6215,7 +6389,11 @@ impl Tokenizer {
                 }
                 let finder = memchr::memmem::Finder::new(sep);
                 let mut segs = Vec::with_capacity(64);
-                bad_local = self.encode_sep_macro(raw, sep, &finder, trusted, s, &mut segs, &mut doc_counts);
+                bad_local = if want_output {
+                    self.encode_sep_macro::<true>(raw, sep, &finder, trusted, s, &mut segs, &mut doc_counts)
+                } else {
+                    self.encode_sep_macro::<false>(raw, sep, &finder, trusted, s, &mut segs, &mut doc_counts)
+                };
                 std::mem::replace(&mut s.out, saved)
             });
             if let Some(di) = bad_local {
@@ -6289,7 +6467,12 @@ impl Tokenizer {
             |k, s, segs| {
                 let (lo, hi) = macros[k];
                 let mut lcounts = Vec::with_capacity(((hi - lo) >> 9).clamp(16, 4096));
-                if let Some(bl) = self.encode_sep_macro(&raw[lo..hi], sep, &finder, trusted, s, segs, &mut lcounts) {
+                let bad_opt = if want_output {
+                    self.encode_sep_macro::<true>(&raw[lo..hi], sep, &finder, trusted, s, segs, &mut lcounts)
+                } else {
+                    self.encode_sep_macro::<false>(&raw[lo..hi], sep, &finder, trusted, s, segs, &mut lcounts)
+                };
+                if let Some(bl) = bad_opt {
                     macro_bad[k].store(bl, Relaxed);
                 }
                 *macro_doc_counts[k].lock().unwrap_or_else(|e| e.into_inner()) = lcounts;
@@ -6421,16 +6604,29 @@ impl Tokenizer {
                     for &(x, y, _) in &tasks {
                         ic.clear();
                         ic.resize(y - x, 0);
-                        self.encode_items_piped(
-                            texts,
-                            &norm,
-                            &trusted,
-                            &items[x..y],
-                            s,
-                            &mut ic,
-                            &mut |d| { bad_doc.fetch_min(d as usize, Relaxed); },
-                            &mut |d| { bad_wide.fetch_min(d as usize, Relaxed); },
-                        );
+                        if want_output {
+                            self.encode_items_piped::<true>(
+                                texts,
+                                &norm,
+                                &trusted,
+                                &items[x..y],
+                                s,
+                                &mut ic,
+                                &mut |d| { bad_doc.fetch_min(d as usize, Relaxed); },
+                                &mut |d| { bad_wide.fetch_min(d as usize, Relaxed); },
+                            );
+                        } else {
+                            self.encode_items_piped::<false>(
+                                texts,
+                                &norm,
+                                &trusted,
+                                &items[x..y],
+                                s,
+                                &mut ic,
+                                &mut |d| { bad_doc.fetch_min(d as usize, Relaxed); },
+                                &mut |d| { bad_wide.fetch_min(d as usize, Relaxed); },
+                            );
+                        }
                         for (ii, &c) in ic.iter().enumerate() {
                             doc_counts[items[x + ii].0 as usize] += c as usize;
                         }
@@ -6487,16 +6683,29 @@ impl Tokenizer {
                 if piped {
                     // SAFETY: items x..y belong to task k only.
                     let ic = unsafe { std::slice::from_raw_parts_mut(ic_ptr.get().add(x), y - x) };
-                    self.encode_items_piped(
-                        texts,
-                        &norm,
-                        &trusted,
-                        &items[x..y],
-                        s,
-                        ic,
-                        &mut |d| { bad_doc.fetch_min(d as usize, Relaxed); },
-                        &mut |d| { bad_wide.fetch_min(d as usize, Relaxed); },
-                    );
+                    if want_output {
+                        self.encode_items_piped::<true>(
+                            texts,
+                            &norm,
+                            &trusted,
+                            &items[x..y],
+                            s,
+                            ic,
+                            &mut |d| { bad_doc.fetch_min(d as usize, Relaxed); },
+                            &mut |d| { bad_wide.fetch_min(d as usize, Relaxed); },
+                        );
+                    } else {
+                        self.encode_items_piped::<false>(
+                            texts,
+                            &norm,
+                            &trusted,
+                            &items[x..y],
+                            s,
+                            ic,
+                            &mut |d| { bad_doc.fetch_min(d as usize, Relaxed); },
+                            &mut |d| { bad_wide.fetch_min(d as usize, Relaxed); },
+                        );
+                    }
                 } else {
                     for (ii, &it) in items[x..y].iter().enumerate() {
                         let before = s.out.len();
@@ -7099,6 +7308,31 @@ impl Tokenizer {
         }
         if text.len() >= SPLIT_MIN && self.splittable() {
             return self.encode_direct(&[text], 0, false).1[0];
+        }
+        if text.len() >= 1024 && self.items_pipe_ok() && self.normalizer.is_identity() && text.len() <= u32::MAX as usize {
+            let bytes = text.as_bytes();
+            let n = bytes.len();
+            return self.with_scratch(|s| {
+                const CAP: usize = 256;
+                let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
+                let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+                let mut scan = blockscan::Scan::new(0);
+                let mut a = 0usize;
+                let mut total = 0usize;
+                loop {
+                    let k = scan.fill(self.kind, bytes, n, &mut ends, 0, CAP);
+                    if k == 0 {
+                        break;
+                    }
+                    let view = self.learned.view();
+                    let lview = self.long_table.view();
+                    let first_a = a;
+                    a = Self::fill_recs(bytes, &ends, 0, k, a, buf.as_mut_ptr(), view, lview);
+                    let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
+                    total += self.flush_recs_count(bytes, n, sl, &ends[..k], first_a, s, view, lview);
+                }
+                total
+            });
         }
         self.with_scratch(|s| {
             s.out.clear();
