@@ -5629,10 +5629,13 @@ impl Tokenizer {
         self.emit(&bytes[pos..end], s, Merge::Auto);
     }
 
-    /// Can one long document be split across threads? Only the hand-written
-    /// state-machine path, where the split rule below is proven (see split_points).
+    /// Can one long document be split across threads? Hand-written SIMD BlockScan,
+    /// streaming DeepSeek CJK, and zero-alloc SIMD SentencePiece all have proven
+    /// exact boundary rules (`split_points` / `split_points_sp`).
     fn splittable(&self) -> bool {
-        self.fast_pretok == FastPretok::BlockScan || self.sp_fast_meta != SpFastMeta::None
+        self.fast_pretok == FastPretok::BlockScan
+            || (self.fast_pretok == FastPretok::Cjk && self.singleton_eow.is_none())
+            || self.sp_fast_meta != SpFastMeta::None
     }
 
     /// True when whole-document serial normalization can be deferred to parallel
@@ -5688,6 +5691,42 @@ impl Tokenizer {
     /// So the chunk containing `p-1` ends exactly at `p`, and since every chunk
     /// scan only looks forward, the scan from `p` is independent of what came
     /// before. Returns [0, p1, p2, …, n], segments ~`seg` bytes.
+    /// Proven-exact split points for DeepSeek CJK: `b[p-1] == '\n'` followed by
+    /// ASCII alphanumeric OR a 3-byte CJK ideograph (`0xE4..=0xE9`, U+4000..U+9FFF),
+    /// so pure Chinese/Japanese documents parallelize across all cores too!
+    fn split_points_cjk(b: &[u8], seg: usize) -> Vec<usize> {
+        let n = b.len();
+        let mut pts = vec![0usize];
+        let mut target = seg;
+        while target < n {
+            let lim = (target + seg).min(n);
+            let mut found = None;
+            let mut i = target.max(1) - 1;
+            while i + 1 < lim {
+                if let Some(rel) = memchr::memchr(b'\n', &b[i..lim - 1]) {
+                    let p = i + rel + 1;
+                    let c = b[p];
+                    if c.is_ascii_alphanumeric() || (0xE4..=0xE9).contains(&c) {
+                        found = Some(p);
+                        break;
+                    }
+                    i = p;
+                } else {
+                    break;
+                }
+            }
+            match found {
+                Some(p) => {
+                    pts.push(p);
+                    target = p + seg;
+                }
+                None => target = lim + 1,
+            }
+        }
+        pts.push(n);
+        pts
+    }
+
     fn split_points(b: &[u8], seg: usize) -> Vec<usize> {
         let n = b.len();
         let mut pts = vec![0usize];
@@ -5875,6 +5914,11 @@ impl Tokenizer {
                     } else {
                         items.push((i as u32, 0, b.len(), false));
                     }
+                } else if self.fast_pretok == FastPretok::Cjk && !defer_norm {
+                    let pts = Self::split_points_cjk(b, seg_bytes);
+                    for w in pts.windows(2) {
+                        items.push((i as u32, w[0], w[1], true));
+                    }
                 } else if defer_norm {
                     let pts = Self::split_points_unicode(b, seg_bytes);
                     for w in pts.windows(2) {
@@ -5928,6 +5972,21 @@ impl Tokenizer {
                 // SAFETY: trusted (from a str) or validated just above (whole doc).
                 let whole = unsafe { std::str::from_utf8_unchecked(d) };
                 self.encode_into(whole, Merge::Auto, true, s);
+            }
+            return true;
+        }
+        if self.fast_pretok == FastPretok::Cjk && self.singleton_eow.is_none() {
+            if self.parallel_unicode_norm() {
+                let sub = unsafe { std::str::from_utf8_unchecked(&d[a..b]) };
+                let norm_sub = self.normalizer.apply(sub);
+                match norm_sub {
+                    std::borrow::Cow::Borrowed(_) => self.encode_cjk_range(d, a, b, s),
+                    std::borrow::Cow::Owned(ns) => self.encode_cjk_range(ns.as_bytes(), 0, ns.len(), s),
+                }
+            } else if seg {
+                self.encode_cjk_range(d, a, b, s);
+            } else {
+                self.encode_cjk_range(d, 0, d.len(), s);
             }
             return true;
         }
@@ -6450,23 +6509,78 @@ impl Tokenizer {
         Ok((out, doc_counts))
     }
 
-    /// DeepSeek path: hand-written 3-stage chunker, then emit each piece (using
-    /// the shared cross-thread chunk tables under `Merge::Auto`). Reuses
-    /// scratch range buffers so zero per-call heap allocations occur.
+    /// DeepSeek CJK streaming 256-chunk pipelined encoder over `bytes[start..stop]`
+    /// (Merge::Auto, no EOW suffix). Single-pass zero-alloc `cjk::CjkScan` feeding
+    /// the same `fill_recs` / `flush_recs` L1-prefetched `SharedTable`+`SharedLongTable`
+    /// pipeline as `BlockScan`.
+    fn encode_cjk_range(&self, bytes: &[u8], start: usize, stop: usize, s: &mut Scratch) {
+        let n = bytes.len();
+        if stop <= start {
+            return;
+        }
+        if stop - start >= 512 && n <= u32::MAX as usize {
+            const CAP: usize = 256;
+            let mut ends = [0u32; CAP + blockscan::SCAN_SLACK];
+            let mut buf = [std::mem::MaybeUninit::<PipeRec>::uninit(); CAP + blockscan::SCAN_SLACK];
+            let mut scan = cjk::CjkScan::new(start);
+            let mut a = start;
+            loop {
+                let k = scan.fill(bytes, stop, &mut ends, 0, CAP);
+                if k == 0 {
+                    break;
+                }
+                let view = self.learned.view();
+                let lview = self.long_table.view();
+                let first_a = a;
+                a = Self::fill_recs(bytes, &ends, 0, k, a, buf.as_mut_ptr(), view, lview);
+                // SAFETY: fill_recs initialized buf[..k].
+                let sl = unsafe { &*(&buf[..k] as *const _ as *const [PipeRec]) };
+                self.flush_recs(bytes, n, sl, &ends[..k], first_a, s, view, lview);
+            }
+            return;
+        }
+        if n <= u32::MAX as usize {
+            let mut ends = [0u32; 64];
+            let mut scan = cjk::CjkScan::new(start);
+            let mut a = start;
+            loop {
+                let k = scan.fill(bytes, stop, &mut ends, 0, 64);
+                if k == 0 {
+                    break;
+                }
+                for &e in &ends[..k] {
+                    let eu = e as usize;
+                    self.emit_chunk(bytes, a, eu, n, s);
+                    a = eu;
+                }
+            }
+            return;
+        }
+        // > 4 GiB fallback
+        let sub = unsafe { std::str::from_utf8_unchecked(&bytes[start..stop]) };
+        let mut cur = std::mem::take(&mut s.cjk_cur);
+        let mut nxt = std::mem::take(&mut s.cjk_nxt);
+        cjk::chunk_ranges(sub, &mut cur, &mut nxt);
+        for &(ps, pe) in &cur {
+            self.emit_chunk(bytes, start + ps, start + pe, n, s);
+        }
+        s.cjk_cur = cur;
+        s.cjk_nxt = nxt;
+    }
+
+    /// DeepSeek path: 1-pass streaming chunker + 256-deep pipelined `SharedTable`
+    /// under `Merge::Auto`, falling back to `chunk_ranges` for explicit merge modes.
     fn encode_cjk(&self, text: &str, s: &mut Scratch, mode: Merge) {
         let bytes = text.as_bytes();
-        let n = bytes.len();
+        if mode == Merge::Auto && self.singleton_eow.is_none() {
+            self.encode_cjk_range(bytes, 0, bytes.len(), s);
+            return;
+        }
         let mut cur = std::mem::take(&mut s.cjk_cur);
         let mut nxt = std::mem::take(&mut s.cjk_nxt);
         cjk::chunk_ranges(text, &mut cur, &mut nxt);
-        if mode == Merge::Auto && self.singleton_eow.is_none() {
-            for &(ps, pe) in &cur {
-                self.emit_chunk(bytes, ps, pe, n, s);
-            }
-        } else {
-            for &(ps, pe) in &cur {
-                self.emit(&bytes[ps..pe], s, mode);
-            }
+        for &(ps, pe) in &cur {
+            self.emit(&bytes[ps..pe], s, mode);
         }
         s.cjk_cur = cur;
         s.cjk_nxt = nxt;
