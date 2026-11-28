@@ -7050,6 +7050,77 @@ impl Tokenizer {
         };
         Ok((Bound::new(py, wrap(d))?, c))
     }
+
+    /// Encode or count raw UTF-8 bytes (e.g. an mmap'd file) with optional
+    /// document separator, releasing the GIL in the caller.
+    fn encode_raw_bytes_sep_t<O: OutTok>(
+        &self,
+        raw: &[u8],
+        num_threads: usize,
+        want_output: bool,
+        sep: Option<&[u8]>,
+    ) -> Result<(Vec<O>, Vec<usize>), Result<BadInput, String>> {
+        if let Some(sep) = sep {
+            if sep.is_empty() {
+                return Err(Err("separator must not be empty".to_string()));
+            }
+            if self.normalizer.is_identity() && self.items_pipe_ok() && raw.len() >= (1 << 18) {
+                return self.encode_fused_sep_t::<O>(raw, sep, false, num_threads, want_output).map_err(Ok);
+            }
+            let allow_raw = self.normalizer.is_identity() || self.parallel_unicode_norm();
+            let spans = split_on(raw, sep, num_threads);
+            if allow_raw {
+                let src: Vec<Src<'_>> = spans.into_iter().map(|(a, b)| Src::Raw(&raw[a..b])).collect();
+                return self.encode_src_t::<O>(&src, num_threads, want_output).map_err(Ok);
+            }
+            let mut src = Vec::with_capacity(spans.len());
+            for (idx, (a, b)) in spans.into_iter().enumerate() {
+                match simdutf8::basic::from_utf8(&raw[a..b]) {
+                    Ok(s) => src.push(Src::Str(s)),
+                    Err(_) => return Err(Ok(BadInput::Bytes(idx))),
+                }
+            }
+            return self.encode_src_t::<O>(&src, num_threads, want_output).map_err(Ok);
+        }
+        let allow_raw = self.normalizer.is_identity() || self.parallel_unicode_norm();
+        if allow_raw {
+            return self.encode_src_t::<O>(&[Src::Raw(raw)], num_threads, want_output).map_err(Ok);
+        }
+        match simdutf8::basic::from_utf8(raw) {
+            Ok(s) => self.encode_src_t::<O>(&[Src::Str(s)], num_threads, want_output).map_err(Ok),
+            Err(_) => Err(Ok(BadInput::Bytes(0))),
+        }
+    }
+
+    #[inline]
+    fn count_ordinary_one(&self, text: &str) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        if text.len() >= SPLIT_MIN && self.splittable() {
+            return self.encode_direct(&[text], 0, false).1[0];
+        }
+        self.with_scratch(|s| {
+            s.out.clear();
+            self.encode_into(text, Merge::Auto, true, s);
+            s.out.len()
+        })
+    }
+
+    #[inline]
+    fn count_special_one(&self, text: &str) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        if self.special_ac.is_none() || self.special_prefilter.find_first(text.as_bytes()).is_none() {
+            return self.count_ordinary_one(text);
+        }
+        self.with_scratch(|s| {
+            s.out.clear();
+            self.encode_special_into(text, s);
+            s.out.len()
+        })
+    }
     /// Construct `Tokenizer` from the parallel zero-malloc fast JSON loader.
     fn from_fast_loaded(
         path: &str,
@@ -8095,8 +8166,164 @@ impl Tokenizer {
         py.detach(|| self.encode_one(text, Merge::Scan))
     }
 
+    /// Count tokens for one string without constructing a Python list or (on
+    /// long splittable documents) allocating an output token buffer.
     fn count_tokens(&self, py: Python<'_>, text: &str) -> usize {
-        py.detach(|| self.encode_one(text, Merge::Auto).len())
+        if text.len() < Self::DETACH_MIN {
+            return self.count_ordinary_one(text);
+        }
+        py.detach(|| self.count_ordinary_one(text))
+    }
+
+    /// Count tokens for one string with registered added/special tokens (without
+    /// post-processor BOS/EOS or Python list allocation).
+    fn count_special_tokens(&self, py: Python<'_>, text: &str) -> usize {
+        if text.len() < Self::DETACH_MIN {
+            return self.count_special_one(text);
+        }
+        py.detach(|| self.count_special_one(text))
+    }
+
+    /// Parallel token counts with registered added/special tokens (zero output
+    /// token buffer allocation on FastBatch; GIL released).
+    #[pyo3(signature = (texts, num_threads = 0))]
+    fn count_special_tokens_batch(
+        &self,
+        py: Python<'_>,
+        texts: &Bound<'_, PyAny>,
+        num_threads: usize,
+    ) -> PyResult<Vec<usize>> {
+        if self.normalizer.is_ascii_identity() && self.items_pipe_ok() {
+            if let Some(batch) = try_extract_fast_batch(py, texts) {
+                if !batch.has_bytes && batch.max_len < SPLIT_MIN {
+                    let slice = &batch.items;
+                    let total_len = batch.total_len;
+                    let res = self.maybe_detach(py, total_len, || {
+                        self.encode_fast_short_t::<u32, true>(slice, total_len, num_threads, false)
+                    });
+                    return match res {
+                        Ok((_, counts)) => Ok(counts),
+                        Err(b) => Err(bad_fast_to_pyerr(py, &batch, b)),
+                    };
+                }
+            }
+        }
+        let texts: Vec<PyText> = texts.extract()?;
+        let wide = wide_texts(py, &texts, num_threads)?;
+        let views = text_views(&texts, &wide);
+        let total: usize = views.iter().map(|t| t.len()).sum();
+        if num_threads == 1 || views.len() <= 1 || !parallel_ok() || total < 65_536 {
+            return Ok(self.maybe_detach(py, total, || {
+                views.iter().map(|t| self.count_special_one(t)).collect()
+            }));
+        }
+        Ok(py.detach(|| {
+            self.par_over(num_threads, &views, |t| t.len(), |t| self.count_special_one(t))
+        }))
+    }
+
+    /// Zero-copy mmap file tokenization: maps `path` straight from the OS page
+    /// cache (with `MADV_SEQUENTIAL` on Linux/macOS, falling back to `fs::read`
+    /// for pipes/non-regular files) and tokenizes in parallel with the GIL
+    /// released into `{"data": np.ndarray (uint32/uint16), "offsets": np.ndarray (int64)}`.
+    #[pyo3(signature = (path, num_threads = 0, separator = None, dtype = None))]
+    fn encode_file_to_buffer<'py>(
+        &self,
+        py: Python<'py>,
+        path: std::path::PathBuf,
+        num_threads: usize,
+        separator: Option<&Bound<'py, PyAny>>,
+        dtype: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let sep = extract_sep_arg(separator)?;
+        let np_mod = || {
+            py.import("numpy").map_err(|_| {
+                PyValueError::new_err("encode_file_to_buffer requires numpy (pip install numpy)")
+            })
+        };
+        let narrow = match &dtype {
+            None => false,
+            Some(d) => {
+                let name: String = np_mod()?.call_method1("dtype", (d,))?.getattr("name")?.extract()?;
+                match name.as_str() {
+                    "uint32" => false,
+                    "uint16" => {
+                        if self.vocab_size > 1 << 16 {
+                            return Err(PyValueError::new_err(format!(
+                                "dtype uint16 needs a vocabulary of at most 65536 ids (this one has {})",
+                                self.vocab_size
+                            )));
+                        }
+                        true
+                    }
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "dtype must be uint16 or uint32, not {other}"
+                        )))
+                    }
+                }
+            }
+        };
+        let (data_ba, counts) = if narrow {
+            let res = py.detach(|| -> Result<(Vec<u16>, Vec<usize>), FileEncodeErr> {
+                let fb = FileBytes::open(&path).map_err(FileEncodeErr::Io)?;
+                self.encode_raw_bytes_sep_t::<u16>(fb.as_slice(), num_threads, true, sep.as_deref())
+                    .map_err(FileEncodeErr::Encode)
+            });
+            let (d, c) = res.map_err(file_err_to_pyerr)?;
+            (Bound::new(py, TokenBuffer::new_u16(d))?, c)
+        } else {
+            let res = py.detach(|| -> Result<(Vec<u32>, Vec<usize>), FileEncodeErr> {
+                let fb = FileBytes::open(&path).map_err(FileEncodeErr::Io)?;
+                self.encode_raw_bytes_sep_t::<u32>(fb.as_slice(), num_threads, true, sep.as_deref())
+                    .map_err(FileEncodeErr::Encode)
+            });
+            let (d, c) = res.map_err(file_err_to_pyerr)?;
+            (Bound::new(py, TokenBuffer::new(d))?, c)
+        };
+        let mut offsets = Vec::with_capacity(counts.len() + 1);
+        offsets.push(0i64);
+        let mut total = 0usize;
+        for &c in &counts {
+            total += c;
+            offsets.push(total as i64);
+        }
+        let np = np_mod()?;
+        let data_arr = np.call_method1("frombuffer", (data_ba, if narrow { "uint16" } else { "uint32" }))?;
+        let off_ba = Bound::new(py, TokenBuffer::new_i64(offsets))?;
+        let off_arr = np.call_method1("frombuffer", (off_ba, "int64"))?;
+        let out = PyDict::new(py);
+        out.set_item("data", data_arr)?;
+        out.set_item("offsets", off_arr)?;
+        Ok(out)
+    }
+
+    /// Zero-copy mmap file token counting with zero output token buffer
+    /// allocation. Returns `int` when `separator is None`, or `list[int]` (one
+    /// count per separated document) when `separator` is given.
+    #[pyo3(signature = (path, num_threads = 0, separator = None))]
+    fn count_tokens_file(
+        &self,
+        py: Python<'_>,
+        path: std::path::PathBuf,
+        num_threads: usize,
+        separator: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let sep = extract_sep_arg(separator)?;
+        let has_sep = sep.is_some();
+        let res = py.detach(|| -> Result<Vec<usize>, FileEncodeErr> {
+            let fb = FileBytes::open(&path).map_err(FileEncodeErr::Io)?;
+            self.encode_raw_bytes_sep_t::<u32>(fb.as_slice(), num_threads, false, sep.as_deref())
+                .map(|(_, c)| c)
+                .map_err(FileEncodeErr::Encode)
+        });
+        let counts = res.map_err(file_err_to_pyerr)?;
+        if has_sep {
+            Ok(counts.into_pyobject(py)?.into_any().unbind())
+        } else {
+            let total: usize = counts.into_iter().sum();
+            Ok(total.into_pyobject(py)?.into_any().unbind())
+        }
     }
 
     /// Encode and return, for each token, its byte span `(start, end)` in `text`
@@ -9316,6 +9543,114 @@ impl DecodeStream {
             if self.skip_special { "True" } else { "False" },
             self.pending.len()
         )
+    }
+}
+
+/// RAII read-only memory-mapped file view (Linux/macOS `mmap` + `MADV_SEQUENTIAL`)
+/// with automatic `std::fs::read` fallback for empty files, pipes, or other OSes.
+enum FileBytes {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Mmap { ptr: *mut std::ffi::c_void, len: usize },
+    Owned(Vec<u8>),
+}
+
+// SAFETY: `Mmap` holds a read-only `MAP_PRIVATE` mapping owned exclusively by this `FileBytes`.
+unsafe impl Send for FileBytes {}
+unsafe impl Sync for FileBytes {}
+
+impl FileBytes {
+    fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let meta = file.metadata()?;
+        let len = meta.len() as usize;
+        if len == 0 {
+            return Ok(Self::Owned(Vec::new()));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if meta.is_file() {
+            use std::os::unix::io::AsRawFd;
+            const PROT_READ: i32 = 1;
+            const MAP_PRIVATE: i32 = 2;
+            const MADV_SEQUENTIAL: i32 = 2;
+            extern "C" {
+                fn mmap(
+                    addr: *mut std::ffi::c_void,
+                    len: usize,
+                    prot: i32,
+                    flags: i32,
+                    fd: i32,
+                    offset: i64,
+                ) -> *mut std::ffi::c_void;
+                fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+            let map_failed = (!0usize) as *mut std::ffi::c_void;
+            if ptr != map_failed && !ptr.is_null() {
+                unsafe {
+                    let _ = madvise(ptr, len, MADV_SEQUENTIAL);
+                }
+                return Ok(Self::Mmap { ptr, len });
+            }
+        }
+        drop(file);
+        Ok(Self::Owned(std::fs::read(path)?))
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Mmap { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr as *const u8, *len) },
+            Self::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+impl Drop for FileBytes {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Self::Mmap { ptr, len } = *self {
+            extern "C" {
+                fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+            }
+            unsafe {
+                let _ = munmap(ptr, len);
+            }
+        }
+    }
+}
+
+enum FileEncodeErr {
+    Io(std::io::Error),
+    Encode(Result<BadInput, String>),
+}
+
+fn file_err_to_pyerr(e: FileEncodeErr) -> PyErr {
+    match e {
+        FileEncodeErr::Io(io) => PyErr::from(io),
+        FileEncodeErr::Encode(Ok(BadInput::Bytes(i))) => {
+            PyValueError::new_err(format!("item {i}: bytes are not valid UTF-8"))
+        }
+        FileEncodeErr::Encode(Ok(BadInput::Wide(_))) => {
+            PyValueError::new_err("file bytes are not valid UTF-8")
+        }
+        FileEncodeErr::Encode(Err(msg)) => PyValueError::new_err(msg),
+    }
+}
+
+/// Accept `None`, `bytes`/`bytearray`, or `str` as a document separator.
+fn extract_sep_arg(sep: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
+    match sep {
+        None => Ok(None),
+        Some(obj) => {
+            if let Ok(b) = obj.extract::<Vec<u8>>() {
+                Ok(Some(b))
+            } else if let Ok(s) = obj.extract::<String>() {
+                Ok(Some(s.into_bytes()))
+            } else {
+                Err(PyValueError::new_err("separator must be bytes or str"))
+            }
+        }
     }
 }
 

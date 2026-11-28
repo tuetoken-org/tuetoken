@@ -1327,6 +1327,160 @@ def test_decode_stream():
     return ok, tot
 
 
+def test_count_and_file_apis():
+    """Verify zero-alloc count_tokens / AutoTokenizer.count_tokens(_batch) and mmap encode_file_to_buffer / count_tokens_file."""
+    print("=== zero-alloc count_tokens & mmap file tokenization parity ===")
+    import os
+    import pathlib
+    import tempfile
+    import unicodedata
+    import numpy as np
+    from tuetoken import AutoTokenizer as TTAuto
+
+    ok = tot = 0
+
+    # 1. Tokenizer.count_tokens (short, medium, >SPLIT_MIN parallel) + AutoTokenizer.count_tokens(_batch)
+    tok_o200k = tuetoken.Tokenizer.from_tiktoken("o200k_base")
+    long_doc = ("The quick brown fox jumps over the lazy dog. 12345 café 🚀\n" * 6000)
+    for s in ("", "hi", "Hello world! 🚀 日本語", long_doc):
+        tot += 1
+        ok += int(tok_o200k.count_tokens(s) == len(tok_o200k.encode_ordinary(s)))
+
+    for repo in (
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "microsoft/Phi-3.5-mini-instruct",
+        "deepseek-ai/DeepSeek-V3",
+        "unsloth/gemma-3-4b-it",
+    ):
+        try:
+            at = TTAuto.from_pretrained(repo)
+        except Exception:
+            continue
+        samples = [
+            "",
+            "Hello world!",
+            "def f(x): return x + 1 # 人工智能 🚀",
+            "<div> > </div> <|im_start|>user\nhi",
+            long_doc[:320_000],
+        ]
+        for add_sp in (False, True):
+            want = [len(at.encode(s, add_special_tokens=add_sp)) for s in samples]
+            got_single = [at.count_tokens(s, add_special_tokens=add_sp) for s in samples]
+            got_batch = at.count_tokens_batch(samples, add_special_tokens=add_sp)
+            tot += 2
+            ok += int(got_single == want)
+            ok += int(got_batch == want)
+
+    # 2. mmap encode_file_to_buffer & count_tokens_file
+    with tempfile.TemporaryDirectory() as td:
+        p_empty = pathlib.Path(td) / "empty.txt"
+        p_empty.write_bytes(b"")
+
+        p_small = pathlib.Path(td) / "small.txt"
+        small_text = "Hello world!\nSecond line 🚀 日本語\nCafé naïve\n"
+        p_small.write_text(small_text, encoding="utf-8")
+
+        # > 512 KiB file to exercise fused separator mmap path AND parallel split path
+        p_big = pathlib.Path(td) / "big.txt"
+        big_docs = [f"Doc {i}: The quick brown fox jumps over the lazy dog! 12345 café 🚀" for i in range(9000)]
+        big_bytes = "\n".join(big_docs).encode("utf-8")
+        p_big.write_bytes(big_bytes)
+
+        # NFD decomposed file for NFC models (Qwen2.5)
+        p_nfd = pathlib.Path(td) / "nfd.txt"
+        nfd_text = unicodedata.normalize("NFD", "Café naïve résumé über\nAlpha beta\n") * 5000
+        p_nfd.write_text(nfd_text, encoding="utf-8")
+
+        # Invalid UTF-8 file
+        p_bad = pathlib.Path(td) / "bad.bin"
+        p_bad.write_bytes(b"valid prefix\n\xff\xfe bad utf8\n")
+
+        # Empty file
+        r_empty = tok_o200k.encode_file_to_buffer(p_empty)
+        tot += 3
+        ok += int(len(r_empty["data"]) == 0)
+        ok += int(list(r_empty["offsets"]) == [0, 0])
+        ok += int(tok_o200k.count_tokens_file(str(p_empty)) == 0)
+
+        # Small file: no sep, bytes sep, str sep, pathlib.Path
+        ref_small = tok_o200k.encode_ordinary_to_buffer([small_text.encode()])
+        got_small = tok_o200k.encode_file_to_buffer(p_small)
+        tot += 3
+        ok += int(np.array_equal(got_small["data"], ref_small["data"]))
+        ok += int(np.array_equal(got_small["offsets"], ref_small["offsets"]))
+        ok += int(tok_o200k.count_tokens_file(p_small) == len(ref_small["data"]))
+
+        ref_sep = tok_o200k.encode_ordinary_to_buffer([small_text.encode()], separator=b"\n")
+        got_sep_b = tok_o200k.encode_file_to_buffer(str(p_small), separator=b"\n")
+        got_sep_s = tok_o200k.encode_file_to_buffer(p_small, separator="\n")
+        tot += 5
+        ok += int(np.array_equal(got_sep_b["data"], ref_sep["data"]))
+        ok += int(np.array_equal(got_sep_b["offsets"], ref_sep["offsets"]))
+        ok += int(np.array_equal(got_sep_s["data"], ref_sep["data"]))
+        ok += int(tok_o200k.count_tokens_file(p_small, separator="\n") == list(np.diff(ref_sep["offsets"])))
+        ok += int(tok_o200k.count_tokens_file(p_small, separator=b"\n") == list(np.diff(ref_sep["offsets"])))
+
+        # Big >512 KiB file (hits encode_fused_sep_t with separator AND split_points without)
+        ref_big = tok_o200k.encode_ordinary_to_buffer([big_bytes])
+        got_big = tok_o200k.encode_file_to_buffer(p_big)
+        ref_big_sep = tok_o200k.encode_ordinary_to_buffer([big_bytes], separator=b"\n")
+        got_big_sep = tok_o200k.encode_file_to_buffer(p_big, separator=b"\n")
+        tot += 6
+        ok += int(np.array_equal(got_big["data"], ref_big["data"]))
+        ok += int(tok_o200k.count_tokens_file(p_big) == len(ref_big["data"]))
+        ok += int(np.array_equal(got_big_sep["data"], ref_big_sep["data"]))
+        ok += int(np.array_equal(got_big_sep["offsets"], ref_big_sep["offsets"]))
+        ok += int(tok_o200k.count_tokens_file(p_big, separator=b"\n") == list(np.diff(ref_big_sep["offsets"])))
+        ok += int(tok_o200k.count_tokens_file(p_big, num_threads=1, separator=b"\n") == list(np.diff(ref_big_sep["offsets"])))
+
+        # uint16 dtype on gpt2 + rejection on o200k
+        tg = tuetoken.Tokenizer.from_tiktoken("gpt2")
+        r16 = tg.encode_file_to_buffer(p_small, dtype="uint16")
+        tot += 2
+        ok += int(r16["data"].dtype == np.uint16)
+        ok += int(list(r16["data"]) == tg.encode_ordinary(small_text))
+        tot += 1
+        try:
+            tok_o200k.encode_file_to_buffer(p_small, dtype="uint16")
+        except ValueError:
+            ok += 1
+
+        # Cross-family file tests: Qwen2.5 (NFC + NFD), Phi-3.5 (SentencePiece), DeepSeek-V3 (CJK)
+        qwen = TTAuto.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+        rq = qwen.encode_file_to_buffer(p_nfd)
+        tot += 2
+        ok += int(list(rq["data"]) == qwen._core.encode_ordinary(nfd_text))
+        ok += int(qwen.count_tokens_file(p_nfd) == len(rq["data"]))
+
+        phi = TTAuto.from_pretrained("microsoft/Phi-3.5-mini-instruct")
+        rp = phi.encode_file_to_buffer(p_small)
+        tot += 2
+        ok += int(list(rp["data"]) == phi._core.encode_ordinary(small_text))
+        ok += int(phi.count_tokens_file(p_small) == len(rp["data"]))
+
+        # Invalid UTF-8 and missing file errors
+        for fn in (
+            lambda: tok_o200k.encode_file_to_buffer(p_bad),
+            lambda: tok_o200k.count_tokens_file(p_bad),
+            lambda: tok_o200k.count_tokens_file(p_bad, separator=b"\n"),
+        ):
+            tot += 1
+            try:
+                fn()
+            except ValueError:
+                ok += 1
+
+        tot += 1
+        try:
+            tok_o200k.count_tokens_file(os.path.join(td, "does_not_exist.txt"))
+        except OSError:
+            ok += 1
+
+    _line("count_tokens & mmap file APIs", ok, tot)
+    assert ok == tot, f"count/file APIs: {ok}/{tot}"
+    return ok, tot
+
+
 def main():
     results = [
         test_tiktoken_parity(), test_streaming(), test_decode_and_buffers(),
@@ -1336,7 +1490,7 @@ def main():
         test_bytes_inputs(), test_warmup_and_fast_startup(),
         test_review_regressions(), test_whisper(), test_zero_copy_buffer_decode(),
         test_fast_and_batch_chat_templates(), test_sentencepiece_fast_meta(),
-        test_decode_stream(),
+        test_decode_stream(), test_count_and_file_apis(),
     ]
     ok = sum(a for a, _ in results); tot = sum(b for _, b in results)
     print("\n" + "=" * 52)

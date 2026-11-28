@@ -609,6 +609,38 @@ class AutoTokenizer:
         `.step_many(ids)`, `.flush()`, `.reset()`)."""
         return self._core.decode_stream(bool(skip_special_tokens))
 
+    def count_tokens(self, text, add_special_tokens=True):
+        """Fast token count matching `len(self.encode(text, add_special_tokens=...))`
+        without constructing a Python `list[int]`."""
+        if not add_special_tokens:
+            return self._core.count_special_tokens(text)
+        prefix, suffix = self._post_prefix_suffix()
+        if self.__dict__.get("_ps_exact", False):
+            return len(prefix) + self._core.count_special_tokens(text) + len(suffix)
+        return len(self.encode(text, add_special_tokens=True))
+
+    def count_tokens_batch(self, texts, add_special_tokens=True, num_threads=0):
+        """Parallel batch token counts matching `[len(self.encode(t, ...)) for t in texts]`
+        with zero Python `list[int]` boxing."""
+        if not add_special_tokens:
+            return self._core.count_special_tokens_batch(texts, int(num_threads))
+        prefix, suffix = self._post_prefix_suffix()
+        if self.__dict__.get("_ps_exact", False):
+            extra = len(prefix) + len(suffix)
+            counts = self._core.count_special_tokens_batch(texts, int(num_threads))
+            return [c + extra for c in counts] if extra else counts
+        return [len(self.encode(t, add_special_tokens=True)) for t in texts]
+
+    def encode_file_to_buffer(self, path, num_threads=0, separator=None, dtype=None):
+        """Zero-copy mmap ordinary-encoding of a file on disk into
+        `{"data": np.ndarray, "offsets": np.ndarray}`."""
+        return self._core.encode_file_to_buffer(path, int(num_threads), separator, dtype)
+
+    def count_tokens_file(self, path, num_threads=0, separator=None):
+        """Zero-copy mmap ordinary token count for a file on disk (returns `int`
+        when `separator is None`, or `list[int]` per separated document)."""
+        return self._core.count_tokens_file(path, int(num_threads), separator)
+
     def _post_prefix_suffix(self):
         """Special ids the post-processor adds before/after a single sequence
         (computed once via a sentinel; covers TemplateProcessing/Bert/Roberta/
