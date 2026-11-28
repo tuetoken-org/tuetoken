@@ -1193,6 +1193,7 @@ struct Tokenizer {
     byte_arena: Vec<u8>,
     byte_span: Vec<(u32, u32)>,
     c2b: [u16; 324],
+    ignore_merges: bool,
     ignore_lookup: Option<FxHashMap<Box<[u8]>, u32>>,
     vocab_size: usize,
     // Composable HF normalizer & pre-tokenizer pipelines.
@@ -2966,7 +2967,17 @@ impl Tokenizer {
             Some((b, s.out[0]))
         };
 
-        let pairs: Vec<(&[u8], u32)> = if this.byte_fast && this.monotonic && this.ignore_lookup.is_none() {
+        let pairs: Vec<(&[u8], u32)> = if this.ignore_merges && !this.byte_fallback {
+            // Under `ignore_merges: true`, every vocab token `1..=15B` wins directly
+            // over BPE merges (first-ID-wins on duplicates, which `ChunkTable` preserves).
+            let mut pairs: Vec<(&[u8], u32)> = Vec::with_capacity(n_vocab);
+            for (id, &(off, len)) in this.byte_span.iter().enumerate() {
+                if len >= 1 && (len as usize) <= chunk_table::MAX_KEY {
+                    pairs.push((&this.byte_arena[off as usize..(off + len) as usize], id as u32));
+                }
+            }
+            pairs
+        } else if this.byte_fast && this.monotonic {
             const LEAF: u32 = u32::MAX;
             const AMBIG: u32 = u32::MAX - 1;
             let mut prod: Vec<(u32, u32, u32)> = vec![(0, 0, LEAF); n_vocab];
@@ -3750,18 +3761,40 @@ impl Tokenizer {
     /// ByteLevel chunk: each byte -> its singleton token, then merge.
     #[inline]
     fn process_chunk(&self, chunk: &[u8], s: &mut Scratch, mode: Merge) {
+        self.process_chunk_impl::<false>(chunk, s, mode);
+    }
+
+    /// `CHECKED_SHORT == true`: caller already confirmed `chunk.len() <= MAX_KEY`
+    /// missed `self.chunk_table` (avoids redundant `chunk_table` re-lookup under
+    /// `ignore_merges: true`).
+    #[inline]
+    fn process_chunk_impl<const CHECKED_SHORT: bool>(&self, chunk: &[u8], s: &mut Scratch, mode: Merge) {
         if chunk.is_empty() {
             return;
+        }
+        if self.ignore_merges {
+            if !CHECKED_SHORT
+                && !self.byte_fallback
+                && self.singleton_eow.is_none()
+                && chunk.len() <= chunk_table::MAX_KEY
+            {
+                let (lo, hi) = chunk_table::pack(chunk);
+                if let Some(id) = self.chunk_table.get(lo, hi) {
+                    s.out.push(id);
+                    return;
+                }
+            } else if (!CHECKED_SHORT || chunk.len() > chunk_table::MAX_KEY)
+                && self.ignore_lookup.is_some()
+            {
+                if let Some(&id) = self.ignore_lookup.as_ref().unwrap().get(chunk) {
+                    s.out.push(id);
+                    return;
+                }
+            }
         }
         if self.byte_fast && mode != Merge::Stream && chunk.len() <= 64 {
             bpe::merge_bytes_into(chunk, &self.singleton_u32, &self.map, &mut s.out);
             return;
-        }
-        if let Some(map) = &self.ignore_lookup {
-            if let Some(&id) = map.get(chunk) {
-                s.out.push(id);
-                return;
-            }
         }
         s.chunk.clear();
         if let Some(eow) = &self.singleton_eow {
@@ -5782,13 +5815,13 @@ impl Tokenizer {
             return;
         }
         if !s.dyn_cache.owned_by(self.uid) {
-            self.process_chunk(chunk, s, Merge::Auto);
+            self.process_chunk_impl::<true>(chunk, s, Merge::Auto);
             return;
         }
         let st = s.out.len();
         #[cfg(test)]
         perf::MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.process_chunk(chunk, s, Merge::Auto);
+        self.process_chunk_impl::<true>(chunk, s, Merge::Auto);
         let (out, dc) = (&s.out, &mut s.dyn_cache);
         let res = &out[st..];
         if !self.learned.put_6(lo, hi, h, res) {
@@ -6920,11 +6953,23 @@ impl Tokenizer {
         if chunk.is_empty() {
             return;
         }
-        if let Some(map) = &self.ignore_lookup {
-            if let Some(&id) = map.get(chunk) {
-                ids.push(id);
-                spans.push((cs, ce));
-                return;
+        if self.ignore_merges {
+            if !self.byte_fallback
+                && self.singleton_eow.is_none()
+                && chunk.len() <= chunk_table::MAX_KEY
+            {
+                let (lo, hi) = chunk_table::pack(chunk);
+                if let Some(id) = self.chunk_table.get(lo, hi) {
+                    ids.push(id);
+                    spans.push((cs, ce));
+                    return;
+                }
+            } else if let Some(map) = &self.ignore_lookup {
+                if let Some(&id) = map.get(chunk) {
+                    ids.push(id);
+                    spans.push((cs, ce));
+                    return;
+                }
             }
         }
         toks.clear();
@@ -7636,15 +7681,17 @@ impl Tokenizer {
             (bpe::MergeMap::new_with_opts(&merges, false, byte_fallback), check_monotonic())
         };
 
+        let short_in_ct = !byte_fallback && fl.singleton_eow.is_none();
         let ignore_lookup = if ignore_merges {
             let mut m: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
             for (id, &(off, len)) in byte_span.iter().enumerate() {
-                if len > 0 {
+                let lu = len as usize;
+                if lu > 0 && (!short_in_ct || lu > chunk_table::MAX_KEY) {
                     let b = &byte_arena[off as usize..(off + len) as usize];
                     m.entry(b.to_vec().into_boxed_slice()).or_insert(id as u32);
                 }
             }
-            Some(m)
+            if m.is_empty() { None } else { Some(m) }
         } else {
             None
         };
@@ -7656,7 +7703,6 @@ impl Tokenizer {
             }
         }
         let byte_fast = !byte_fallback
-            && ignore_lookup.is_none()
             && fl.singleton_eow.is_none()
             && map.init_byte_tables(&singleton, &merges, monotonic);
 
@@ -7685,6 +7731,7 @@ impl Tokenizer {
             byte_arena,
             byte_span,
             c2b,
+            ignore_merges,
             ignore_lookup,
             vocab_size,
             normalizer,
@@ -8056,15 +8103,17 @@ impl Tokenizer {
             (bpe::MergeMap::new_with_opts(&merges, false, byte_fallback), check_monotonic())
         };
 
+        let short_in_ct = !byte_fallback && singleton_eow.is_none();
         let ignore_lookup = if ignore_merges {
             let mut m: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
             for (id, &(off, len)) in byte_span.iter().enumerate() {
-                if len > 0 {
+                let lu = len as usize;
+                if lu > 0 && (!short_in_ct || lu > chunk_table::MAX_KEY) {
                     let b = &byte_arena[off as usize..(off + len) as usize];
                     m.entry(b.to_vec().into_boxed_slice()).or_insert(id as u32);
                 }
             }
-            Some(m)
+            if m.is_empty() { None } else { Some(m) }
         } else {
             None
         };
@@ -8076,7 +8125,6 @@ impl Tokenizer {
             }
         }
         let byte_fast = !byte_fallback
-            && ignore_lookup.is_none()
             && singleton_eow.is_none()
             && map.init_byte_tables(&singleton, &merges, monotonic);
 
@@ -8105,6 +8153,7 @@ impl Tokenizer {
             byte_arena,
             byte_span,
             c2b,
+            ignore_merges,
             ignore_lookup,
             vocab_size,
             normalizer,
