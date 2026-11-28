@@ -54,32 +54,6 @@ maturin develop --release
 | **Whisper batch decode** (`whisper-large-v3`, `decode_with_timestamps`) | **0.098 ms** | — | — | 31.67 ms | **323× vs HF** |
 | **1 MB byte offsets** (`encode_with_offsets_buffer`, Qwen2.5) | **1.16 ms** | — | — | 249.4 ms | **215× vs HF** |
 
-**Ubuntu Linux x86_64 (AMD EPYC Zen 4, 4 vCPU, AVX-512):** `tuetoken` hits **1.56 GB/s cold / 1.68 GB/s warm** on 105 MB whole-file `o200k` vs `gigatoken` **0.44 / 1.16 GB/s** (**3.6× cold / 1.5× warm**), **30.1 ms** startup vs `gigatoken` **394 ms** (**13.1×**), **3.1–4.3× faster** decode, **16.3× faster** 50 MB truncation (`3.15 ms` vs `51.4 ms`), and **4.7× faster** on adversarial 100 KB random hex (`1.08 ms` vs `5.05 ms`, `73.1 ms` `fastokens`).
-
-Token IDs are verified bit-for-bit identical across all libraries before anything is timed, and cold corpus runs use a fresh OS process per point (no warm caches). Reproduce on your own machine with:
-
-```bash
-python tools/bench/bench_vs_all.py corpus_1gb.txt && python tools/bench/plot_vs_all.py
-```
-
-Raw numbers in [tools/bench/results_vs_all.json](tools/bench/results_vs_all.json).
-
-New in 0.1.10:
-- **Exact O(`max_tokens`) early-exit right & left truncation**: truncating a 10 MB document to 512 tokens takes **2.75 µs right / 3.67 µs left** (up to 3,600 GB/s effective); 50 MB `AutoTokenizer` batch truncation (`1,000 × 50 KB`) runs in **1.3–2.8 ms** (**up to 11,842x faster** than 🤗 `transformers` on Qwen2.5, **8,017x** on DeepSeek-V3), token-for-token identical.
-- **5x–15x faster startup**: parallel zero-malloc SIMD JSON loader + parallel table builders (`o200k_base` in **10.5 ms**, 33.4 MB `gemma-3-4b` in **19.6 ms** — **8.5–15.4x** faster than 🤗 `tokenizers` across Qwen3, Llama-4, DeepSeek-V3, Gemma-2/3, GPT-OSS, and Falcon-H1).
-- **Frontier model-family & core speedups**: SIMD/parallel engines for DeepSeek-V3/R1 CJK (**11.9 GB/s**, 2,733x vs HF), SentencePiece (`Gemma-2/3`, `Mistral`, `Phi-3.5`, `Yi-1.5` up to **3.8 GB/s**, 274–666x vs HF), parallel O(1) NFC (`Qwen3.6` **4.8 GB/s**, 1,024x vs HF), `Seed-Coder` (**3.1 GB/s**), and `Falcon-H1/3` (**1.8 GB/s**), plus **10+ GB/s** core `o200k`/`cl100k` encode and SIMD UTF-32 transcoding.
-- **Decode, Whisper, chat & offsets**: inline-16B `DecodeEntry` + zero-copy NumPy/tensor decode (**421–441 Mtok/s**; Whisper timestamped batch decode **290–505x** vs HF), compiled & batched chat templates (**5.5 µs**, 380k chats/s), universal `FastBatch` + SIMD nibble-table special prefilter (`10K` prompts in **1.2–1.7 ms**, 122–300x vs HF), and zero-copy `encode_with_offsets_buffer` (**254–391x** vs HF).
-- **New utilities & typing**: incremental UTF-8 `DecodeStream` (10–12x vs HF), zero-copy `mmap` `encode_file_to_buffer` / `count_tokens_file` (up to **11.55 GB/s**), `truncate`, `chunk_text`, `count_special_tokens(_batch)`, local-directory `AutoTokenizer.from_pretrained` (with `chat_template.jinja`), and full PEP 561 `.pyi` stubs.
-
-New in 0.1.9:
-- **OpenAI Whisper ASR support**: full `WhisperTokenizerFast` parity (`whisper-tiny` through `whisper-large-v3-turbo`, `distil-whisper`, and legacy `vocab.json`+`merges.txt`), with SIMD `<|` special-token prefiltering and all-Rust decode / `decode_with_timestamps` (31-180x faster than 🤗 `transformers`).
-- **Universal HF normalizer & pre-tokenizer pipeline**: composable Rust support for modern Hugging Face tokenizers plus Mistral `tekken.json` and legacy BPE checkpoints.
-- **Core throughput & startup**: 4.5-4.8x faster tokenizer startup (+ `warmup()` API), `FastBatch` zero-plan short-document engine, exact 2D-shielded byte-pair BPE pre-collapse, SIMD-bucketed `MergeMap` with 2 MiB THP, AVX-512 VBMI2 `blockscan`, and BMI2 `bzhi` key packing.
-
-New in 0.1.8: a batch of non-ASCII `str` (most real text) is converted to UTF-8 on all
-cores instead of by Python on one thread, so lists of strings are 2-2.5x faster than in
-0.1.7 (1 GB of OpenWebText documents in one call: 1.7 -> 4.1 GB/s), with identical output.
-
 ## Drop-in `AutoTokenizer`
 
 The full 🤗 API, byte-exact with `transformers.AutoTokenizer`:
