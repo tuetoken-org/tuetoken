@@ -7790,32 +7790,353 @@ impl Tokenizer {
         }
     }
 
+    /// Search backward in `lo..=hint` (`0 < p < b.len()`) for the rightmost byte
+    /// offset `p` proven to be an exact ordinary chunk & normalizer boundary:
+    /// `encode(text) == encode(text[..p]) || encode_nonfirst(text[p..])`.
+    fn find_safe_ordinary_split_before(&self, b: &[u8], hint: usize, lo: usize) -> Option<usize> {
+        let n = b.len();
+        if n < 4 || hint == 0 || lo >= hint || hint >= n {
+            return None;
+        }
+        // 1. SentencePiece (`SpFastMeta`, e.g. Gemma-2/3, Mistral, Phi-3.5, Yi-1.5).
+        if self.sp_fast_meta != SpFastMeta::None {
+            let cross = &self.sp_cross_prev;
+            let mut hi = hint + 1;
+            let min_p = lo.max(1);
+            while hi > min_p {
+                let rel = memchr::memrchr(b' ', &b[min_p..hi])?;
+                let p = min_p + rel;
+                let prev = b[p - 1];
+                if prev < 0x80 && prev != b' ' && ((cross[(prev as usize) >> 6] >> (prev & 63)) & 1) == 0 {
+                    return Some(p);
+                }
+                hi = p;
+            }
+            return None;
+        }
+        if self.singleton_eow.is_some()
+            || !(self.normalizer.is_identity() || self.normalizer.is_unicode_only())
+        {
+            return None;
+        }
+        let id_norm = self.normalizer.is_identity();
+        // 2. DeepSeek-V3/R1 CJK (`\n` + alphanumeric or CJK lead byte).
+        if self.fast_pretok == FastPretok::Cjk {
+            let mut hi = hint;
+            let min_nl = lo.saturating_sub(1);
+            while hi > min_nl {
+                let rel = memchr::memrchr(b'\n', &b[min_nl..hi])?;
+                let nl = min_nl + rel;
+                let p = nl + 1;
+                if p < n {
+                    let c = b[p];
+                    let ok = if id_norm {
+                        c.is_ascii_alphanumeric() || (0xE4..=0xE9).contains(&c)
+                    } else {
+                        c.is_ascii_alphabetic() && (p + 1 == n || b[p + 1] < 0x80)
+                    };
+                    if ok {
+                        return Some(p);
+                    }
+                }
+                hi = nl;
+            }
+            return None;
+        }
+        // 3. ByteLevel `BlockScan` (GPT-2, cl100k, o200k, Qwen2.5/3/3.6, Llama-3/4,
+        //    gpt-oss, SmolLM3, Seed-Coder):
+        //    First try exact single-space boundary `[a-z] [A-Za-z]` (works even on
+        //    10 MB single-line docs with ZERO newlines!), then fall back to `\n[A-Za-z]`.
+        if self.fast_pretok == FastPretok::BlockScan {
+            let mut hi = (hint + 1).min(n - 1);
+            let min_p = lo.max(1);
+            while hi > min_p {
+                let Some(rel) = memchr::memrchr(b' ', &b[min_p..hi]) else {
+                    break;
+                };
+                let p = min_p + rel;
+                if b[p - 1].is_ascii_lowercase()
+                    && b[p + 1].is_ascii_alphabetic()
+                    && (id_norm || p + 2 == n || b[p + 2] < 0x80)
+                {
+                    return Some(p);
+                }
+                hi = p;
+            }
+            let mut hi = hint;
+            let min_nl = lo.saturating_sub(1);
+            while hi > min_nl {
+                let rel = memchr::memrchr(b'\n', &b[min_nl..hi])?;
+                let nl = min_nl + rel;
+                let p = nl + 1;
+                if p < n && b[p].is_ascii_alphabetic() && (id_norm || p + 1 == n || b[p + 1] < 0x80) {
+                    return Some(p);
+                }
+                hi = nl;
+            }
+            return None;
+        }
+        // 4. Slice-only `Pipe` (`Falcon-H1`, `Falcon3`) when splittable (`\n[A-Za-z]`).
+        if self.fast_pretok == FastPretok::Pipe && self.splittable() {
+            let mut hi = hint;
+            let min_nl = lo.saturating_sub(1);
+            while hi > min_nl {
+                let rel = memchr::memrchr(b'\n', &b[min_nl..hi])?;
+                let nl = min_nl + rel;
+                let p = nl + 1;
+                if p < n && b[p].is_ascii_alphabetic() && (id_norm || p + 1 == n || b[p + 1] < 0x80) {
+                    return Some(p);
+                }
+                hi = nl;
+            }
+        }
+        None
+    }
+
+    /// Encode a proven non-first interior suffix fragment `sub` (starting at `p > 0`
+    /// inside an ordinary text span) into `s.out`.
+    #[inline]
+    fn encode_ordinary_nonfirst_into(&self, sub: &str, s: &mut Scratch) {
+        if sub.is_empty() {
+            return;
+        }
+        if self.sp_fast_meta != SpFastMeta::None {
+            let ok = self.encode_sp_fast(sub, false, false, s);
+            debug_assert!(ok);
+            return;
+        }
+        self.encode_into(sub, Merge::Auto, false, s);
+    }
+
+    /// Encode at most the LAST `max_tokens` ordinary tokens of `text` into `s.out`,
+    /// using O(`max_tokens`) backward-window suffix splitting when `text` is much
+    /// longer than `max_tokens`.
+    fn encode_ordinary_suffix_into(&self, text: &str, max_tokens: usize, s: &mut Scratch) {
+        if max_tokens == 0 || text.is_empty() {
+            return;
+        }
+        let start_out = s.out.len();
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        let mut win = max_tokens.saturating_mul(8).saturating_add(512);
+        for _ in 0..2 {
+            if n <= win.saturating_add(256) {
+                break;
+            }
+            let hint = n - win;
+            let lo = hint.saturating_sub(4096).max(1);
+            if let Some(p) = self.find_safe_ordinary_split_before(bytes, hint, lo) {
+                self.encode_ordinary_nonfirst_into(&text[p..], s);
+                let got = s.out.len() - start_out;
+                if got >= max_tokens {
+                    if got > max_tokens {
+                        s.out.drain(start_out..s.out.len() - max_tokens);
+                    }
+                    return;
+                }
+                s.out.truncate(start_out);
+            }
+            win = win.saturating_mul(4);
+        }
+        if n >= SPLIT_MIN && self.splittable() {
+            s.out.extend_from_slice(&self.encode_split(text));
+        } else {
+            self.encode_into(text, Merge::Auto, true, s);
+        }
+        let got = s.out.len() - start_out;
+        if got > max_tokens {
+            s.out.drain(start_out..s.out.len() - max_tokens);
+        }
+    }
+
+    /// Exact special-token-aware encode of at most the LAST `max_tokens` tokens of
+    /// `text` into `s.out` in O(`max_tokens`) time (even on 100 MB chat logs!).
+    fn encode_special_suffix_into(&self, text: &str, max_tokens: usize, s: &mut Scratch) {
+        if max_tokens == 0 || text.is_empty() {
+            return;
+        }
+        let Some(ac) = &self.special_ac else {
+            self.encode_ordinary_suffix_into(text, max_tokens, s);
+            return;
+        };
+        let start_out = s.out.len();
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        let mut win = max_tokens.saturating_mul(8).saturating_add(512);
+        for _ in 0..2 {
+            if n <= win.saturating_add(256) {
+                break;
+            }
+            let mut hint = n - win;
+            let min_lo = hint.saturating_sub(8192).max(1);
+            let mut found_p = None;
+            // Try up to 4 candidate ordinary split points, verifying none lies inside
+            // or adjacent to any special token (including lstrip/rstrip whitespace reach).
+            for _ in 0..4 {
+                if hint <= min_lo {
+                    break;
+                }
+                let Some(p) = self.find_safe_ordinary_split_before(bytes, hint, min_lo) else {
+                    break;
+                };
+                let ws_lo = text[..p].trim_end().len();
+                let ws_after = text[p..].len() - text[p..].trim_start().len();
+                if ws_lo > 0 && p + ws_after < n {
+                    let mut guard_lo = ws_lo.saturating_sub(self.special_max_len + 2);
+                    while guard_lo > 0 && !text.is_char_boundary(guard_lo) {
+                        guard_lo -= 1;
+                    }
+                    let mut guard_hi = (p + ws_after + self.special_max_len + 2).min(n);
+                    while guard_hi < n && !text.is_char_boundary(guard_hi) {
+                        guard_hi += 1;
+                    }
+                    let clear = if self.special_prefilter.find_first(&bytes[guard_lo..guard_hi]).is_none() {
+                        true
+                    } else {
+                        // Scan every special-token match starting in `guard_lo..=p+ws_after`
+                        // using standard unanchored LeftmostLongest `ac.find` (zero StartKind::Both
+                        // build overhead): LeftmostLongest skips non-matching spans in one jump and
+                        // returns the longest match at `ms`, mathematically ruling out ANY special
+                        // token crossing or reaching `p` (including via lstrip/rstrip) even when
+                        // unrelated specials like `\n` appear nearby in Gemma-3.
+                        let scan_hi = (p + ws_after + 1).min(n);
+                        let mut ok = true;
+                        let mut s_idx = guard_lo;
+                        while s_idx < scan_hi {
+                            let Some(m) = ac.find(&text[s_idx..guard_hi]) else {
+                                break;
+                            };
+                            let ms = s_idx + m.start();
+                            if ms >= scan_hi {
+                                break;
+                            }
+                            let me = s_idx + m.end();
+                            let pat = m.pattern().as_usize();
+                            let start = if self.special_lstrip[pat] {
+                                text[..ms].trim_end().len()
+                            } else {
+                                ms
+                            };
+                            let end = if self.special_rstrip[pat] {
+                                n - text[me..].trim_start().len()
+                            } else {
+                                me
+                            };
+                            if start <= p && end >= p {
+                                ok = false;
+                                break;
+                            }
+                            // Advance past `ms` to the next UTF-8 char boundary so any overlapping
+                            // special starting after `ms` is still checked.
+                            s_idx = ms + text[ms..].chars().next().map_or(1, char::len_utf8);
+                        }
+                        ok
+                    };
+                    if clear {
+                        found_p = Some(p);
+                        break;
+                    }
+                    hint = guard_lo;
+                } else {
+                    hint = p.saturating_sub(1);
+                }
+            }
+            if let Some(p) = found_p {
+                let sub = &text[p..];
+                let sb = sub.as_bytes();
+                let sn = sb.len();
+                if let Some(first) = self.special_prefilter.find_first(sb) {
+                    let mut last = 0usize;
+                    let mut first_frag = true;
+                    for m in ac.find_iter(&sub[first..]) {
+                        let ms = first + m.start();
+                        let me = first + m.end();
+                        if ms < last {
+                            continue;
+                        }
+                        let pat = m.pattern().as_usize();
+                        let (mut start, mut end) = (ms, me);
+                        if self.special_lstrip[pat] {
+                            start = last + sub[last..start].trim_end().len();
+                        }
+                        if self.special_rstrip[pat] {
+                            end = sn - sub[end..].trim_start().len();
+                        }
+                        if start > last {
+                            if first_frag {
+                                self.encode_ordinary_nonfirst_into(&sub[last..start], s);
+                            } else {
+                                self.encode_fragment_into(&sub[last..start], false, s);
+                            }
+                        }
+                        s.out.push(self.special_ids[pat]);
+                        first_frag = false;
+                        last = end;
+                    }
+                    if last < sn {
+                        if first_frag {
+                            self.encode_ordinary_nonfirst_into(&sub[last..], s);
+                        } else {
+                            self.encode_fragment_into(&sub[last..], false, s);
+                        }
+                    }
+                } else {
+                    self.encode_ordinary_nonfirst_into(sub, s);
+                }
+                let got = s.out.len() - start_out;
+                if got >= max_tokens {
+                    if got > max_tokens {
+                        s.out.drain(start_out..s.out.len() - max_tokens);
+                    }
+                    return;
+                }
+                s.out.truncate(start_out);
+            }
+            win = win.saturating_mul(4);
+        }
+        self.encode_special_into(text, s);
+        let got = s.out.len() - start_out;
+        if got > max_tokens {
+            s.out.drain(start_out..s.out.len() - max_tokens);
+        }
+    }
+
     /// Encode a batch of text views serially into ONE flat `Vec<u32>` + row ends
     /// (single `SCRATCH` borrow, zero per-row `Vec` allocations, zero rayon wakeup).
-    /// When `right_cap` is `Some(cap)`, uses O(`cap`) early-exit prefix encoding.
+    /// When `trunc_cap` is `Some((cap, left))`, uses O(`cap`) early-exit prefix
+    /// (`left == false`) or suffix (`left == true`) encoding.
     fn encode_special_serial_flat_cap(
         &self,
         views: &[&str],
         total_bytes: usize,
-        right_cap: Option<usize>,
+        trunc_cap: Option<(usize, bool)>,
     ) -> (Vec<u32>, Vec<usize>) {
-        let est = match right_cap {
-            Some(cap) => views.len().saturating_mul(cap.min(4096)).min(total_bytes / 3 + views.len() * 2) + 8,
+        let est = match trunc_cap {
+            Some((cap, _)) => views.len().saturating_mul(cap.min(4096)).min(total_bytes / 3 + views.len() * 2) + 8,
             None => total_bytes / 3 + views.len() * 2 + 8,
         };
         let run = |s: &mut Scratch| -> (Vec<u32>, Vec<usize>) {
             let saved = std::mem::take(&mut s.out);
             s.out = Vec::with_capacity(est);
             let mut ends = Vec::with_capacity(views.len());
-            if let Some(cap) = right_cap {
-                for &t in views {
-                    self.encode_special_prefix_into(t, cap, s);
-                    ends.push(s.out.len());
+            match trunc_cap {
+                Some((cap, false)) => {
+                    for &t in views {
+                        self.encode_special_prefix_into(t, cap, s);
+                        ends.push(s.out.len());
+                    }
                 }
-            } else {
-                for &t in views {
-                    self.encode_special_into(t, s);
-                    ends.push(s.out.len());
+                Some((cap, true)) => {
+                    for &t in views {
+                        self.encode_special_suffix_into(t, cap, s);
+                        ends.push(s.out.len());
+                    }
+                }
+                None => {
+                    for &t in views {
+                        self.encode_special_into(t, s);
+                        ends.push(s.out.len());
+                    }
                 }
             }
             let flat = std::mem::replace(&mut s.out, saved);
@@ -7840,7 +8161,7 @@ impl Tokenizer {
         &self,
         views: &[&str],
         num_threads: usize,
-        right_cap: Option<usize>,
+        trunc_cap: Option<(usize, bool)>,
     ) -> Vec<(Vec<u32>, Vec<usize>)> {
         let n = views.len();
         let target_chunks = if num_threads == 0 {
@@ -7855,7 +8176,7 @@ impl Tokenizer {
                 .par_chunks(chunk_len)
                 .map(|slice| {
                     let bytes: usize = slice.iter().map(|t| t.len()).sum();
-                    self.encode_special_serial_flat_cap(slice, bytes, right_cap)
+                    self.encode_special_serial_flat_cap(slice, bytes, trunc_cap)
                 })
                 .collect::<Vec<_>>()
         };
@@ -7884,15 +8205,21 @@ impl Tokenizer {
         num_threads: usize,
     ) -> PyResult<(Bound<'py, PyList>, Option<Bound<'py, PyList>>)> {
         // FastBatch zero-plan pipelined path for plain list/tuple of str (< SPLIT_MIN)
-        // when normalizer is ASCII-identity and BlockScan applies. Skip it when right
-        // truncation has long documents (`max_len > cap * 6 + 128`) so our O(cap)
-        // early-exit prefix encoder avoids tokenizing discarded document tails!
-        let right_cap = if !trunc_left { budget } else { None };
+        // when normalizer is ASCII-identity and BlockScan applies. Skip it when
+        // truncation has long documents (`max_len > cap * 8 + 512`) so our O(cap)
+        // early-exit prefix/suffix encoder avoids tokenizing discarded text!
+        let trunc_cap = budget.map(|cap| (cap, trunc_left));
         let fast_flat: Option<(Vec<u32>, Vec<usize>)> =
             if self.normalizer.is_ascii_identity() && self.items_pipe_ok() {
                 if let Some(batch) = try_extract_fast_batch(py, texts_obj) {
-                    let early_exit_worthy = right_cap
-                        .is_some_and(|cap| batch.max_len > cap.saturating_mul(6).saturating_add(128));
+                    let early_exit_worthy = trunc_cap.is_some_and(|(cap, left)| {
+                        let thresh = if left {
+                            cap.saturating_mul(8).saturating_add(768)
+                        } else {
+                            cap.saturating_mul(6).saturating_add(128)
+                        };
+                        batch.max_len > thresh
+                    });
                     if !batch.has_bytes && batch.max_len < SPLIT_MIN && !early_exit_worthy {
                         let slice = &batch.items;
                         let total_len = batch.total_len;
@@ -7932,9 +8259,13 @@ impl Tokenizer {
             let wide = wide_texts(py, &texts, num_threads)?;
             let views = text_views(&texts, &wide);
             let total: usize = views.iter().map(|t| t.len()).sum();
-            let eff_work: usize = match right_cap {
-                Some(cap) => {
-                    let lim = cap.saturating_mul(6).saturating_add(128);
+            let eff_work: usize = match trunc_cap {
+                Some((cap, left)) => {
+                    let lim = if left {
+                        cap.saturating_mul(8).saturating_add(512)
+                    } else {
+                        cap.saturating_mul(6).saturating_add(128)
+                    };
                     views.iter().map(|t| t.len().min(lim)).sum()
                 }
                 None => total,
@@ -7943,11 +8274,11 @@ impl Tokenizer {
             let chunks =
                 if num_threads == 1 || nrows <= 1 || !parallel_ok() || eff_work < FLAT_SERIAL_MAX {
                     let one = self.maybe_detach(py, eff_work, || {
-                        self.encode_special_serial_flat_cap(&views, total, right_cap)
+                        self.encode_special_serial_flat_cap(&views, total, trunc_cap)
                     });
                     vec![one]
                 } else {
-                    py.detach(|| self.encode_special_par_chunks_cap(&views, num_threads, right_cap))
+                    py.detach(|| self.encode_special_par_chunks_cap(&views, num_threads, trunc_cap))
                 };
             (nrows, chunks)
         };
@@ -9537,40 +9868,59 @@ impl Tokenizer {
         if txt.is_empty() {
             return Ok(text.clone());
         }
-        // O(max_tokens) early-exit fast path for right truncation: never scans
-        // or encodes the discarded tail of multi-MB documents!
-        if right && txt.len() > max_tokens.saturating_mul(6).saturating_add(128) {
+        // O(max_tokens) early-exit fast path for BOTH right and left truncation:
+        // never scans or encodes the discarded portion of multi-MB documents!
+        let early_thresh = if right {
+            max_tokens.saturating_mul(6).saturating_add(128)
+        } else {
+            max_tokens.saturating_mul(8).saturating_add(768)
+        };
+        if txt.len() > early_thresh {
             let need = max_tokens.saturating_add(1);
-            if max_tokens < 2048 && self.normalizer.is_identity() {
-                return Ok(self.with_scratch(|sc| {
-                    sc.out.clear();
+            let run_into = |sc: &mut Scratch| {
+                sc.out.clear();
+                if right {
                     if special && self.special_ac.is_some() {
                         self.encode_special_prefix_into(txt, need, sc);
                     } else {
                         self.encode_ordinary_prefix_into(txt, need, sc);
                     }
+                } else if special && self.special_ac.is_some() {
+                    self.encode_special_suffix_into(txt, need, sc);
+                } else {
+                    self.encode_ordinary_suffix_into(txt, need, sc);
+                }
+            };
+            if max_tokens < 2048 && self.normalizer.is_identity() {
+                return Ok(self.with_scratch(|sc| {
+                    run_into(sc);
                     if sc.out.len() <= max_tokens {
                         return text.clone();
                     }
-                    self.decode_slice_to_pystr(py, &sc.out[..max_tokens], false, false, 0.02, 1500, &mut sc.utf8)
+                    let sub = if right {
+                        &sc.out[..max_tokens]
+                    } else {
+                        &sc.out[sc.out.len() - max_tokens..]
+                    };
+                    self.decode_slice_to_pystr(py, sub, false, false, 0.02, 1500, &mut sc.utf8)
                 }));
             }
             let ids: Vec<u32> = py.detach(|| {
                 self.with_scratch(|sc| {
-                    sc.out.clear();
-                    if special && self.special_ac.is_some() {
-                        self.encode_special_prefix_into(txt, need, sc);
-                    } else {
-                        self.encode_ordinary_prefix_into(txt, need, sc);
-                    }
+                    run_into(sc);
                     sc.out.clone()
                 })
             });
             if ids.len() <= max_tokens {
                 return Ok(text.clone());
             }
+            let sub = if right {
+                &ids[..max_tokens]
+            } else {
+                &ids[ids.len() - max_tokens..]
+            };
             return Ok(self.with_scratch(|sc| {
-                self.decode_slice_to_pystr(py, &ids[..max_tokens], false, false, 0.02, 1500, &mut sc.utf8)
+                self.decode_slice_to_pystr(py, sub, false, false, 0.02, 1500, &mut sc.utf8)
             }));
         }
         if txt.len() < Self::DETACH_MIN {
@@ -10313,19 +10663,25 @@ impl Tokenizer {
         num_threads: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         let n_special = prefix.len() + suffix.len();
-        let right_cap = if truncation && !trunc_left {
-            max_length.map(|ml| ml.saturating_sub(n_special))
+        let trunc_cap = if truncation {
+            max_length.map(|ml| (ml.saturating_sub(n_special), trunc_left))
         } else {
             None
         };
         // FastBatch zero-plan pipelined path when normalizer is ASCII-identity & BlockScan applies.
-        // When right-truncation has long docs (`max_len > cap * 6 + 128`), use our O(cap)
-        // early-exit prefix encoder instead of encoding discarded document tails!
+        // When truncation has long docs, use our O(cap) early-exit prefix/suffix encoder
+        // instead of encoding discarded text!
         let fast_flat: Option<(Vec<u32>, Vec<usize>)> =
             if self.normalizer.is_ascii_identity() && self.items_pipe_ok() {
                 if let Some(batch) = try_extract_fast_batch(py, texts) {
-                    let early_exit_worthy = right_cap
-                        .is_some_and(|cap| batch.max_len > cap.saturating_mul(6).saturating_add(128));
+                    let early_exit_worthy = trunc_cap.is_some_and(|(cap, left)| {
+                        let thresh = if left {
+                            cap.saturating_mul(8).saturating_add(768)
+                        } else {
+                            cap.saturating_mul(6).saturating_add(128)
+                        };
+                        batch.max_len > thresh
+                    });
                     if !batch.has_bytes && batch.max_len < SPLIT_MIN && !early_exit_worthy {
                         let slice = &batch.items;
                         let total_len = batch.total_len;
@@ -10363,9 +10719,13 @@ impl Tokenizer {
             let wide = wide_texts(py, &texts, num_threads)?;
             let views = text_views(&texts, &wide);
             let total: usize = views.iter().map(|t| t.len()).sum();
-            let eff_work: usize = match right_cap {
-                Some(cap) => {
-                    let lim = cap.saturating_mul(6).saturating_add(128);
+            let eff_work: usize = match trunc_cap {
+                Some((cap, left)) => {
+                    let lim = if left {
+                        cap.saturating_mul(8).saturating_add(512)
+                    } else {
+                        cap.saturating_mul(6).saturating_add(128)
+                    };
                     views.iter().map(|t| t.len().min(lim)).sum()
                 }
                 None => total,
@@ -10373,11 +10733,11 @@ impl Tokenizer {
             let nrows = views.len();
             if num_threads == 1 || nrows <= 1 || !parallel_ok() || eff_work < FLAT_SERIAL_MAX {
                 let one = self.maybe_detach(py, eff_work, || {
-                    self.encode_special_serial_flat_cap(&views, total, right_cap)
+                    self.encode_special_serial_flat_cap(&views, total, trunc_cap)
                 });
                 vec![one]
             } else {
-                py.detach(|| self.encode_special_par_chunks_cap(&views, num_threads, right_cap))
+                py.detach(|| self.encode_special_par_chunks_cap(&views, num_threads, trunc_cap))
             }
         };
 

@@ -1704,13 +1704,18 @@ def test_early_exit_right_truncation_parity():
             ok += int(np.array_equal(got["input_ids"], exp_ids))
             ok += int(np.array_equal(got["attention_mask"], exp_mask))
             for i, d in enumerate(docs):
-                tot += 2
+                tot += 4
                 exp_tr = d if len(full[i]) <= ml else t.decode(full[i][:ml])
                 ok += int(t.truncate(d, ml, side="right", special=False) == exp_tr)
                 exp_sp = d if len(full_sp[i]) <= ml else t.decode(full_sp[i][:ml])
                 ok += int(t.truncate(d, ml, side="right", special=True) == exp_sp)
+                exp_trl = "" if ml == 0 else (d if len(full[i]) <= ml else t.decode(full[i][-ml:]))
+                ok += int(t.truncate(d, ml, side="left", special=False) == exp_trl)
+                exp_spl = "" if ml == 0 else (d if len(full_sp[i]) <= ml else t.decode(full_sp[i][-ml:]))
+                ok += int(t.truncate(d, ml, side="left", special=True) == exp_spl)
 
     # 2. Diverse HF AutoTokenizer families (NFC, CJK, SP NormPrependAlways, SP NormNoPrepend, SP Metaspace)
+    #    Test BOTH right and left truncation!
     for repo in (
         "Qwen/Qwen2.5-0.5B-Instruct",
         "deepseek-ai/DeepSeek-V3",
@@ -1723,17 +1728,20 @@ def test_early_exit_right_truncation_parity():
             tt = TTAuto.from_pretrained(repo, local_files_only=True)
         except Exception:
             continue
-        for d in docs:
-            for ml in (1, 2, 5, 16, 17, 64, 512):
-                for sp in (True, False):
-                    ref = hf(d, truncation=True, max_length=ml, add_special_tokens=sp)["input_ids"]
-                    gl = tt(d, truncation=True, max_length=ml, add_special_tokens=sp)["input_ids"]
-                    gn = tt([d], truncation=True, max_length=ml, add_special_tokens=sp, return_tensors="np")["input_ids"][0].tolist()
-                    tot += 2
-                    ok += int(gl == ref)
-                    ok += int(gn == ref)
+        for side in ("right", "left"):
+            hf.truncation_side = side
+            tt.truncation_side = side
+            for d in docs:
+                for ml in (1, 2, 5, 16, 17, 64, 512):
+                    for sp in (True, False):
+                        ref = hf(d, truncation=True, max_length=ml, add_special_tokens=sp)["input_ids"]
+                        gl = tt(d, truncation=True, max_length=ml, add_special_tokens=sp)["input_ids"]
+                        gn = tt([d], truncation=True, max_length=ml, add_special_tokens=sp, return_tensors="np")["input_ids"][0].tolist()
+                        tot += 2
+                        ok += int(gl == ref)
+                        ok += int(gn == ref)
 
-    _line("early-exit right truncation (all families)", ok, tot)
+    _line("early-exit right & left truncation (all families)", ok, tot)
     assert ok == tot, f"early-exit truncation: {ok}/{tot}"
     return ok, tot
 
