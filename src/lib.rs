@@ -5260,6 +5260,7 @@ impl Tokenizer {
                 counts[ii] += (s.out.len() - before) as u32;
             }
         };
+        let defer_norm = self.parallel_unicode_norm();
         for (ii, &(doc, a0, b0, seg)) in items.iter().enumerate() {
             if let Src::Wide(w) = texts[doc as usize] {
                 if cnt == 0 {
@@ -5326,8 +5327,75 @@ impl Tokenizer {
             let d: &[u8] = &norm[doc as usize];
             let n = d.len();
             let (start, stop) = if seg { (a0, b0) } else { (0, n) };
+            let mut need_utf8_check = !trusted[doc as usize];
+            if defer_norm {
+                if need_utf8_check && simdutf8::basic::from_utf8(&d[start..stop]).is_err() {
+                    bad_bytes(doc);
+                    continue;
+                }
+                need_utf8_check = false;
+                // SAFETY: `trusted` or validated immediately above; `split_points_unicode`
+                // cuts strictly on ASCII char boundaries.
+                let sub = unsafe { std::str::from_utf8_unchecked(&d[start..stop]) };
+                if let std::borrow::Cow::Owned(norm_s) = self.normalizer.apply(sub) {
+                    if cnt == 0 {
+                        ubuf.clear();
+                    } else if norm_s.len() > 16384 {
+                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                        cnt = 0;
+                        segs.clear();
+                        ubuf.clear();
+                    }
+                    let uoff = ubuf.len();
+                    ubuf.extend_from_slice(norm_s.as_bytes());
+                    let ustop = ubuf.len() - uoff;
+                    if ustop == 0 {
+                        continue;
+                    }
+                    if seg && stop < n {
+                        ubuf.push(b'a');
+                    }
+                    let ulen = ubuf.len() - uoff;
+                    if ulen > u32::MAX as usize {
+                        flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                        cnt = 0;
+                        segs.clear();
+                        let before = s.out.len();
+                        self.encode_range(&ubuf[uoff..uoff + ulen], 0, ustop, s);
+                        counts[ii] += (s.out.len() - before) as u32;
+                        ubuf.clear();
+                        continue;
+                    }
+                    let mut scan = blockscan::Scan::new(0);
+                    let mut a = 0usize;
+                    loop {
+                        if cnt == 0 {
+                            view = self.learned.view();
+                            lview = self.long_table.view();
+                        }
+                        let ud = &ubuf[uoff..uoff + ulen];
+                        let k1 = scan.fill(self.kind, ud, ustop, &mut ends, cnt, CAP);
+                        if k1 == cnt {
+                            break;
+                        }
+                        let first_a = a;
+                        a = Self::fill_recs(ud, &ends, cnt, k1, a, buf.as_mut_ptr(), view, lview);
+                        segs.push((cnt, k1, ii, first_a, uoff, ulen));
+                        cnt = k1;
+                        if cnt >= CAP {
+                            flush(&buf[..cnt], &ends[..cnt], &segs, &ubuf, s, counts, view, lview);
+                            cnt = 0;
+                            segs.clear();
+                        }
+                        if a >= ustop {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
             if n > u32::MAX as usize {
-                if !trusted[doc as usize] && simdutf8::basic::from_utf8(&d[a0..b0]).is_err() {
+                if need_utf8_check && simdutf8::basic::from_utf8(&d[start..stop]).is_err() {
                     bad_bytes(doc);
                     continue;
                 }
@@ -5339,7 +5407,7 @@ impl Tokenizer {
                 counts[ii] += (s.out.len() - before) as u32;
                 continue;
             }
-            let mut scan = blockscan::Scan::new_checked(start, !trusted[doc as usize]);
+            let mut scan = blockscan::Scan::new_checked(start, need_utf8_check);
             let mut a = start;
             loop {
                 if cnt == 0 {
@@ -5567,6 +5635,14 @@ impl Tokenizer {
         self.fast_pretok == FastPretok::BlockScan || self.sp_fast_meta != SpFastMeta::None
     }
 
+    /// True when whole-document serial normalization can be deferred to parallel
+    /// per-segment normalization inside workers (sound for pure NFC/NFD/NFKC/NFKD
+    /// cut at `split_points_unicode` ASCII boundaries).
+    #[inline(always)]
+    fn parallel_unicode_norm(&self) -> bool {
+        self.normalizer.is_unicode_only() && self.splittable() && self.sp_fast_meta == SpFastMeta::None
+    }
+
     /// Proven-exact chunk boundaries for `SpFastMeta`: any `b[p] == b' '` preceded
     /// by `b[p - 1] != b' '` and not in `cross` starts a new chunk uncrossable by BPE.
     fn split_points_sp(b: &[u8], seg: usize, cross: &[u64; 4]) -> Vec<usize> {
@@ -5619,13 +5695,54 @@ impl Tokenizer {
         while target < n {
             let lim = (target + seg).min(n);
             let mut found = None;
-            let mut i = target.max(1);
-            while i < lim {
-                if b[i - 1] == b'\n' && b[i].is_ascii_alphabetic() {
-                    found = Some(i);
+            let mut i = target.max(1) - 1;
+            while i + 1 < lim {
+                if let Some(rel) = memchr::memchr(b'\n', &b[i..lim - 1]) {
+                    let p = i + rel + 1;
+                    if b[p].is_ascii_alphabetic() {
+                        found = Some(p);
+                        break;
+                    }
+                    i = p;
+                } else {
                     break;
                 }
-                i += 1;
+            }
+            match found {
+                Some(p) => {
+                    pts.push(p);
+                    target = p + seg;
+                }
+                None => target = lim + 1,
+            }
+        }
+        pts.push(n);
+        pts
+    }
+
+    /// Split points guaranteed invariant under ALL four Unicode normalization forms
+    /// (NFC/NFD/NFKC/NFKD) AND exact chunk boundaries: `b[p-1] == '\n'`, `b[p]` is
+    /// ASCII alphabetic, and `b[p+1]` (if present) is ASCII (so no following
+    /// combining mark can compose with `b[p]`).
+    fn split_points_unicode(b: &[u8], seg: usize) -> Vec<usize> {
+        let n = b.len();
+        let mut pts = vec![0usize];
+        let mut target = seg;
+        while target < n {
+            let lim = (target + seg).min(n);
+            let mut found = None;
+            let mut i = target.max(1) - 1;
+            while i + 1 < lim {
+                if let Some(rel) = memchr::memchr(b'\n', &b[i..lim - 1]) {
+                    let p = i + rel + 1;
+                    if b[p].is_ascii_alphabetic() && (p + 1 == n || b[p + 1] < 0x80) {
+                        found = Some(p);
+                        break;
+                    }
+                    i = p;
+                } else {
+                    break;
+                }
             }
             match found {
                 Some(p) => {
@@ -5692,7 +5809,8 @@ impl Tokenizer {
                 Src::Raw(_) | Src::Wide(_) => unreachable!("unvalidated bytes/wide reach plan() only without a normalizer"),
             }
         };
-        let norm: Vec<Cow<'t, [u8]>> = if self.normalizer.is_identity() || self.sp_fast_meta != SpFastMeta::None {
+        let defer_norm = self.parallel_unicode_norm();
+        let norm: Vec<Cow<'t, [u8]>> = if self.normalizer.is_identity() || self.sp_fast_meta != SpFastMeta::None || defer_norm {
             texts
                 .iter()
                 .map(|t| {
@@ -5757,6 +5875,11 @@ impl Tokenizer {
                     } else {
                         items.push((i as u32, 0, b.len(), false));
                     }
+                } else if defer_norm {
+                    let pts = Self::split_points_unicode(b, seg_bytes);
+                    for w in pts.windows(2) {
+                        items.push((i as u32, w[0], w[1], true));
+                    }
                 } else {
                     let pts = Self::split_points(b, seg_bytes);
                     for w in pts.windows(2) {
@@ -5805,6 +5928,21 @@ impl Tokenizer {
                 // SAFETY: trusted (from a str) or validated just above (whole doc).
                 let whole = unsafe { std::str::from_utf8_unchecked(d) };
                 self.encode_into(whole, Merge::Auto, true, s);
+            }
+            return true;
+        }
+        if self.parallel_unicode_norm() {
+            // SAFETY: trusted or validated immediately above; `split_points_unicode`
+            // cuts strictly on ASCII char boundaries.
+            let sub = unsafe { std::str::from_utf8_unchecked(&d[a..b]) };
+            let norm_sub = self.normalizer.apply(sub);
+            if seg {
+                match norm_sub {
+                    std::borrow::Cow::Borrowed(_) => self.encode_range(d, a, b, s),
+                    std::borrow::Cow::Owned(ns) => self.encode_range(ns.as_bytes(), 0, ns.len(), s),
+                }
+            } else {
+                self.encode_into_norm(norm_sub.as_ref(), Merge::Auto, true, s);
             }
             return true;
         }
@@ -6125,7 +6263,8 @@ impl Tokenizer {
             let src = texts_as_src_stream(texts);
             return self.encode_src_t::<O>(&src, num_threads, want_output).map_err(Ok);
         }
-        let src = texts_as_src(texts, wide, self.normalizer.is_identity()).map_err(Err)?;
+        let allow_raw = self.normalizer.is_identity() || self.parallel_unicode_norm();
+        let src = texts_as_src(texts, wide, allow_raw).map_err(Err)?;
         // Single-pass fused separator split + encode for one large buffer.
         if let Some(sep) = sep {
             if sep.is_empty() {
@@ -6181,10 +6320,11 @@ impl Tokenizer {
 
     fn encode_src_t<O: OutTok>(&self, texts: &[Src<'_>], num_threads: usize, want_output: bool) -> Result<(Vec<O>, Vec<usize>), BadInput> {
         use std::sync::atomic::{AtomicUsize, Ordering::*};
+        let defer_norm = self.parallel_unicode_norm();
         let (norm, items, tasks) = self.plan(texts, num_threads);
         let trusted: Vec<bool> = texts
             .iter()
-            .map(|t| matches!(t, Src::Str(_) | Src::Wide(_)) || !self.normalizer.is_identity())
+            .map(|t| matches!(t, Src::Str(_) | Src::Wide(_)) || (!self.normalizer.is_identity() && !defer_norm))
             .collect();
         let bad_doc = AtomicUsize::new(usize::MAX);
         let bad_wide = AtomicUsize::new(usize::MAX);

@@ -47,13 +47,101 @@ fn full(form: u8, s: &str, out: &mut String) {
     }
 }
 
+/// Exhaustively-proven O(1)-per-char NFC fast check for a valid UTF-8 non-ASCII
+/// run: returns `true` only if EVERY codepoint in `b` has `CCC == 0`, `NFC(c) == c`,
+/// and `NFC_QC == Yes` (cannot reorder, decompose, or compose with any preceding
+/// ASCII or NFC-safe starter). Covers 99%+ of real European, CJK, Hangul,
+/// punctuation, and emoji text without touching `unicode_normalization` tables.
+#[inline]
+fn is_nfc_safe_run(b: &[u8]) -> bool {
+    let mut i = 0usize;
+    let n = b.len();
+    while i < n {
+        let b0 = b[i];
+        if b0 < 0xE0 {
+            // 2-byte UTF-8:
+            //   0xC2..=0xCB -> U+0080..=U+02FF (Latin-1, Latin-Ext-A/B): 0 unsafe
+            //   0xD0..=0xD3 -> U+0400..=U+04FF (Cyrillic) except U+0483..=U+0487 (0xD2 0x83..=0x87)
+            if (0xC2..=0xCB).contains(&b0) {
+                i += 2;
+                continue;
+            }
+            if (0xD0..=0xD3).contains(&b0) {
+                if b0 == 0xD2 && (0x83..=0x87).contains(&b[i + 1]) {
+                    return false;
+                }
+                i += 2;
+                continue;
+            }
+            return false;
+        } else if b0 < 0xF0 {
+            // 3-byte UTF-8:
+            //   0xE4..=0xE9 -> U+4000..=U+9FFF (CJK Unified Ideographs + Ext A): 0 unsafe
+            //   0xEB..=0xEC -> U+B000..=U+CFFF (Hangul Syllables core): 0 unsafe
+            if (0xE4..=0xE9).contains(&b0) || b0 == 0xEB || b0 == 0xEC {
+                i += 3;
+                continue;
+            }
+            let b1 = b[i + 1];
+            match b0 {
+                // U+2002..=U+207F (dashes, quotes, ellipsis, etc.; exclude U+2000/U+2001)
+                0xE2 if b1 == 0x81 || (b1 == 0x80 && b[i + 2] >= 0x82) => {
+                    i += 3;
+                    continue;
+                }
+                // U+3000..=U+3029 (CJK punct) & U+3040..=U+30FF (Hiragana/Katakana) except U+3099/309A
+                0xE3 if (b1 == 0x80 && b[i + 2] <= 0xA9)
+                    || b1 == 0x81
+                    || b1 == 0x83
+                    || (b1 == 0x82 && !matches!(b[i + 2], 0x99 | 0x9A)) =>
+                {
+                    i += 3;
+                    continue;
+                }
+                // U+AC00..=U+AFFF & U+D000..=U+D7A3 (remaining Hangul Syllables)
+                0xEA if b1 >= 0xB0 => {
+                    i += 3;
+                    continue;
+                }
+                0xED if b1 <= 0x9D || (b1 == 0x9E && b[i + 2] <= 0xA3) => {
+                    i += 3;
+                    continue;
+                }
+                // U+FF00..=U+FFEF (Fullwidth punct & Halfwidth Katakana)
+                0xEF if (0xBC..=0xBE).contains(&b1) || (b1 == 0xBF && b[i + 2] <= 0xAF) => {
+                    i += 3;
+                    continue;
+                }
+                _ => return false,
+            }
+        } else {
+            // 4-byte UTF-8: 0xF0 0x9F -> U+1F000..=U+1FFFF (Emojis): 0 unsafe
+            if b0 == 0xF0 && b[i + 1] == 0x9F {
+                i += 4;
+                continue;
+            }
+            return false;
+        }
+    }
+    true
+}
+
 /// Next maximal non-ASCII run at or after `i`: Some((run_start, run_end)).
 #[inline]
 fn next_run(b: &[u8], mut i: usize) -> Option<(usize, usize)> {
     let n = b.len();
-    while i + 8 <= n
-        && u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) & 0x8080_8080_8080_8080 == 0
-    {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    while i + 32 <= n {
+        let w0 = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(b[i + 8..i + 16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(b[i + 16..i + 24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(b[i + 24..i + 32].try_into().unwrap());
+        if ((w0 | w1 | w2 | w3) & HI) != 0 {
+            break;
+        }
+        i += 32;
+    }
+    while i + 8 <= n && (u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) & HI) == 0 {
         i += 8;
     }
     while i < n && b[i] < 0x80 {
@@ -77,6 +165,14 @@ fn seg_start(st: usize) -> usize {
     st.saturating_sub(1)
 }
 
+#[inline]
+fn run_is_normalized(form: u8, text: &str, st: usize, en: usize) -> bool {
+    if form == 1 && is_nfc_safe_run(&text.as_bytes()[st..en]) {
+        return true;
+    }
+    quick(form, &text[seg_start(st)..en])
+}
+
 pub fn normalize(form: u8, text: &str) -> Cow<'_, str> {
     if !(1..=4).contains(&form) {
         return Cow::Borrowed(text);
@@ -88,7 +184,7 @@ pub fn normalize(form: u8, text: &str) -> Cow<'_, str> {
         match next_run(b, i) {
             None => return Cow::Borrowed(text),
             Some((st, en)) => {
-                if !quick(form, &text[seg_start(st)..en]) {
+                if !run_is_normalized(form, text, st, en) {
                     break (st, en);
                 }
                 i = en;
@@ -104,10 +200,10 @@ pub fn normalize(form: u8, text: &str) -> Cow<'_, str> {
     let mut copied = en; // text[..copied] is accounted for
     let mut i = en;
     while let Some((st, en)) = next_run(b, i) {
-        let ss = seg_start(st);
-        if quick(form, &text[ss..en]) {
+        if run_is_normalized(form, text, st, en) {
             out.push_str(&text[copied..en]);
         } else {
+            let ss = seg_start(st);
             out.push_str(&text[copied..ss]);
             full(form, &text[ss..en], &mut out);
         }
@@ -250,6 +346,14 @@ impl Normalizer {
     #[inline(always)]
     pub fn is_identity(&self) -> bool {
         self.stages.is_empty()
+    }
+
+    /// True when the normalizer is a single Unicode normalization stage
+    /// (NFC, NFD, NFKC, or NFKD). Allows parallel per-segment normalization
+    /// across ASCII split boundaries (`N(a + b) == N(a) + N(b)`).
+    #[inline(always)]
+    pub fn is_unicode_only(&self) -> bool {
+        self.fast_unicode != 0
     }
 
     /// True when the normalizer is guaranteed to leave every pure-ASCII string
@@ -433,5 +537,43 @@ mod tests {
         // Fail closed on unknown normalizer types
         assert!(Normalizer::from_json(&json!({"type": "BertNormalizer"})).is_err());
         assert!(Normalizer::from_json(&json!({"type": "Precompiled"})).is_err());
+    }
+
+    /// Exhaustive proof over ALL 1,112,064 Unicode scalar values against the
+    /// compiled `unicode-normalization` crate: every char accepted by
+    /// `is_nfc_safe_run` has `CCC == 0`, `NFC(c) == c`, and `NFC_QC == Yes`
+    /// (never composes with any ASCII or Hangul starter).
+    #[test]
+    fn nfc_safe_run_exhaustive_unicode() {
+        let mut buf = [0u8; 4];
+        let mut safe_count = 0usize;
+        for cp in 0x80u32..=0x10FFFF {
+            let Some(ch) = char::from_u32(cp) else { continue };
+            let s = ch.encode_utf8(&mut buf);
+            if is_nfc_safe_run(s.as_bytes()) {
+                safe_count += 1;
+                assert_eq!(
+                    unicode_normalization::char::canonical_combining_class(ch),
+                    0,
+                    "U+{cp:04X} has non-zero CCC"
+                );
+                assert_eq!(
+                    is_nfc_quick(std::iter::once(ch)),
+                    IsNormalized::Yes,
+                    "U+{cp:04X} is not NFC_QC=Yes"
+                );
+                let nfc: String = s.nfc().collect();
+                assert_eq!(nfc.as_str(), &*s, "U+{cp:04X} changed under NFC");
+                for &starter in &['e', 'a', 'A', '\u{1100}', '\u{AC00}'] {
+                    assert_eq!(
+                        is_nfc_quick([starter, ch].into_iter()),
+                        IsNormalized::Yes,
+                        "U+{cp:04X} failed is_nfc_quick after U+{:04X}",
+                        starter as u32
+                    );
+                }
+            }
+        }
+        assert!(safe_count > 40_000, "unexpectedly small safe_count={safe_count}");
     }
 }
