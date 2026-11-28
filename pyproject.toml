@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "tuetoken"
 version = "0.1.10"
-description = "The fastest tokenizer for modern LLMs, up to 20x faster. Drop-in for transformers.AutoTokenizer, byte-exact, never quadratic."
+description = "The fastest BPE tokenizer for modern LLMs (4.5 GB/s cold, up to 9.0 GB/s warm). Drop-in for transformers.AutoTokenizer, 2.5-24x faster than gigatoken, byte-exact, never quadratic."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }

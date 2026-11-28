@@ -1,13 +1,14 @@
 # tuetoken
 
-**The fastest tokenizer for modern LLMs: 5.4 GB/s, up to 52x faster than tiktoken and 122x faster than 🤗 tokenizers.**
+**The fastest BPE tokenizer for modern LLMs: 4.5 GB/s cold, up to 9.0 GB/s warm — 2.5–24× faster than `gigatoken`, 71× faster than `tiktoken`, and up to 4,381× faster than 🤗 `tokenizers`/`transformers`.**
 
 tuetoken is a BPE tokenizer with a fast, safe Rust core. It is a drop-in replacement
-for 🤗 `transformers.AutoTokenizer`: it loads any model's own `tokenizer.json` and
-reproduces tokenization exactly (special tokens, chat templates, padding/truncation),
-up to 12x faster (8.6x on chat templates). It also loads OpenAI/tiktoken encodings natively, and
-its O(n) merger stays fast even on adversarial inputs (hashes, base64, minified code)
-where other tokenizers degrade to O(n²).
+for 🤗 `transformers.AutoTokenizer`: it loads any model's own `tokenizer.json` in
+**7–20 ms** (13–24× faster than `gigatoken`, 12–29× faster than 🤗 `tokenizers`) and
+reproduces tokenization **bit-for-bit** (special tokens, chat templates, padding, exact
+O(`max_tokens`) right & left truncation, Whisper timestamps). It also loads OpenAI/tiktoken
+encodings natively, and its O(n) merger stays fast even on adversarial inputs (hashes,
+base64, minified code) where other tokenizers degrade to O(n²).
 
 ```python
 from tuetoken import AutoTokenizer
@@ -37,25 +38,31 @@ maturin develop --release
 
 ![Performances](https://raw.githubusercontent.com/tuetoken-org/tuetoken/main/bench_tokenizers.png)
 
-| tuetoken speedup (o200k_base, Apple M4 Max, 14 cores) | vs tiktoken | vs 🤗 tokenizers / transformers |
-|---|---|---|
-| Corpus encode, 1 GB `bytes`, all cores (5.4 GB/s) | **52x** | **122x** |
-| Corpus as a `list[str]` of documents, all cores (3.4 GB/s) | **33x** | **77x** |
-| Corpus encode, 1 thread (572 MB/s) | 17x | 83x |
-| Single prompt, 128 B to 128 KB (p50) | 4-7x | 26-63x |
-| Batch of documents to `list[list[int]]` | 5-6x | 10-13x |
-| Decode (p50) | 2x | 7x |
-| `AutoTokenizer`: `tok(texts)` / chat template | | **122-300x** / **3.2x+** (5.5 µs) |
-| `AutoTokenizer` truncation (`50 MB`, `max_length=512`, right & left) | | **up to 11,842x** (1.3-2.8 ms) |
-| Startup (`o200k` 10.5 ms; Qwen3 / Llama-4 / Gemma-3 9-20 ms) | | **8.5-15.4x** |
-| Offsets (`encode_with_offsets` / `encode_with_offsets_buffer`) | | **18-26x** / **254-391x** |
-| Whisper (`whisper-large-v3`, M4 Max): encode batch / padded `np` | | **31-46x** / **180x** |
-| Whisper (`whisper-large-v3`, M4 Max): decode / `decode_with_timestamps` | | **32-51x** / **290-505x** |
+### Head-to-head: `tuetoken 0.1.10` vs `gigatoken 0.11.0`, `fastokens 0.3.7`, `tiktoken`, and 🤗 `tokenizers`
 
-Token ids are identical across all three libraries. Every number uses text the
-tokenizer has not seen before, and corpus runs start a fresh process (no warm
-caches). Reproduce with `python tools/bench/bench.py corpus.txt && python tools/bench/plot.py`
-(raw numbers in `tools/bench/results.json`).
+| Benchmark (Apple M4 Max, 14 cores · identical token IDs) | `tuetoken` | `gigatoken` | `tiktoken` | 🤗 `tokenizers` / `transformers` | `tuetoken` speedup |
+|---|---:|---:|---:|---:|---|
+| **Cold 1 GB corpus** (`o200k_base`, fresh process, 14T) | **4.50 GB/s** | 1.79 GB/s | 63 MB/s | 9.5 MB/s | **2.5× vs gt** · **7.7× vs ft** · **71× vs tk** · **474× vs HF** |
+| **Warm 100 MB corpus** (`o200k_base`, 14T) | **8.70 GB/s** | 2.76 GB/s | — | — | **3.1× vs gt** · **5.5× vs fastokens** |
+| **Frontier LLMs (25 MB, 14T):** `Llama-4-Scout` / `Qwen3-8B` | **9.00 / 6.77 GB/s** | 2.38 / 1.64 GB/s | — | 20 / 7.3 MB/s | **3.8–4.1× vs gt** · **446–927× vs HF** |
+| **SentencePiece (25 MB, 14T):** `Gemma-3-4B` / `Mistral-7B` | **5.07 / 4.93 GB/s** | 0.50 / 0.54 GB/s | — | 55 / 83 MB/s | **9.2–10.2× vs gt** · **59–93× vs HF** |
+| **DeepSeek-V3 / Seed-Coder / Falcon-H1 (25 MB, 14T)** | **3.77 / 6.83 / 2.76 GB/s** | 1.81 GB/s / unsupp. / unsupp. | — | 9.2 / 9.5 / 7.8 MB/s | **2.1× vs gt** · **354–719× vs HF** |
+| **Startup (`o200k` / `Qwen3` / `DeepSeek` / `Gemma-3`)** | **7.1–20.0 ms** | 139–260 ms | — | 84–348 ms | **13–24× vs gt** · **12–29× vs HF** |
+| **Decode p50 (`50` / `1K` / `12K` tok, `list[int]`)** | **0.46 / 4.3 / 48.3 µs** | 1.67 / 16.3 / 228 µs | 2.1 / 29 / 322 µs | 6.7 / 105 / 1,247 µs | **3.6–4.7× vs gt** · **4.6–6.8× vs tk** · **15–26× vs HF** |
+| **10K docs padded** (`max_length=512`, NumPy) | **6.81 GB/s** | 0.66 GB/s | — | — | **10.4× vs gt** |
+| **50 MB truncation** (`1000×50KB`, `Qwen2.5`, `max_length=512`) | **2.42 ms (R) / 2.57 ms (L)** | 14.23 ms (R only) | — | 10,602 ms | **5.9× vs gt** · **4,381× vs HF** (up to **11,842×** on mixed logs) |
+| **Whisper batch decode** (`whisper-large-v3`, `decode_with_timestamps`) | **0.098 ms** | — | — | 31.67 ms | **323× vs HF** |
+| **1 MB byte offsets** (`encode_with_offsets_buffer`, Qwen2.5) | **1.16 ms** | — | — | 249.4 ms | **215× vs HF** |
+
+**Ubuntu Linux x86_64 (AMD EPYC Zen 4, 4 vCPU, AVX-512):** `tuetoken` hits **1.56 GB/s cold / 1.68 GB/s warm** on 105 MB whole-file `o200k` vs `gigatoken` **0.44 / 1.16 GB/s** (**3.6× cold / 1.5× warm**), **30.1 ms** startup vs `gigatoken` **394 ms** (**13.1×**), **3.1–4.3× faster** decode, **16.3× faster** 50 MB truncation (`3.15 ms` vs `51.4 ms`), and **4.7× faster** on adversarial 100 KB random hex (`1.08 ms` vs `5.05 ms`, `73.1 ms` `fastokens`).
+
+Token IDs are verified bit-for-bit identical across all libraries before anything is timed, and cold corpus runs use a fresh OS process per point (no warm caches). Reproduce on your own machine with:
+
+```bash
+python tools/bench/bench_vs_all.py corpus_1gb.txt && python tools/bench/plot_vs_all.py
+```
+
+Raw numbers in [tools/bench/results_vs_all.json](tools/bench/results_vs_all.json).
 
 New in 0.1.10:
 - **Exact O(`max_tokens`) early-exit right & left truncation**: truncating a 10 MB document to 512 tokens takes **2.75 µs right / 3.67 µs left** (up to 3,600 GB/s effective); 50 MB `AutoTokenizer` batch truncation (`1,000 × 50 KB`) runs in **1.3–2.8 ms** (**up to 11,842x faster** than 🤗 `transformers` on Qwen2.5, **8,017x** on DeepSeek-V3), token-for-token identical.

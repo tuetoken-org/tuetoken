@@ -1,0 +1,247 @@
+{
+  "meta": {
+    "cpu": "Apple M4 Max",
+    "machine": "arm64",
+    "cores": 14,
+    "python": "3.12.9",
+    "versions": {
+      "tuetoken": "0.1.10",
+      "gigatoken": "0.11.0",
+      "fastokens": "0.3.7",
+      "tiktoken": "0.12.0",
+      "tokenizers": "0.22.2",
+      "transformers": "4.57.6"
+    }
+  },
+  "corpus": {
+    "bytes": 1073741824,
+    "cold": {
+      "tuetoken": [
+        {
+          "threads": 1,
+          "mbps": 490.8,
+          "tokens": 238846303
+        },
+        {
+          "threads": 2,
+          "mbps": 956.1,
+          "tokens": 238846303
+        },
+        {
+          "threads": 4,
+          "mbps": 1821.5,
+          "tokens": 238846303
+        },
+        {
+          "threads": 8,
+          "mbps": 3341.2,
+          "tokens": 238846303
+        },
+        {
+          "threads": 14,
+          "mbps": 4503.9,
+          "tokens": 238846303
+        }
+      ],
+      "gigatoken": [
+        {
+          "threads": 1,
+          "mbps": 343.1,
+          "tokens": 238846303
+        },
+        {
+          "threads": 2,
+          "mbps": 592.2,
+          "tokens": 238846303
+        },
+        {
+          "threads": 4,
+          "mbps": 995.9,
+          "tokens": 238846303
+        },
+        {
+          "threads": 8,
+          "mbps": 1553.9,
+          "tokens": 238846303
+        },
+        {
+          "threads": 14,
+          "mbps": 1789.8,
+          "tokens": 238846303
+        }
+      ],
+      "fastokens": [
+        {
+          "threads": 14,
+          "mbps": 583.7,
+          "tokens": 238846303
+        }
+      ],
+      "tiktoken": [
+        {
+          "threads": 1,
+          "mbps": 12.1,
+          "tokens": 238846303
+        },
+        {
+          "threads": 14,
+          "mbps": 63.2,
+          "tokens": 238846303
+        }
+      ],
+      "hf": [
+        {
+          "threads": 1,
+          "mbps": 5.6,
+          "tokens": 238846303
+        },
+        {
+          "threads": 14,
+          "mbps": 9.5,
+          "tokens": 238846303
+        }
+      ]
+    },
+    "warm_100mb": {
+      "tuetoken": 8700.0,
+      "gigatoken": 2762.3,
+      "fastokens": 1589.9
+    }
+  },
+  "startup": [
+    {
+      "model": "o200k_base",
+      "tuetoken": 10.37,
+      "gigatoken": 245.24,
+      "hf": 304.45
+    },
+    {
+      "model": "Qwen3-8B",
+      "tuetoken": 8.61,
+      "gigatoken": 143.7,
+      "hf": 112.47
+    },
+    {
+      "model": "DeepSeek-V3",
+      "tuetoken": 7.08,
+      "gigatoken": 139.24,
+      "hf": 84.04
+    },
+    {
+      "model": "Gemma-3-4B",
+      "tuetoken": 19.99,
+      "gigatoken": 260.41,
+      "hf": 348.02
+    },
+    {
+      "model": "Llama-4-Scout",
+      "tuetoken": 15.34,
+      "gigatoken": 280.31,
+      "hf": 266.81
+    },
+    {
+      "model": "gpt-oss-20b",
+      "tuetoken": 14.56,
+      "gigatoken": 281.94,
+      "hf": 269.97
+    }
+  ],
+  "frontier": [
+    {
+      "model": "Llama-4-Scout",
+      "tuetoken": 9004.8,
+      "gigatoken": 2383.7,
+      "hf": 20.2
+    },
+    {
+      "model": "Qwen3-8B",
+      "tuetoken": 6769.6,
+      "gigatoken": 1642.8,
+      "hf": 7.3
+    },
+    {
+      "model": "Seed-Coder-8B",
+      "tuetoken": 6825.9,
+      "gigatoken": null,
+      "hf": 9.5
+    },
+    {
+      "model": "Gemma-3-4B",
+      "tuetoken": 5066.8,
+      "gigatoken": 498.3,
+      "hf": 54.5
+    },
+    {
+      "model": "Mistral-7B",
+      "tuetoken": 4926.0,
+      "gigatoken": 537.4,
+      "hf": 83.4
+    },
+    {
+      "model": "DeepSeek-V3",
+      "tuetoken": 3771.9,
+      "gigatoken": 1806.4,
+      "hf": 9.2
+    },
+    {
+      "model": "Falcon-H1-7B",
+      "tuetoken": 2760.8,
+      "gigatoken": null,
+      "hf": 7.8
+    }
+  ],
+  "decode": [
+    {
+      "tokens": 50,
+      "tuetoken_np": 0.46,
+      "tuetoken": 0.46,
+      "gigatoken_np": 1.25,
+      "gigatoken": 1.67,
+      "tiktoken": 2.12,
+      "fastokens": 3.79,
+      "hf": 6.67
+    },
+    {
+      "tokens": 1000,
+      "tuetoken_np": 4.56,
+      "tuetoken": 4.33,
+      "gigatoken_np": 12.52,
+      "gigatoken": 16.29,
+      "tiktoken": 29.27,
+      "fastokens": 54.54,
+      "hf": 104.73
+    },
+    {
+      "tokens": 12000,
+      "tuetoken_np": 57.08,
+      "tuetoken": 48.33,
+      "gigatoken_np": 162.21,
+      "gigatoken": 228.04,
+      "tiktoken": 322.38,
+      "fastokens": 601.04,
+      "hf": 1246.88
+    }
+  ],
+  "batch_trunc": {
+    "padded_10k_mbps": {
+      "tuetoken": 6811.0,
+      "gigatoken": 657.2
+    },
+    "trunc_50mb_ms": {
+      "tuetoken_right": 2.42,
+      "tuetoken_left": 2.57,
+      "gigatoken": 14.23,
+      "hf": 10602.1
+    }
+  },
+  "extras": {
+    "whisper_batch_500_ms": {
+      "tuetoken": 0.098,
+      "hf": 31.67
+    },
+    "offsets_1mb_ms": {
+      "tuetoken_buf": 1.16,
+      "hf": 249.4
+    }
+  }
+}
